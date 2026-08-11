@@ -1,0 +1,7 @@
+node_modules/
+.pnpm-store/
+dist/
+__pycache__/
+*.pyc
+restore-points/
+release/

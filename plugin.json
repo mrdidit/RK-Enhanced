@@ -1,0 +1,11 @@
+{
+  "name": "RK-Enhanced",
+  "version": "0.1.0",
+  "author": "thefiqs",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["hardware", "performance", "power"],
+    "description": "Preset-based CPU, GPU, and fan control for ROCKNIX"
+  }
+}

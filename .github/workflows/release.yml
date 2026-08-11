@@ -1,0 +1,44 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: python3 -m py_compile main.py
+      - name: Assemble plugin
+        run: |
+          mkdir -p release/RK-Enhanced
+          cp -r dist main.py plugin.json install.sh README.md LICENSE release/RK-Enhanced/
+          chmod 755 release/RK-Enhanced/install.sh
+          cd release
+          zip -r RK-Enhanced.zip RK-Enhanced
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RK-Enhanced
+          path: release/RK-Enhanced.zip
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: release/RK-Enhanced.zip
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

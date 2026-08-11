@@ -1,0 +1,6 @@
+storeDir: .pnpm-store
+
+peerDependencyRules:
+  ignoreMissing:
+    - react
+    - react-dom

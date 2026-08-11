@@ -1,0 +1,17 @@
+import { call } from "@decky/api";
+import type { HardwareProfile, State, Telemetry } from "./types";
+
+export const getState = () => call<[], State>("get_state");
+export const getTelemetry = () => call<[], Telemetry>("get_telemetry");
+export const getLog = () => call<[], string>("get_log");
+export const clearLog = () => call<[], boolean>("clear_log");
+export const applyProfile = (profile: HardwareProfile) => call<[HardwareProfile], boolean>("apply_profile", profile);
+export const savePreset = (name: string, profile: HardwareProfile) => call<[string, HardwareProfile], State>("save_preset", name, profile);
+export const restoreSteamDefault = () => call<[], State>("restore_steam_default");
+export const renamePreset = (oldName: string, newName: string) => call<[string, string], State>("rename_preset", oldName, newName);
+export const deletePreset = (name: string) => call<[string], State>("delete_preset", name);
+export const assignGame = (appid: string, preset: string) => call<[string, string], State>("assign_game", appid, preset);
+export const setSteamDefault = (preset: string) => call<[string], State>("set_steam_default", preset);
+export const saveSystemFanCurve = (curve: HardwareProfile["fan_curve"]) => call<[HardwareProfile["fan_curve"]], State>("save_system_fan_curve", curve);
+export const unassignGame = (appid: string) => call<[string], State>("unassign_game", appid);
+export const activateGame = (appid: string) => call<[string], { applied: boolean; preset: string }>("activate_game", appid);
