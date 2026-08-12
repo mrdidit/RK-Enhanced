@@ -454,10 +454,10 @@ class Plugin:
             path = _gpu_path()
             (path / "governor").write_text(clean["gpu_governor"])
             _write_gpu_range(path, clean["gpu_min"], clean["gpu_max"])
-        if clean["cooling_profile"] == "custom" and not FAN_CONFIG.exists():
-            # ROCKNIX has one global Custom curve. Presets only select the
-            # native profile and must never overwrite an existing system curve.
-            _write_fan_curve(_fan_curve())
+        if clean["cooling_profile"] == "custom":
+            # Native ROCKNIX fancontrol remains the controller. The active
+            # preset supplies the temporary Custom curve it should execute.
+            _write_fan_curve(clean["fan_curve"])
         _set_setting("cooling.profile", clean["cooling_profile"])
         decky.logger.info(
             f"Restarting native fancontrol: profile={clean['cooling_profile']} "
@@ -820,4 +820,10 @@ class Plugin:
         await asyncio.to_thread(self._load)
 
     async def _unload(self):
-        decky.logger.info("RK-Enhanced unloaded; native ROCKNIX services left untouched")
+        def restore_system_curve():
+            data = self._load()
+            _write_fan_curve(data["system_fan_curve"])
+            _set_setting("cooling.profile", "custom")
+            _restart_fancontrol()
+        await asyncio.to_thread(restore_system_curve)
+        decky.logger.info("RK-Enhanced unloaded; restored the system ROCKNIX Custom curve")

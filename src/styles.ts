@@ -11,6 +11,8 @@ export const styles = `
   .rke-tabs [role="tabpanel"] { box-sizing: border-box; padding-left: 4px !important; padding-right: 6px !important; overflow-x: clip !important; overflow-y: auto !important; touch-action: pan-y; overscroll-behavior-y: contain; contain: paint; clip-path: inset(0); }
   .rke-content { box-sizing: border-box; width: 100%; padding: 0 2px 28px; overflow-x: clip; contain: paint; }
   .rke-presets .rke-action-button { box-sizing: border-box !important; width: calc(100% - 12px) !important; margin-left: 12px !important; }
+  .rke-save-apply { box-sizing: border-box; width: calc(100% - 12px); margin: 5px 0 7px 12px; }
+  .rke-save-apply .${gamepadDialogClasses.Field} { opacity: .72; font-size: 11px; text-align: center; }
   .rke-section-heading { width: 100%; box-sizing: border-box; padding: 8px 0 10px; text-align: center; text-transform: uppercase; font-size: 16px; font-weight: 700; letter-spacing: .04em; }
   .rke-cluster-heading { width: 100%; box-sizing: border-box; padding: 12px 0 4px; text-align: center; font-size: 15px; font-weight: 600; }
   .rke-cluster-heading small { display: block; margin-top: 3px; opacity: .66; font-size: 11px; font-weight: 400; }

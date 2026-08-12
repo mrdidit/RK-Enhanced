@@ -4,7 +4,7 @@ import {
 } from "@decky/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { activateGame, applyProfile, assignGame, deletePreset, getState, getTelemetry, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame } from "./backend";
+import { activateGame, assignGame, deletePreset, getState, getTelemetry, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame } from "./backend";
 import { currentGame } from "./game";
 import { Monitor } from "./Monitor";
 import { Logs } from "./Logs";
@@ -131,15 +131,6 @@ export function Content() {
     catch (error) { setMessage(String(error)); }
     finally { setBusy(false); }
   };
-  const applyDraft = async () => {
-    if (!draft) return;
-    setBusy(true);
-    try {
-      await applyProfile(draft);
-      setMessage("Applied without saving · Save preset to keep these settings");
-    } catch (error) { setMessage(String(error)); }
-    finally { setBusy(false); }
-  };
   const createDraft = async () => {
     if (!draft || !newName.trim()) return;
     const name = newName.trim();
@@ -162,6 +153,16 @@ export function Content() {
   const dirty = JSON.stringify(draft) !== JSON.stringify(state.presets[selected]);
   const valid = cpuPolicies.length > 0;
 
+  const saveAndApply = () => run(
+    async () => installState(await savePreset(selected, draft), selected),
+    `${selected} saved and applied`,
+  );
+  const saveApplyControl = () => <div className="rke-save-apply">
+    <PanelSectionRow><ButtonItem layout="below" disabled={busy || !valid}
+      onClick={() => void saveAndApply()}>Save &amp; Apply</ButtonItem></PanelSectionRow>
+    <PanelSectionRow><Field label={`Saves and applies changes to ${selected}.`} /></PanelSectionRow>
+  </div>;
+
   const choosePreset = (name: string) => {
     setSelected(name); setDraft(clone(state.presets[name])); setRenameName(""); setPresetForm(null); setMessage("");
   };
@@ -179,6 +180,35 @@ export function Content() {
     for (let i = index - 1; i >= 0; i--) curve[i][0] = Math.min(curve[i][0], curve[i + 1][0] - 1000);
   });
   const updateSystemPwm = (index: number, value: number) => updateSystemCurve(curve => {
+    curve[index][1] = value;
+    for (let i = index + 1; i < curve.length; i++) if (curve[i][1] < value) curve[i][1] = value;
+    for (let i = index - 1; i >= 0; i--) if (curve[i][1] > value) curve[i][1] = value;
+  });
+  const addCurvePoint = () => update(profile => {
+    const curve = profile.fan_curve;
+    const last = curve[curve.length - 1];
+    if (last && last[0] < 120000) {
+      curve.push([Math.min(120000, last[0] + 10000), last[1]]);
+      return;
+    }
+    let gapIndex = 0;
+    for (let index = 1; index < curve.length; index++)
+      if (curve[index][0] - curve[index - 1][0] > curve[gapIndex + 1][0] - curve[gapIndex][0]) gapIndex = index - 1;
+    if (curve[gapIndex + 1][0] - curve[gapIndex][0] > 1000) {
+      const low = curve[gapIndex], high = curve[gapIndex + 1];
+      curve.splice(gapIndex + 1, 0, [Math.round((low[0] + high[0]) / 2000) * 1000, Math.round((low[1] + high[1]) / 2)]);
+    }
+  });
+  const updateCurveTemp = (index: number, requested: number) => update(profile => {
+    const curve = profile.fan_curve;
+    const minimum = 10000 + index * 1000;
+    const maximum = 120000 - (curve.length - 1 - index) * 1000;
+    curve[index][0] = Math.max(minimum, Math.min(maximum, requested));
+    for (let i = index + 1; i < curve.length; i++) curve[i][0] = Math.max(curve[i][0], curve[i - 1][0] + 1000);
+    for (let i = index - 1; i >= 0; i--) curve[i][0] = Math.min(curve[i][0], curve[i + 1][0] - 1000);
+  });
+  const updateCurvePwm = (index: number, value: number) => update(profile => {
+    const curve = profile.fan_curve;
     curve[index][1] = value;
     for (let i = index + 1; i < curve.length; i++) if (curve[i][1] < value) curve[i][1] = value;
     for (let i = index - 1; i >= 0; i--) if (curve[i][1] > value) curve[i][1] = value;
@@ -210,10 +240,7 @@ export function Content() {
     <PanelSection>
       <SelectRow label="Editing preset" value={selected} values={names} disabled={busy} onChange={choosePreset} />
       <PanelSectionRow><Field label={dirty ? "Unsaved changes" : selected === state.active_preset ? "Active preset" : "Saved preset"} /></PanelSectionRow>
-      <div className="rke-action-button"><PanelSectionRow><ButtonItem layout="below" disabled={busy || !valid}
-        onClick={() => void applyDraft()}>Apply now</ButtonItem></PanelSectionRow></div>
-      <div className="rke-action-button"><PanelSectionRow><ButtonItem layout="below" disabled={busy || !valid || !dirty}
-        onClick={() => run(async () => installState(await savePreset(selected, draft), selected), "Preset saved and applied")}>Save preset</ButtonItem></PanelSectionRow></div>
+      {saveApplyControl()}
       {selected === DEFAULT && <PanelSectionRow><ButtonItem layout="below" disabled={busy}
         onClick={confirmRestoreSteam}>Restore original Steam Default</ButtonItem></PanelSectionRow>}
       <PanelSectionRow><ButtonItem layout="below" disabled={busy}
@@ -269,6 +296,8 @@ export function Content() {
         onChange={value => update(profile => { profile.cpu_scheduler = value; })} />
     </PanelSection>
 
+    {saveApplyControl()}
+
     <PanelSection>
       <SectionHeading>GPU</SectionHeading>
       {!gpu.available ? <PanelSectionRow><Field label="GPU frequency control unavailable" /></PanelSectionRow> : <>
@@ -279,22 +308,38 @@ export function Content() {
       </>}
     </PanelSection>
 
+    {saveApplyControl()}
+
   </div>;
 
   const fan = <div>
+    {saveApplyControl()}
     <PanelSection>
       <SelectRow label="ROCKNIX cooling profile" value={draft.cooling_profile} values={state.capabilities.cooling_profiles}
         disabled={!state.capabilities.fan_available}
         onChange={value => update(profile => { profile.cooling_profile = value; })} />
       {!state.capabilities.fan_available && <PanelSectionRow><Field label="Fan control unavailable on this device" /></PanelSectionRow>}
-      {draft.cooling_profile === "custom" && <PanelSectionRow><Field label="ROCKNIX Custom"
-        description="Uses the single native fancontrol.conf curve configured in Utils." /></PanelSectionRow>}
+      {draft.cooling_profile === "custom" && <>
+        <PanelSectionRow><Field label={`${selected} custom curve`}
+          description="Saved inside this preset. It temporarily replaces fancontrol.conf while this preset is active." /></PanelSectionRow>
+        {draft.fan_curve.map(([temp, pwm], index) => <div key={index}>
+          <PanelSectionRow><SliderField label={`Point ${index + 1} temperature`} description={`${Math.round(temp / 1000)}°C`}
+            value={temp} min={10000 + index * 1000} max={120000 - (draft.fan_curve.length - 1 - index) * 1000}
+            step={1000} showValue onChange={value => updateCurveTemp(index, value)} /></PanelSectionRow>
+          <PanelSectionRow><SliderField label={`Point ${index + 1} PWM`} description={`${Math.round(pwm * 100 / 255)}%`}
+            value={pwm} min={0} max={255} step={1} showValue onChange={value => updateCurvePwm(index, value)} /></PanelSectionRow>
+          {draft.fan_curve.length > 2 && <PanelSectionRow><ButtonItem layout="below"
+            onClick={() => update(profile => { profile.fan_curve.splice(index, 1); })}>Remove point</ButtonItem></PanelSectionRow>}
+        </div>)}
+        {draft.fan_curve.length < 16 && <PanelSectionRow><ButtonItem layout="below" onClick={addCurvePoint}>Add curve point</ButtonItem></PanelSectionRow>}
+      </>}
       <PanelSectionRow><Field label="Live fan PWM">
         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
           {live ? `${live.fan_pwm} PWM · ${live.fan_percent}%` : "Reading…"}
         </span>
       </Field></PanelSectionRow>
     </PanelSection>
+    {saveApplyControl()}
   </div>;
 
   const utils = <div className="rke-utils">

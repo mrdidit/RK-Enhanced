@@ -25,7 +25,8 @@ different backends, so RK-Enhanced is not a direct copy of NDC-Enhanced.
 - Kernel or supported `sched_ext` scheduler selection.
 - Editable Steam default and reusable performance presets.
 - Per-game preset assignment with a configurable Steam fallback preset.
-- Separate native ROCKNIX Custom fan-curve configuration.
+- Native ROCKNIX Custom system curve plus independent custom curves in Steam
+  and per-game presets.
 - Runtime log viewer in the Utils tab.
 
 ## Fan-control design
@@ -33,17 +34,17 @@ different backends, so RK-Enhanced is not a direct copy of NDC-Enhanced.
 RK-Enhanced does **not** run a competing fan-control loop. ROCKNIX's native
 `fancontrol.service` remains responsible for continuously driving the fan.
 
-When a custom curve is saved, RK-Enhanced writes ROCKNIX's
-`/storage/.config/fancontrol.conf` and asks the native service to reload it. The
-ROCKNIX Custom system curve is managed separately from Steam and per-game
-performance presets.
+The system ROCKNIX Custom curve is managed only in Utils. On first setup,
+RK-Enhanced imports an existing `/storage/.config/fancontrol.conf`, or creates a
+safe curve when none exists. The initial Steam Default preset copies that
+system curve.
 
-ROCKNIX has one global Custom fan curve: `fancontrol.conf`. Selecting `custom`
-in the system, Steam default, or a per-game configuration activates that same
-curve. Modifying ROCKNIX Custom in RK-Enhanced therefore modifies the global
-native curve; there are no separate per-preset custom curves. If the file does
-not exist when Custom is first selected, RK-Enhanced creates a safe initial
-configuration.
+Steam Default and per-game presets may select Quiet, Moderate, Aggressive, or
+Custom. Each preset choosing Custom stores its own independent curve. While
+that preset is active, RK-Enhanced writes its curve to `fancontrol.conf` and
+reloads native fancontrol. When RK-Enhanced unloads, it restores the separately
+saved system ROCKNIX Custom curve. This changes configuration only; ROCKNIX's
+native service remains responsible for continuously controlling the fan.
 
 ## GPU monitoring
 
