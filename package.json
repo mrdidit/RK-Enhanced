@@ -1,7 +1,7 @@
 {
   "name": "rk-enhanced",
   "version": "0.1.0",
-  "description": "Decky performance controls for ROCKNIX",
+  "description": "ROCKNIX Kontrol Enhanced Decky performance controls",
   "type": "module",
   "scripts": {
     "build": "rollup -c",

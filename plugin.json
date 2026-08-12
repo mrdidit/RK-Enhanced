@@ -6,6 +6,6 @@
   "api_version": 1,
   "publish": {
     "tags": ["hardware", "performance", "power"],
-    "description": "Preset-based CPU, GPU, and fan control for ROCKNIX"
+    "description": "ROCKNIX Kontrol Enhanced performance and fan controls"
   }
 }

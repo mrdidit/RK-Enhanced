@@ -1,7 +1,8 @@
 # RK-Enhanced
 
-RK-Enhanced is an experimental Decky Loader plugin for controlling and monitoring
-ROCKNIX-based ARM handhelds from Steam's Quick Access Menu.
+**RK-Enhanced** stands for **ROCKNIX Kontrol Enhanced**. It is an experimental
+Decky Loader plugin for controlling and monitoring ROCKNIX-based ARM handhelds
+from Steam's Quick Access Menu.
 
 This project is a reworked successor to
 [Rocknix-Control-Enhanced](https://github.com/thefiqs/Rocknix-Control-Enhanced/tree/preset-delete-button),
