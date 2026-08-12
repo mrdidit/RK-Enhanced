@@ -37,6 +37,13 @@ When a custom curve is saved, RK-Enhanced writes ROCKNIX's
 ROCKNIX Custom system curve is managed separately from Steam and per-game
 performance presets.
 
+ROCKNIX has one global Custom fan curve: `fancontrol.conf`. Selecting `custom`
+in the system, Steam default, or a per-game configuration activates that same
+curve. Modifying ROCKNIX Custom in RK-Enhanced therefore modifies the global
+native curve; there are no separate per-preset custom curves. If the file does
+not exist when Custom is first selected, RK-Enhanced creates a safe initial
+configuration.
+
 ## GPU monitoring
 
 On the tested Qualcomm/Adreno ROCKNIX device, RK-Enhanced reads the unique DRM

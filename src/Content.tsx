@@ -165,44 +165,6 @@ export function Content() {
   const choosePreset = (name: string) => {
     setSelected(name); setDraft(clone(state.presets[name])); setRenameName(""); setPresetForm(null); setMessage("");
   };
-  const addCurvePoint = () => update(profile => {
-    const curve = profile.fan_curve;
-    const last = curve[curve.length - 1];
-    if (last[0] < 120000) {
-      curve.push([Math.min(120000, last[0] + 10000), last[1]]);
-      return;
-    }
-    let gapIndex = -1, largestGap = 0;
-    for (let i = 1; i < curve.length; i++) {
-      const gap = curve[i][0] - curve[i - 1][0];
-      if (gap > largestGap) { largestGap = gap; gapIndex = i; }
-    }
-    if (gapIndex > 0 && largestGap >= 2000) {
-      const before = curve[gapIndex - 1], after = curve[gapIndex];
-      curve.splice(gapIndex, 0, [
-        Math.round((before[0] + after[0]) / 2000) * 1000,
-        Math.round((before[1] + after[1]) / 2),
-      ]);
-    }
-  });
-  const updateCurveTemp = (index: number, requested: number) => update(profile => {
-    const curve = profile.fan_curve;
-    const minimum = 10000 + index * 1000;
-    const maximum = 120000 - (curve.length - 1 - index) * 1000;
-    curve[index][0] = Math.max(minimum, Math.min(maximum, requested));
-    for (let i = index + 1; i < curve.length; i++)
-      curve[i][0] = Math.max(curve[i][0], curve[i - 1][0] + 1000);
-    for (let i = index - 1; i >= 0; i--)
-      curve[i][0] = Math.min(curve[i][0], curve[i + 1][0] - 1000);
-  });
-  const updateCurvePwm = (index: number, value: number) => update(profile => {
-    const curve = profile.fan_curve;
-    curve[index][1] = value;
-    for (let i = index + 1; i < curve.length; i++)
-      if (curve[i][1] < value) curve[i][1] = value;
-    for (let i = index - 1; i >= 0; i--)
-      if (curve[i][1] > value) curve[i][1] = value;
-  });
   const updateSystemCurve = (change: (curve: HardwareProfile["fan_curve"]) => void) =>
     setSystemCurve(current => { const next = clone(current); change(next); return next; });
   const addSystemCurvePoint = () => updateSystemCurve(curve => {
@@ -325,17 +287,8 @@ export function Content() {
         disabled={!state.capabilities.fan_available}
         onChange={value => update(profile => { profile.cooling_profile = value; })} />
       {!state.capabilities.fan_available && <PanelSectionRow><Field label="Fan control unavailable on this device" /></PanelSectionRow>}
-      {draft.cooling_profile === "custom" && draft.fan_curve.map(([temp, pwm], index) => <div key={index}>
-        <PanelSectionRow><SliderField label={`Point ${index + 1} temperature`} description={`${Math.round(temp / 1000)}°C`}
-          value={temp} min={10000 + index * 1000}
-          max={120000 - (draft.fan_curve.length - 1 - index) * 1000}
-          step={1000} showValue onChange={value => updateCurveTemp(index, value)} /></PanelSectionRow>
-        <PanelSectionRow><SliderField label={`Point ${index + 1} PWM`} description={`${Math.round(pwm * 100 / 255)}%`}
-          value={pwm} min={0} max={255}
-          step={1} showValue onChange={value => updateCurvePwm(index, value)} /></PanelSectionRow>
-        {draft.fan_curve.length > 2 && <PanelSectionRow><ButtonItem layout="below" onClick={() => update(profile => { profile.fan_curve.splice(index, 1); })}>Remove point</ButtonItem></PanelSectionRow>}
-      </div>)}
-      {draft.cooling_profile === "custom" && draft.fan_curve.length < 16 && <PanelSectionRow><ButtonItem layout="below" onClick={addCurvePoint}>Add point above hottest</ButtonItem></PanelSectionRow>}
+      {draft.cooling_profile === "custom" && <PanelSectionRow><Field label="ROCKNIX Custom"
+        description="Uses the single native fancontrol.conf curve configured in Utils." /></PanelSectionRow>}
       <PanelSectionRow><Field label="Live fan PWM">
         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
           {live ? `${live.fan_pwm} PWM · ${live.fan_percent}%` : "Reading…"}

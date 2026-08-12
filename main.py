@@ -454,12 +454,14 @@ class Plugin:
             path = _gpu_path()
             (path / "governor").write_text(clean["gpu_governor"])
             _write_gpu_range(path, clean["gpu_min"], clean["gpu_max"])
-        if clean["cooling_profile"] == "custom":
-            _write_fan_curve(clean["fan_curve"])
+        if clean["cooling_profile"] == "custom" and not FAN_CONFIG.exists():
+            # ROCKNIX has one global Custom curve. Presets only select the
+            # native profile and must never overwrite an existing system curve.
+            _write_fan_curve(_fan_curve())
         _set_setting("cooling.profile", clean["cooling_profile"])
         decky.logger.info(
             f"Restarting native fancontrol: profile={clean['cooling_profile']} "
-            f"points={clean['fan_curve'] if clean['cooling_profile'] == 'custom' else 'stock'}"
+            f"curve={'/storage/.config/fancontrol.conf' if clean['cooling_profile'] == 'custom' else 'stock'}"
         )
         fancontrol_pid = _restart_fancontrol()
         decky.logger.info(f"Native fancontrol restarted successfully: pid={fancontrol_pid}")
