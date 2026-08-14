@@ -1,6 +1,6 @@
-import { Field, PanelSection, PanelSectionRow } from "@decky/ui";
+import { Field, PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
 import { useEffect, useState } from "react";
-import { getTelemetry } from "./backend";
+import { getTelemetry, setBypassCharging } from "./backend";
 import type { Telemetry } from "./types";
 
 const cpuMhz = (khz: number) => `${Math.round(khz / 1000)} MHz`;
@@ -15,9 +15,12 @@ const clusterLabel = (index: number, cpus: string[]) => {
   if (!cpus.length) return `Cluster ${index + 1}`;
   return `Cluster ${index + 1} (${cpus.length > 1 ? `${cpus[0]}–${cpus[cpus.length - 1]}` : cpus[0]})`;
 };
-const duration = (seconds: number) => seconds > 0
-  ? `${Math.floor(seconds / 3600)}:${String(Math.floor(seconds % 3600 / 60)).padStart(2, "0")}`
-  : "Unavailable";
+const duration = (seconds: number) => {
+  if (seconds <= 0) return "";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor(seconds % 3600 / 60);
+  return hours > 0 ? `${hours}h${minutes > 0 ? ` ${minutes}m` : ""}` : `${minutes}m`;
+};
 
 function Meter({ value, color = "#59bf40" }: { value: number; color?: string }) {
   const width = Math.max(0, Math.min(100, value));
@@ -39,6 +42,7 @@ const Heading = ({ children }: { children: string }) =>
 export function Monitor({ active }: { active: boolean }) {
   const [data, setData] = useState<Telemetry | null>(null);
   const [error, setError] = useState("");
+  const [bypassBusy, setBypassBusy] = useState(false);
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
@@ -57,12 +61,35 @@ export function Monitor({ active }: { active: boolean }) {
   const oneMinuteLoad = data.load_average[0] || 0;
   const queueStatus = logicalCpus && oneMinuteLoad > logicalCpus ? "Overloaded"
     : logicalCpus && oneMinuteLoad >= logicalCpus * 0.75 ? "Busy" : "Normal";
+  const bypassCharging = data.bypass_charging;
+  const bypassHolding = bypassCharging && Math.abs(data.battery_flow_watts) < 0.2;
+  const bypassDischarging = bypassCharging && data.battery_flow_watts <= -0.2;
+  const bypassFilling = bypassCharging && data.battery_flow_watts >= 0.2;
+  const toggleBypass = async (enabled: boolean) => {
+    setBypassBusy(true);
+    try {
+      await setBypassCharging(enabled);
+      setData(await getTelemetry());
+      setError("");
+    } catch (reason) { setError(String(reason)); }
+    finally { setBypassBusy(false); }
+  };
   return <div className="rke-monitor">
     <PanelSection>
-      <Metric label={data.battery_status === "Charging" ? "Battery until full" : "Battery remaining"}
-        value={`${duration(data.battery_seconds)} · ${data.battery_percent}%`} percent={data.battery_percent} color={batteryColor(data.battery_percent)} />
-      <Metric label={data.battery_status === "Charging" ? "Charging power" : "Power draw"}
-        value={data.battery_watts > 0 ? `${data.battery_watts.toFixed(1)} W` : "Unavailable"} />
+      <Metric label={bypassHolding ? "Bypass charging" : bypassDischarging ? "Battery remaining" : bypassFilling ? "Battery until full" : data.battery_status === "Charging" ? "Battery until full" : "Battery remaining"}
+        value={bypassHolding
+          ? `${data.battery_percent}%`
+          : data.battery_estimate_ready && data.battery_seconds > 0
+            ? `${duration(data.battery_seconds)} · ${data.battery_percent}%`
+            : "Calculating…"}
+        percent={data.battery_percent} color={bypassCharging ? "#45aaf2" : batteryColor(data.battery_percent)} />
+      <PanelSectionRow><ToggleField label="Bypass charging" checked={bypassCharging}
+        disabled={bypassBusy} onChange={enabled => void toggleBypass(enabled)} /></PanelSectionRow>
+      <Metric label={bypassCharging ? "Battery flow" : data.battery_status === "Charging" ? "Charging power" : "Power draw"}
+        value={bypassHolding ? "Holding charge" : data.battery_watts > 0
+          ? `${bypassFilling ? "Charging · " : bypassDischarging ? "Drawing · " : ""}${data.battery_watts.toFixed(1)} W`
+          : "Unavailable"}
+        valueColor={bypassHolding ? "#45aaf2" : undefined} />
       <Metric label="Thermal limit" value={data.thermal_limit}
         valueColor={data.thermal_limit === "Clear" ? "#26de81" : data.thermal_limit === "CPU + GPU" ? "#fc5c65" : "#fed330"} />
       <Heading>Live Performance</Heading>

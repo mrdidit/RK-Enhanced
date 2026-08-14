@@ -54,8 +54,11 @@ export interface State {
 export interface Telemetry {
   battery_percent: number;
   battery_status: string;
+  bypass_charging: boolean;
   battery_seconds: number;
+  battery_estimate_ready: boolean;
   battery_watts: number;
+  battery_flow_watts: number;
   cpu_temperature: number;
   gpu_temperature: number;
   cpu_percent: number;

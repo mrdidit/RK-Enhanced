@@ -19,12 +19,16 @@ different backends, so RK-Enhanced is not a direct copy of NDC-Enhanced.
 
 ## Current features
 
-- Live battery, power, thermal, CPU, GPU, fan, memory and clock monitoring.
+- Live battery, signed battery flow, thermal, CPU, GPU, fan, memory and clock
+  monitoring with severity-based colours.
+- Bypass charging control on supported ROCKNIX kernels, including holding,
+  charging and discharging states plus a smoothed remaining-time estimate.
 - CPU governor and per-cluster frequency limits.
 - GPU governor and frequency limits where ROCKNIX exposes them.
 - Kernel or supported `sched_ext` scheduler selection.
 - Editable Steam default and reusable performance presets.
 - Per-game preset assignment with a configurable Steam fallback preset.
+- Combined Save & Apply actions on Performance, Fan Curves and Presets.
 - Native ROCKNIX Custom system curve plus independent custom curves in Steam
   and per-game presets.
 - Runtime log viewer in the Utils tab.
@@ -48,23 +52,36 @@ native service remains responsible for continuously controlling the fan.
 
 ## GPU monitoring
 
-On the tested Qualcomm/Adreno ROCKNIX device, RK-Enhanced reads the unique DRM
-clients belonging to the persistent gamescope process and calculates usage from
-the change in `drm-engine-gpu` time. It does not repeatedly scan every process
-and file descriptor on the system.
+On Qualcomm/Adreno devices exposing KGSL, RK-Enhanced follows MangoHud and reads
+the system-wide `gpu_busy_percentage` metric from
+`/sys/class/kgsl/kgsl-3d0`. On systems without that metric it falls back to the
+active Steam game's unique DRM clients and their `drm-engine-gpu` time. When no
+game is running it monitors gamescope instead. Process discovery is cached and
+does not repeatedly scan every process and file descriptor on each sample.
 
-This follows the relevant MangoHud/MangoApp approach and avoids the severe CPU
-load caused by the earlier system-wide `/proc/*/fd` scan. Other GPU drivers may
-need additional detection and testing.
+## Battery and bypass charging
+
+On supported devices, the Monitor tab controls bypass charging through
+`/sys/class/power_supply/battery/charge_behaviour`. RK-Enhanced writes
+`inhibit-charge` to enable bypass and `auto` to restore normal charging, then
+reads the active bracketed mode back to verify the change.
+
+While bypass is active, the battery bar is blue and signed battery flow reports
+whether the battery is holding charge, charging, or supplementing a weak power
+supply. When the battery is discharging, RK-Enhanced calculates remaining time
+from the charge counter and a smoothed current sample instead of trusting the
+kernel estimate after near-zero-current periods. It displays `Calculating…`
+until the initial sample window is ready, then updates the estimate every five
+seconds. Times use readable forms such as `6h 11m`.
 
 ## Known limitations
 
-- This is the first public pre-release; regressions and incomplete workflows
+- This remains early pre-release software; regressions and incomplete workflows
   should be expected.
 - Hardware discovery and writable sysfs controls can differ between ROCKNIX
   devices and builds.
-- GPU usage currently targets the gamescope/MSM DRM layout tested during
-  development.
+- Active-game GPU usage currently targets Qualcomm KGSL and MSM DRM layouts
+  tested during development; other drivers may need additional support.
 - Decky or SteamWebHelper restarts can occasionally leave old PluginLoader
   workers behind on this ROCKNIX/FEX setup.
 - Preset, session restoration and fan-curve workflows need broader real-world

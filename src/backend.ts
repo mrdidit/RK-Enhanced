@@ -3,6 +3,7 @@ import type { HardwareProfile, State, Telemetry } from "./types";
 
 export const getState = () => call<[], State>("get_state");
 export const getTelemetry = () => call<[], Telemetry>("get_telemetry");
+export const setBypassCharging = (enabled: boolean) => call<[boolean], boolean>("set_bypass_charging", enabled);
 export const getLog = () => call<[], string>("get_log");
 export const clearLog = () => call<[], boolean>("clear_log");
 export const applyProfile = (profile: HardwareProfile) => call<[HardwareProfile], boolean>("apply_profile", profile);

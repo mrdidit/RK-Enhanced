@@ -18,6 +18,7 @@ SETTINGS_FILE = "settings.json"
 FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
+KGSL_GPU_ROOT = Path("/sys/class/kgsl/kgsl-3d0")
 COOLING_PROFILES = ["quiet", "moderate", "aggressive", "custom"]
 
 
@@ -379,6 +380,9 @@ class Plugin:
         self.gamescope_pid = None
         self.gpu_fdinfo_paths = []
         self.gpu_fdinfo_refresh = 0.0
+        self.battery_discharge_ema = None
+        self.battery_discharge_samples = 0
+        self.battery_discharge_last_sample = 0.0
         self.log_offsets = {}
         self.lock = None
 
@@ -618,6 +622,9 @@ class Plugin:
             if target == self.active_appid and preset == self.active_preset:
                 return {"applied": False, "preset": self.active_preset}
             self.active_appid = target
+            self.gpu_fdinfo_paths = []
+            self.gpu_fdinfo_refresh = 0.0
+            self.last_gpu_sample = None
             self._apply(data["presets"][preset])
             self.active_preset = preset
             return {"applied": True, "preset": preset}
@@ -636,11 +643,25 @@ class Plugin:
         return None
 
     def _refresh_gpu_fdinfo_paths(self):
-        pid = self._find_gamescope_pid()
+        processes = []
+        if self.active_appid:
+            appid = self.active_appid.encode()
+            for process in Path("/proc").glob("[0-9]*"):
+                try:
+                    environment = (process / "environ").read_bytes()
+                except OSError:
+                    continue
+                variables = environment.split(b"\0")
+                if (b"SteamAppId=" + appid in variables or
+                        b"SteamGameId=" + appid in variables):
+                    processes.append(process)
+        if not processes:
+            pid = self._find_gamescope_pid()
+            if pid is not None:
+                processes.append(Path("/proc") / str(pid))
         paths = []
         client_ids = set()
-        if pid is not None:
-            process = Path("/proc") / str(pid)
+        for process in processes:
             for descriptor in (process / "fd").glob("*"):
                 try:
                     target = os.readlink(descriptor)
@@ -694,16 +715,23 @@ class Plugin:
             cpu_percent = 100 * (total - idle) / total if total else 0
         if counters:
             self.last_cpu_sample = counters
-        gpu_engine_ns = self._gpu_engine_time()
-        now_ns = time.monotonic_ns()
-        gpu_percent = 0.0
-        if self.last_gpu_sample:
-            previous_engine, previous_time = self.last_gpu_sample
-            elapsed = now_ns - previous_time
-            busy = gpu_engine_ns - previous_engine
-            if elapsed > 0 and busy >= 0:
-                gpu_percent = min(100.0, busy * 100 / elapsed)
-        self.last_gpu_sample = (gpu_engine_ns, now_ns)
+        # Match MangoHud's msm_drm/KGSL backend on Qualcomm devices: this is
+        # total GPU load, rather than the load of gamescope's DRM client.
+        kgsl_load = _read_int(KGSL_GPU_ROOT / "gpu_busy_percentage", -1)
+        if kgsl_load >= 0:
+            gpu_percent = min(100.0, float(kgsl_load))
+            self.last_gpu_sample = None
+        else:
+            gpu_engine_ns = self._gpu_engine_time()
+            now_ns = time.monotonic_ns()
+            gpu_percent = 0.0
+            if self.last_gpu_sample:
+                previous_engine, previous_time = self.last_gpu_sample
+                elapsed = now_ns - previous_time
+                busy = gpu_engine_ns - previous_engine
+                if elapsed > 0 and busy >= 0:
+                    gpu_percent = min(100.0, busy * 100 / elapsed)
+            self.last_gpu_sample = (gpu_engine_ns, now_ns)
         cpu_package_temps, cpu_core_temps, gpu_temps = [], [], []
         for root in (Path("/sys/devices/virtual/thermal"), Path("/sys/class/thermal")):
             for zone in root.glob("thermal_zone*"):
@@ -725,12 +753,36 @@ class Plugin:
         fan_pwm = _read_int(pwm_path) if pwm_path else 0
         battery = Path("/sys/class/power_supply/battery")
         battery_status = _read(battery / "status")
-        battery_seconds = (_read_int(battery / "time_to_full_avg")
-                           if battery_status.lower() == "charging"
-                           else _read_int(battery / "time_to_empty_avg"))
+        charge_behaviour = _read(battery / "charge_behaviour", "auto")
+        bypass_charging = (charge_behaviour == "inhibit-charge" or
+                           "[inhibit-charge]" in charge_behaviour)
         voltage_uv = _read_int(battery / "voltage_now")
         current_ua = _read_int(battery / "current_now")
-        battery_watts = abs(voltage_uv * current_ua) / 1_000_000_000_000
+        battery_flow_watts = voltage_uv * current_ua / 1_000_000_000_000
+        battery_watts = abs(battery_flow_watts)
+        battery_filling = (battery_status.lower() == "charging" or
+                           (bypass_charging and battery_flow_watts >= 0.2))
+        battery_seconds = (_read_int(battery / "time_to_full_avg") if battery_filling
+                           else _read_int(battery / "time_to_empty_avg"))
+        battery_estimate_ready = battery_seconds > 0
+        if bypass_charging and battery_flow_watts <= -0.2:
+            discharge_ua = abs(current_ua)
+            now = time.monotonic()
+            sample_due = (self.battery_discharge_samples < 5 or
+                          now - self.battery_discharge_last_sample >= 5)
+            if sample_due:
+                self.battery_discharge_ema = (discharge_ua if self.battery_discharge_ema is None
+                                              else self.battery_discharge_ema * 0.8 + discharge_ua * 0.2)
+                self.battery_discharge_samples += 1
+                self.battery_discharge_last_sample = now
+            charge_uah = _read_int(battery / "charge_counter")
+            battery_estimate_ready = self.battery_discharge_samples >= 5 and charge_uah > 0
+            battery_seconds = (int(charge_uah * 3600 / self.battery_discharge_ema)
+                               if battery_estimate_ready else 0)
+        elif not bypass_charging or battery_flow_watts >= 0.2:
+            self.battery_discharge_ema = None
+            self.battery_discharge_samples = 0
+            self.battery_discharge_last_sample = 0.0
         try:
             load = [float(value) for value in _read("/proc/loadavg").split()[:3]]
         except ValueError:
@@ -748,8 +800,11 @@ class Plugin:
         return {
             "battery_percent": _read_int(battery / "capacity"),
             "battery_status": battery_status,
+            "bypass_charging": bypass_charging,
             "battery_seconds": max(0, battery_seconds),
+            "battery_estimate_ready": battery_estimate_ready,
             "battery_watts": round(battery_watts, 1),
+            "battery_flow_watts": round(battery_flow_watts, 2),
             "cpu_temperature": round(
                 sum(cpu_package_temps) / len(cpu_package_temps) / 1000, 1
             ) if cpu_package_temps else (
@@ -776,6 +831,24 @@ class Plugin:
 
     async def get_telemetry(self):
         return await asyncio.to_thread(self._telemetry)
+
+    async def set_bypass_charging(self, enabled):
+        def work():
+            behaviour = Path("/sys/class/power_supply/battery/charge_behaviour")
+            if not behaviour.exists():
+                raise RuntimeError("bypass charging is unavailable on this device")
+            requested = "inhibit-charge" if bool(enabled) else "auto"
+            behaviour.write_text(requested)
+            self.battery_discharge_ema = None
+            self.battery_discharge_samples = 0
+            self.battery_discharge_last_sample = 0.0
+            active = _read(behaviour)
+            accepted = (active == requested or f"[{requested}]" in active)
+            if not accepted:
+                raise RuntimeError("ROCKNIX did not accept the bypass charging setting")
+            decky.logger.info(f"Bypass charging {'enabled' if enabled else 'disabled'}")
+            return True
+        return await asyncio.to_thread(work)
 
     def _log_text(self):
         configured = os.environ.get("DECKY_PLUGIN_LOG_DIR")
