@@ -17,6 +17,10 @@ const clusterLabel = (index: number, cpus: string[]) => {
 };
 const duration = (seconds: number) => {
   if (seconds <= 0) return "";
+  if (seconds >= 9.75 * 3600) {
+    const roundedHalfHours = Math.round(seconds / 1800) / 2;
+    return `${roundedHalfHours}h+`;
+  }
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor(seconds % 3600 / 60);
   return hours > 0 ? `${hours}h${minutes > 0 ? ` ${minutes}m` : ""}` : `${minutes}m`;
