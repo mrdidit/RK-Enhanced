@@ -8,6 +8,9 @@ RK-Enhanced is built on the foundation established by Seilent's original
 [ROCKNIX Control](https://github.com/seilent/rocknix-control). Its ROCKNIX
 integration and Decky control concepts made this project possible.
 
+Detailed changes for each published build are recorded in
+[CHANGELOG.md](CHANGELOG.md).
+
 The project later evolved through
 [Rocknix-Control-Enhanced](https://github.com/thefiqs/Rocknix-Control-Enhanced/tree/preset-delete-button),
 with additional interface concepts and improvements inspired by
@@ -55,12 +58,20 @@ Performance settings can be stored independently in every preset:
 
 - CPU governor
 - Minimum and maximum frequency for each CPU cluster
+- Device-discovered CPU boost ceilings when ROCKNIX turbo mode is enabled
 - GPU governor
 - GPU maximum frequency
 - Kernel or supported `sched_ext` scheduler
 
 Save & Apply controls are available at convenient points throughout the
 Performance tab.
+
+Boost clocks are discovered independently for every CPU policy. They are valid
+maximum limits, never minimum choices, and are labelled **Boost** in the UI.
+An adaptive governor such as `schedutil` treats the selected value as an upper
+limit and requests boost only when needed. The `performance` governor may hold
+an allowed boost clock continuously, so RK-Enhanced displays a red warning for
+that combination.
 
 ### Fan curves
 
@@ -311,6 +322,19 @@ Monitor polling only while the Monitor tab is visible.
 The automatic game watcher reads only Steam's small process cgroup rather than
 repeatedly scanning the whole system.
 
+### Runtime restoration
+
+Before the first preset is applied in a Steam session, RK-Enhanced captures the
+native CPU, GPU, scheduler, and charging state. It records only controls RKE
+actually changes and restores their native values when Steam exits, the plugin
+unloads, or Decky/plugin workers terminate unexpectedly.
+
+Restoration is ownership-aware: a value is restored only while it still equals
+the last value written by RK-Enhanced. If ROCKNIX or another tool changes that
+control afterward, RK-Enhanced leaves the newer value intact. Runtime values
+are not carried across a reboot; the protected persistent ROCKNIX Custom fan
+curve is still recovered when necessary.
+
 ## Current limitations
 
 - Hardware coverage remains limited.
@@ -320,7 +344,8 @@ repeatedly scanning the whole system.
   graphically edit the ROCKNIX Custom curve afterward. Activation still occurs
   through ROCKNIX or Steam cooling-profile settings.
 - Native ROCKNIX profile overrides may remain active after Steam exits.
-- Crash recovery and restoration need broader long-duration testing.
+- Crash recovery and ownership-aware restoration need broader long-duration
+  testing across devices.
 - Touch, controller navigation, and compact-screen layouts still need
   refinement.
 - Experimental bypass charging is not ready for general exposure.
@@ -392,8 +417,9 @@ Manual layout:
 ```text
 /storage/homebrew/plugins/RK-Enhanced/
 ├── dist/index.js
-├── fan-restore-guard.sh
 ├── main.py
+├── runtime-restore.py
+├── runtime-restore-guard.sh
 ├── updater.sh
 └── plugin.json
 ```
@@ -410,7 +436,8 @@ Validation and build:
 
 ```sh
 pnpm install
-python3 -m py_compile main.py
+python3 -m py_compile main.py runtime-restore.py
+python3 -m unittest discover -s tests -v
 pnpm typecheck
 pnpm build
 ```

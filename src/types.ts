@@ -16,10 +16,14 @@ export interface CpuPolicy {
   id: string;
   cpus: string[];
   frequencies: number[];
+  boost_frequencies: number[];
+  boost_enabled: boolean;
+  maximum_frequencies: number[];
   governors: string[];
   current: number;
   minimum: number;
   maximum: number;
+  effective_maximum: number;
 }
 
 export interface GpuCapability {

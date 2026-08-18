@@ -176,6 +176,14 @@ export function Content() {
   const valid = cpuPolicies.length > 0;
   const effectiveCooling = live?.cooling_profile || state.effective_cooling_profile;
   const fanCanApply = effectiveCooling === "custom";
+  const boostPolicies = cpuPolicies.filter(policy =>
+    policy.boost_enabled && policy.boost_frequencies.length > 0);
+  const selectedBoostLimits = boostPolicies
+    .map(policy => draft.cpu_max[policy.id])
+    .filter((frequency, index) => boostPolicies[index].boost_frequencies.includes(frequency));
+  const hardwareBoostMaximum = Math.max(0, ...boostPolicies.flatMap(policy => policy.boost_frequencies));
+  const selectedBoostMaximum = Math.max(0, ...selectedBoostLimits);
+  const performanceBoost = draft.cpu_governor === "performance" && selectedBoostMaximum > 0;
 
   const saveAndApply = () => run(
     async () => installState(await savePreset(selected, draft), selected),
@@ -303,6 +311,16 @@ export function Content() {
       <SectionHeading>CPU</SectionHeading>
       <SelectRow label="Governor" value={draft.cpu_governor} values={state.capabilities.cpu_governors}
         onChange={value => update(profile => { profile.cpu_governor = value; })} />
+      {boostPolicies.length > 0 && <div className={performanceBoost ? "rke-boost-warning" : "rke-boost-notice"}>
+        <PanelSectionRow><Field
+          label={performanceBoost ? "CPU boost may remain at maximum" : "ROCKNIX CPU boost enabled"}
+          description={performanceBoost
+            ? `The performance governor may hold boost clocks up to ${cpuMhz(selectedBoostMaximum)} continuously. Use schedutil for dynamic boosting.`
+            : selectedBoostMaximum > 0
+              ? `This preset permits boost up to ${cpuMhz(selectedBoostMaximum)}. Adaptive governors request it only when needed.`
+              : `Boost is available up to ${cpuMhz(hardwareBoostMaximum)}, but this preset is capped below the boost clocks.`} />
+        </PanelSectionRow>
+      </div>}
       {cpuPolicies.map((policy, index) => <div key={policy.id}>
         <div className="rke-cluster-heading">
           <div>Cluster {index + 1}</div>
@@ -316,11 +334,11 @@ export function Content() {
             profile.cpu_min[policy.id] = value;
             if (value > profile.cpu_max[policy.id]) profile.cpu_max[policy.id] = value;
           })} /></PanelSectionRow>
-        <PanelSectionRow><SliderField label="Max" description={cpuMhz(draft.cpu_max[policy.id])}
-          value={Math.max(0, policy.frequencies.indexOf(draft.cpu_max[policy.id]))}
-          min={0} max={policy.frequencies.length - 1} step={1}
+        <PanelSectionRow><SliderField label="Max" description={`${cpuMhz(draft.cpu_max[policy.id])}${policy.boost_frequencies.includes(draft.cpu_max[policy.id]) ? " · Boost" : ""}`}
+          value={Math.max(0, policy.maximum_frequencies.indexOf(draft.cpu_max[policy.id]))}
+          min={0} max={policy.maximum_frequencies.length - 1} step={1}
           onChange={index => update(profile => {
-            const value = policy.frequencies[index];
+            const value = policy.maximum_frequencies[index];
             profile.cpu_max[policy.id] = value;
             if (value < profile.cpu_min[policy.id]) profile.cpu_min[policy.id] = value;
           })} /></PanelSectionRow>

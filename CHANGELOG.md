@@ -1,0 +1,73 @@
+# Changelog
+
+## v0.2.0-beta.2 — 2026-08-18
+
+This patch focuses on correct CPU boost handling and recoverable ownership of
+runtime hardware controls.
+
+### CPU boost support
+
+- Discovers boost support independently for every CPU policy instead of using
+  SoC-specific frequency constants.
+- Reads policy or global boost state, `scaling_boost_frequencies`, and the
+  policy's `cpuinfo_max_freq` where it exposes an additional boost ceiling.
+- Keeps boost clocks out of minimum-frequency choices.
+- Adds available boost bins to each policy's maximum-frequency control and
+  labels them as **Boost**.
+- Shows an informational notice when ROCKNIX CPU boost is enabled.
+- Shows a red warning when `performance` and a boost maximum are selected,
+  because that governor may request the highest permitted clock continuously.
+- Reports the device's effective boost-capable maximum to monitoring rather
+  than treating the normal frequency table as the hardware ceiling.
+- Fixes the previous SM8750 behaviour where applying a preset wrote the normal
+  `4089.6 MHz` maximum back over ROCKNIX's native `4320 MHz` boost ceiling.
+
+Boost remains device- and ROCKNIX-controlled. RK-Enhanced neither enables nor
+disables turbo mode; it exposes the frequencies provided by the running kernel.
+
+### Runtime ownership and restoration
+
+- Captures a same-boot native baseline immediately before the first RKE preset
+  is applied.
+- Tracks CPU governors and minimum/maximum frequencies per policy.
+- Tracks GPU governor and minimum/maximum frequencies.
+- Tracks the `scx_lavd.service` scheduler state.
+- Tracks bypass-charging behaviour when RKE changes it.
+- Integrates protected ROCKNIX Custom fan-curve recovery into the same runtime
+  session.
+- Restores owned controls when Steam exits, the plugin unloads cleanly, Decky
+  terminates, or the RKE plugin worker crashes.
+- Uses atomic state records and a shared file lock so a detached guard cannot
+  race an in-progress hardware write.
+- Records RKE's last intended value and restores a control only when its current
+  value still matches that value. Later ROCKNIX or manual changes are preserved
+  wherever this comparison can identify them.
+- Skips stale CPU, GPU, scheduler, and charging values after a reboot while
+  still recovering the persistent protected fan curve when required.
+- Retries an incomplete crash restoration three times and leaves its session
+  record available for startup recovery if restoration cannot finish.
+- Detects both PluginLoader termination and a terminated RKE worker process.
+
+The captured baseline is the state immediately before RKE's first apply. This
+does not change ROCKNIX's separate behaviour when a Steam override itself is not
+restored to the earlier System profile.
+
+### Installation and recovery
+
+- Replaces the fan-only guard with a general runtime restoration guard and a
+  standalone restoration helper copied outside the plugin directory for crash
+  safety during updates.
+- Moves installer backups to `/storage/homebrew/plugin-backups` so Decky cannot
+  discover a rollback copy as a second plugin.
+- Validates the restoration tools when installing a release.
+- Packages the new helper and guard in GitHub release archives.
+
+### Validation
+
+- Adds automated coverage for restoring a native boost ceiling.
+- Verifies that controls changed after RKE's write are preserved.
+- Covers GPU, charging, and protected fan-curve restoration.
+- Covers stale sessions from an earlier boot.
+- Covers different boost ceilings across CPU policies and devices.
+- Runs Python compilation, unit tests, shell syntax checks, TypeScript checks,
+  and the production frontend build in the release workflow.

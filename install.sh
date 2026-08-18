@@ -10,6 +10,7 @@ STORAGE_ROOT="/storage"
 HOMEBREW_DIR="${STORAGE_ROOT}/homebrew"
 SERVICES_DIR="${HOMEBREW_DIR}/services"
 PLUGINS_DIR="${HOMEBREW_DIR}/plugins"
+BACKUP_ROOT="${HOMEBREW_DIR}/plugin-backups"
 SERVICE_FILE="${STORAGE_ROOT}/.config/system.d/plugin_loader.service"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -78,12 +79,14 @@ fi
 unzip -q "${work_dir}/RK-Enhanced.zip" -d "${work_dir}/plugin"
 if [ ! -f "${work_dir}/plugin/RK-Enhanced/plugin.json" ] || \
    [ ! -f "${work_dir}/plugin/RK-Enhanced/main.py" ] || \
+   [ ! -f "${work_dir}/plugin/RK-Enhanced/runtime-restore.py" ] || \
+   [ ! -f "${work_dir}/plugin/RK-Enhanced/runtime-restore-guard.sh" ] || \
    [ ! -f "${work_dir}/plugin/RK-Enhanced/dist/index.js" ]; then
     echo "RK-Enhanced release has an invalid plugin layout." >&2
     exit 1
 fi
 
-mkdir -p "${SERVICES_DIR}" "${PLUGINS_DIR}" "$(dirname "${SERVICE_FILE}")"
+mkdir -p "${SERVICES_DIR}" "${PLUGINS_DIR}" "${BACKUP_ROOT}" "$(dirname "${SERVICE_FILE}")"
 touch "${STORAGE_ROOT}/.steam/steam/.cef-enable-remote-debugging" 2>/dev/null || true
 
 echo "Stopping Decky cleanly..."
@@ -97,8 +100,8 @@ if [ -f "${SERVICES_DIR}/PluginLoader" ]; then
     cp "${SERVICES_DIR}/PluginLoader" "${SERVICES_DIR}/PluginLoader.rollback"
 fi
 if [ -d "${PLUGINS_DIR}/RK-Enhanced" ]; then
-    rm -rf "${PLUGINS_DIR}/RK-Enhanced.rollback"
-    mv "${PLUGINS_DIR}/RK-Enhanced" "${PLUGINS_DIR}/RK-Enhanced.rollback"
+    plugin_backup="${BACKUP_ROOT}/RK-Enhanced-before-${rke_version}-$(date +%Y%m%d-%H%M%S)"
+    mv "${PLUGINS_DIR}/RK-Enhanced" "${plugin_backup}"
 fi
 
 cp "${work_dir}/PluginLoader" "${SERVICES_DIR}/PluginLoader"

@@ -1,11 +1,14 @@
 """Root Decky backend for RK-Enhanced on ROCKNIX."""
 
 import asyncio
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 import signal
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -22,6 +25,7 @@ FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
 KGSL_GPU_ROOT = Path("/sys/class/kgsl/kgsl-3d0")
+CHARGE_BEHAVIOUR = Path("/sys/class/power_supply/battery/charge_behaviour")
 
 
 def _read(path, default=""):
@@ -45,7 +49,7 @@ def _read_ints(path):
         return []
 
 
-def _run(command, check=True):
+def _run(command, check=True, timeout=15):
     environment = os.environ.copy()
     # PyInstaller-based Decky builds prepend their private libraries to child
     # processes. System tools such as curl must use ROCKNIX's own OpenSSL.
@@ -56,7 +60,7 @@ def _run(command, check=True):
         else:
             environment.pop(variable, None)
     process = subprocess.run(command, text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, timeout=15, check=False,
+                             stderr=subprocess.PIPE, timeout=timeout, check=False,
                              env=environment)
     if check and process.returncode:
         raise RuntimeError(process.stderr.strip() or f"command failed: {command[0]}")
@@ -103,12 +107,35 @@ def _atomic_text(path, content):
     temporary.replace(path)
 
 
+@contextmanager
+def _exclusive_file_lock(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _active_charge_behaviour(path=CHARGE_BEHAVIOUR):
+    value = _read(path)
+    for option in value.split():
+        if option.startswith("[") and option.endswith("]"):
+            return option[1:-1]
+    return value
+
+
 def _cpu_capabilities():
     result = []
     policies = list(CPU_ROOT.glob("policy*"))
     policies.sort(key=lambda item: int(item.name[6:]))
     for policy in policies:
         frequencies = _read_ints(policy / "scaling_available_frequencies")
+        boost_frequencies = _read_ints(policy / "scaling_boost_frequencies")
+        boost_enabled = bool(_read_int(
+            policy / "boost", _read_int(CPU_ROOT / "boost")))
         if not frequencies:
             frequencies = sorted({value for value in (
                 _read_int(policy / "cpuinfo_min_freq"),
@@ -116,13 +143,23 @@ def _cpu_capabilities():
             ) if value})
         if not frequencies:
             continue
+        cpuinfo_maximum = _read_int(policy / "cpuinfo_max_freq")
+        if boost_enabled and cpuinfo_maximum > max(frequencies):
+            boost_frequencies = sorted(set(boost_frequencies + [cpuinfo_maximum]))
+        maximum_frequencies = sorted(set(
+            frequencies + (boost_frequencies if boost_enabled else [])
+        ))
         cpus = _read(policy / "affected_cpus", policy.name[6:]).split()
         result.append({
             "id": policy.name[6:], "cpus": cpus, "frequencies": frequencies,
+            "boost_frequencies": boost_frequencies,
+            "boost_enabled": boost_enabled,
+            "maximum_frequencies": maximum_frequencies,
             "governors": sorted(set(_read(policy / "scaling_available_governors").split())),
             "current": _read_int(policy / "scaling_cur_freq"),
             "minimum": _read_int(policy / "scaling_min_freq"),
             "maximum": _read_int(policy / "scaling_max_freq"),
+            "effective_maximum": max(maximum_frequencies),
         })
     return result
 
@@ -259,6 +296,10 @@ def _scheduler_capabilities():
     return result
 
 
+def _service_active(unit):
+    return _run(["systemctl", "is-active", unit], check=False) == "active"
+
+
 def _capabilities():
     cpu = _cpu_capabilities()
     common = sorted(set.intersection(*(set(item["governors"]) for item in cpu))) if cpu else []
@@ -309,9 +350,10 @@ def _validate_profile(profile, capabilities):
     clean_min, clean_max = {}, {}
     for policy in capabilities["cpu"]:
         pid, frequencies = policy["id"], policy["frequencies"]
+        maximum_frequencies = policy["maximum_frequencies"]
         low = int(clean.get("cpu_min", {}).get(pid, -1))
         high = int(clean.get("cpu_max", {}).get(pid, -1))
-        if low not in frequencies or high not in frequencies or low > high:
+        if low not in frequencies or high not in maximum_frequencies or low > high:
             raise ValueError(f"invalid CPU range for policy {pid}")
         clean_min[pid], clean_max[pid] = low, high
     clean["cpu_min"], clean["cpu_max"] = clean_min, clean_max
@@ -385,7 +427,12 @@ class Plugin:
         settings = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
         self.settings_dir = Path(settings) if settings else Path(__file__).resolve().parent / "settings"
         self.settings_path = self.settings_dir / SETTINGS_FILE
-        self.fan_guard_marker = self.settings_dir / "fan-curve-session.active"
+        self.legacy_fan_guard_marker = self.settings_dir / "fan-curve-session.active"
+        self.runtime_marker = self.settings_dir / "runtime-session.active"
+        self.runtime_state_path = self.settings_dir / "runtime-session.json"
+        self.runtime_lock_path = self.settings_dir / "runtime-session.lock"
+        self.runtime_restore_path = self.settings_dir / "runtime-restore.py"
+        self.runtime_guard_path = self.settings_dir / "runtime-restore-guard.sh"
         self.canonical_fan_config = self.settings_dir / "rocknix-custom-fancontrol.conf"
         self.active_preset = DEFAULT_PRESET
         self.active_appid = ""
@@ -399,6 +446,7 @@ class Plugin:
         self.battery_discharge_last_sample = 0.0
         self.log_offsets = {}
         self.latest_release_cache = (0.0, [])
+        self.session_lock = threading.RLock()
         self.lock = None
         self.game_watch_task = None
 
@@ -486,37 +534,154 @@ class Plugin:
         _atomic_text(self.canonical_fan_config,
                      f"SPEEDS=({speeds})\nTEMPS=({temps})\n")
 
-    def _fan_session_active(self):
-        return self.fan_guard_marker.exists()
-
-    def _start_fan_guard(self):
-        if self._fan_session_active():
-            return
-        source = Path(__file__).resolve().parent / "fan-restore-guard.sh"
-        if not source.exists():
-            raise RuntimeError("fan restoration guard is missing")
-        guard = self.settings_dir / "fan-restore-guard.sh"
-        shutil.copy2(source, guard)
-        guard.chmod(0o755)
-        _atomic_text(self.fan_guard_marker, f"{os.getpid()}\n")
+    def _runtime_state(self):
         try:
-            unit = f"rke-fan-restore-guard-{os.getpid()}-{time.monotonic_ns()}"
+            state = json.loads(self.runtime_state_path.read_text())
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+
+    def _capture_runtime_state(self, capabilities):
+        cpu = []
+        for policy in capabilities["cpu"]:
+            path = CPU_ROOT / f"policy{policy['id']}"
+            cpu.append({
+                "id": policy["id"],
+                "path": str(path),
+                "baseline": {
+                    "governor": _read(path / "scaling_governor"),
+                    "minimum": _read_int(path / "scaling_min_freq"),
+                    "maximum": _read_int(path / "scaling_max_freq"),
+                },
+                "applied": {},
+            })
+        gpu = None
+        if capabilities["gpu"]["available"]:
+            path = _gpu_path()
+            gpu = {
+                "path": str(path),
+                "baseline": {
+                    "governor": _read(path / "governor"),
+                    "minimum": _read_int(path / "min_freq"),
+                    "maximum": _read_int(path / "max_freq"),
+                },
+                "applied": {},
+            }
+        scheduler = None
+        if "lavd" in capabilities["schedulers"]:
+            scheduler = {
+                "unit": "scx_lavd.service",
+                "baseline": _service_active("scx_lavd.service"),
+                "applied": None,
+            }
+        charging = None
+        if CHARGE_BEHAVIOUR.exists():
+            charging = {
+                "path": str(CHARGE_BEHAVIOUR),
+                "baseline": _active_charge_behaviour(),
+                "applied": None,
+            }
+        return {
+            "version": 1,
+            "owner_pid": os.getpid(),
+            "boot_id": _read("/proc/sys/kernel/random/boot_id"),
+            "created": int(time.time()),
+            "controls": {
+                "cpu": cpu,
+                "gpu": gpu,
+                "scheduler": scheduler,
+                "charging": charging,
+                "fan": {"applied": False},
+            },
+        }
+
+    def _install_runtime_restore_tools(self):
+        plugin_dir = Path(__file__).resolve().parent
+        source_guard = plugin_dir / "runtime-restore-guard.sh"
+        source_restore = plugin_dir / "runtime-restore.py"
+        if not source_guard.exists() or not source_restore.exists():
+            raise RuntimeError("runtime restoration tools are missing")
+        shutil.copy2(source_guard, self.runtime_guard_path)
+        shutil.copy2(source_restore, self.runtime_restore_path)
+        self.runtime_guard_path.chmod(0o755)
+        self.runtime_restore_path.chmod(0o755)
+
+    def _ensure_runtime_session_locked(self, capabilities):
+        if self.runtime_marker.exists():
+            return self._runtime_state()
+        self._install_runtime_restore_tools()
+        state = self._capture_runtime_state(capabilities)
+        _atomic_text(self.runtime_state_path,
+                     json.dumps(state, indent=2, sort_keys=True) + "\n")
+        _atomic_text(self.runtime_marker, f"{os.getpid()}\n")
+        try:
+            unit = f"rke-runtime-restore-guard-{os.getpid()}-{time.monotonic_ns()}"
             _run(["systemd-run", f"--unit={unit}", "--collect",
-                  str(guard), str(self.fan_guard_marker),
+                  str(self.runtime_guard_path), str(self.runtime_marker),
+                  str(self.runtime_state_path), str(self.runtime_restore_path),
                   str(self.canonical_fan_config), str(FAN_CONFIG)])
         except Exception:
-            self.fan_guard_marker.unlink(missing_ok=True)
+            self.runtime_marker.unlink(missing_ok=True)
+            self.runtime_state_path.unlink(missing_ok=True)
             raise
+        decky.logger.info("Captured native runtime baseline and started restoration guard")
+        return state
 
-    def _restore_system_fan_curve(self):
-        if not self._fan_session_active():
+    def _record_profile_intent_locked(self, state, clean, capabilities,
+                                      fan_applied):
+        controls = state["controls"]
+        policies = {item["id"]: item for item in controls["cpu"]}
+        for policy in capabilities["cpu"]:
+            pid = policy["id"]
+            policies[pid]["applied"] = {
+                "governor": clean["cpu_governor"],
+                "minimum": clean["cpu_min"][pid],
+                "maximum": clean["cpu_max"][pid],
+            }
+        gpu = controls.get("gpu")
+        if gpu is not None and capabilities["gpu"]["available"]:
+            gpu["applied"] = {
+                "governor": clean["gpu_governor"],
+                "minimum": clean["gpu_min"],
+                "maximum": clean["gpu_max"],
+            }
+        scheduler = controls.get("scheduler")
+        if scheduler is not None:
+            scheduler["applied"] = clean["cpu_scheduler"] == "lavd"
+        if fan_applied:
+            controls["fan"]["applied"] = True
+        _atomic_text(self.runtime_state_path,
+                     json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+    def _fan_session_active(self):
+        if not self.runtime_marker.exists():
+            return False
+        return bool(self._runtime_state().get("controls", {}).get(
+            "fan", {}).get("applied"))
+
+    def _restore_runtime_session(self):
+        if not self.runtime_marker.exists():
+            return False
+        self._install_runtime_restore_tools()
+        output = _run([
+            str(self.runtime_restore_path), str(self.runtime_marker),
+            str(self.runtime_state_path), str(self.canonical_fan_config),
+            str(FAN_CONFIG),
+        ], timeout=30)
+        if self.runtime_marker.exists():
+            raise RuntimeError(output or "runtime restoration did not complete")
+        decky.logger.info(output or "Restored native runtime baseline")
+        return True
+
+    def _restore_legacy_system_fan_curve(self):
+        if not self.legacy_fan_guard_marker.exists():
             return False
         data = self._load()
         _write_fan_curve(data["system_fan_curve"])
-        self.fan_guard_marker.unlink(missing_ok=True)
+        self.legacy_fan_guard_marker.unlink(missing_ok=True)
         if _get_setting("cooling.profile", "") == "custom":
             _restart_fancontrol()
-        decky.logger.info("Restored protected ROCKNIX Custom fan curve")
+        decky.logger.info("Restored protected ROCKNIX Custom fan curve from a legacy session")
         return True
 
     def _save(self, data):
@@ -534,28 +699,32 @@ class Plugin:
     def _apply(self, profile, capabilities=None):
         capabilities = capabilities or _capabilities()
         clean = _validate_profile(profile, capabilities)
-        for policy in capabilities["cpu"]:
-            path, pid = CPU_ROOT / f"policy{policy['id']}", policy["id"]
-            (path / "scaling_governor").write_text(clean["cpu_governor"])
-            _write_range(path, clean["cpu_min"][pid], clean["cpu_max"][pid])
-        gpu = capabilities["gpu"]
-        if gpu["available"]:
-            path = _gpu_path()
-            (path / "governor").write_text(clean["gpu_governor"])
-            _write_gpu_range(path, clean["gpu_min"], clean["gpu_max"])
         effective_cooling = _get_setting("cooling.profile", "")
-        if effective_cooling == "custom":
-            self._start_fan_guard()
-            _write_fan_curve(clean["fan_curve"])
-            fancontrol_pid = _restart_fancontrol()
-            decky.logger.info(
-                f"Applied RK-E fan curve through native fancontrol: pid={fancontrol_pid}")
-        else:
-            decky.logger.info(
-                f"RK-E fan curve inactive: effective ROCKNIX cooling profile is {effective_cooling or 'unknown'}")
-        if "lavd" in capabilities["schedulers"]:
-            action = "start" if clean["cpu_scheduler"] == "lavd" else "stop"
-            _run(["systemctl", action, "scx_lavd.service"])
+        fan_applied = effective_cooling == "custom"
+        with self.session_lock, _exclusive_file_lock(self.runtime_lock_path):
+            state = self._ensure_runtime_session_locked(capabilities)
+            self._record_profile_intent_locked(
+                state, clean, capabilities, fan_applied)
+            for policy in capabilities["cpu"]:
+                path, pid = CPU_ROOT / f"policy{policy['id']}", policy["id"]
+                (path / "scaling_governor").write_text(clean["cpu_governor"])
+                _write_range(path, clean["cpu_min"][pid], clean["cpu_max"][pid])
+            gpu = capabilities["gpu"]
+            if gpu["available"]:
+                path = _gpu_path()
+                (path / "governor").write_text(clean["gpu_governor"])
+                _write_gpu_range(path, clean["gpu_min"], clean["gpu_max"])
+            if fan_applied:
+                _write_fan_curve(clean["fan_curve"])
+                fancontrol_pid = _restart_fancontrol()
+                decky.logger.info(
+                    f"Applied RK-E fan curve through native fancontrol: pid={fancontrol_pid}")
+            else:
+                decky.logger.info(
+                    f"RK-E fan curve inactive: effective ROCKNIX cooling profile is {effective_cooling or 'unknown'}")
+            if "lavd" in capabilities["schedulers"]:
+                action = "start" if clean["cpu_scheduler"] == "lavd" else "stop"
+                _run(["systemctl", action, "scx_lavd.service"])
         return True
 
     async def get_state(self):
@@ -1009,7 +1178,7 @@ class Plugin:
             "cpu_percent": round(cpu_percent, 1),
             "gpu_percent": round(gpu_percent, 1),
             "cpu_clocks": [{"id": item["id"], "cpus": item["cpus"], "frequency": item["current"],
-                            "minimum": item["minimum"], "maximum": item["maximum"]} for item in cpu],
+                            "minimum": item["minimum"], "maximum": item["effective_maximum"]} for item in cpu],
             "cpu_governor": governors[0] if len(set(governors)) == 1 else "Mixed",
             "gpu_frequency": gpu["current"], "gpu_frequency_max": max(gpu["frequencies"], default=0),
             "gpu_governor": _read(gpu_path / "governor") if gpu_path else "",
@@ -1030,11 +1199,20 @@ class Plugin:
         def work():
             if bool(enabled) and not self._load().get("experimental_unlocked", False):
                 raise RuntimeError("unlock experimental controls in Utils first")
-            behaviour = Path("/sys/class/power_supply/battery/charge_behaviour")
+            behaviour = CHARGE_BEHAVIOUR
             if not behaviour.exists():
                 raise RuntimeError("bypass charging is unavailable on this device")
             requested = "inhibit-charge" if bool(enabled) else "auto"
-            behaviour.write_text(requested)
+            capabilities = _capabilities()
+            with self.session_lock, _exclusive_file_lock(self.runtime_lock_path):
+                state = self._ensure_runtime_session_locked(capabilities)
+                charging = state["controls"].get("charging")
+                if charging is None:
+                    raise RuntimeError("bypass charging is unavailable in this runtime session")
+                charging["applied"] = requested
+                _atomic_text(self.runtime_state_path,
+                             json.dumps(state, indent=2, sort_keys=True) + "\n")
+                behaviour.write_text(requested)
             self.battery_discharge_ema = None
             self.battery_discharge_samples = 0
             self.battery_discharge_last_sample = 0.0
@@ -1179,9 +1357,11 @@ class Plugin:
     async def _main(self):
         decky.logger.info("RK-Enhanced loaded; native ROCKNIX fancontrol remains in ownership")
         def initialise():
-            if self._fan_session_active():
-                self._restore_system_fan_curve()
             self._load()
+            if self.runtime_marker.exists():
+                self._restore_runtime_session()
+            if self.legacy_fan_guard_marker.exists():
+                self._restore_legacy_system_fan_curve()
         await asyncio.to_thread(initialise)
         self.game_watch_task = asyncio.create_task(self._game_watch_loop())
 
@@ -1193,7 +1373,9 @@ class Plugin:
             except asyncio.CancelledError:
                 pass
             self.game_watch_task = None
-        restored = await asyncio.to_thread(self._restore_system_fan_curve)
+        restored = await asyncio.to_thread(self._restore_runtime_session)
+        legacy_restored = await asyncio.to_thread(self._restore_legacy_system_fan_curve)
         decky.logger.info(
-            "RK-Enhanced unloaded; protected fan curve restored" if restored
-            else "RK-Enhanced unloaded; no fan curve session required restoration")
+            "RK-Enhanced unloaded; native runtime baseline restored"
+            if restored or legacy_restored
+            else "RK-Enhanced unloaded; no runtime session required restoration")

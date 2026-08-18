@@ -18,6 +18,10 @@ export const styles = `
   .rke-section-heading { width: 100%; box-sizing: border-box; padding: 8px 0 10px; text-align: center; text-transform: uppercase; font-size: 16px; font-weight: 700; letter-spacing: .04em; }
   .rke-cluster-heading { width: 100%; box-sizing: border-box; padding: 12px 0 4px; text-align: center; font-size: 15px; font-weight: 600; }
   .rke-cluster-heading small { display: block; margin-top: 3px; opacity: .66; font-size: 11px; font-weight: 400; }
+  .rke-boost-notice .${gamepadDialogClasses.Field},
+  .rke-boost-notice .${gamepadDialogClasses.FieldDescription} { color: #69b9ff !important; opacity: 1 !important; }
+  .rke-boost-warning .${gamepadDialogClasses.Field},
+  .rke-boost-warning .${gamepadDialogClasses.FieldDescription} { color: #ff5b5b !important; opacity: 1 !important; }
   .rke-content .${quickAccessMenuClasses.PanelSectionRow} { margin-top: 0 !important; margin-bottom: 3px !important; padding-top: 0 !important; padding-bottom: 0 !important; }
   .rke-content .${gamepadDialogClasses.Field} { min-height: 0 !important; padding-top: 7px !important; padding-bottom: 7px !important; }
   .rke-content .${gamepadDialogClasses.WithStandardPadding},
