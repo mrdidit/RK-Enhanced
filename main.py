@@ -15,6 +15,7 @@ import decky
 DEFAULT_PRESET = "Steam Default"
 LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default")
 SETTINGS_FILE = "settings.json"
+UPDATE_STATUS_FILE = "update-status.txt"
 FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
@@ -885,6 +886,27 @@ class Plugin:
                     self.log_offsets[str(path)] = len(path.read_text(errors="replace").splitlines())
                 except OSError:
                     pass
+            return True
+        return await asyncio.to_thread(work)
+
+    async def get_update_status(self):
+        return await asyncio.to_thread(
+            _read, self.settings_dir / UPDATE_STATUS_FILE, "No reinstall has been run yet."
+        )
+
+    async def reinstall_latest_release(self):
+        def work():
+            source = Path(__file__).resolve().parent / "updater.sh"
+            if not source.exists():
+                raise RuntimeError("updater.sh is missing from this RK-Enhanced installation")
+            target = Path("/storage/homebrew/rk-enhanced-updater.sh")
+            shutil.copy2(source, target)
+            target.chmod(0o755)
+            _atomic_text(self.settings_dir / UPDATE_STATUS_FILE,
+                         "Starting the RK-Enhanced reinstall…\n")
+            _run(["systemctl", "reset-failed", "rk-enhanced-update.service"], check=False)
+            _run(["systemd-run", "--unit=rk-enhanced-update", "--collect", str(target)])
+            decky.logger.info("Detached latest-release reinstall started")
             return True
         return await asyncio.to_thread(work)
 

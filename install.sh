@@ -5,7 +5,7 @@
 set -eu
 
 DECKY_REPOSITORY="SteamDeckHomebrew/decky-loader"
-RKE_REPOSITORY="thefiqs/RK-Enhanced"
+RKE_REPOSITORY="mrdidit/RK-Enhanced"
 STORAGE_ROOT="/storage"
 HOMEBREW_DIR="${STORAGE_ROOT}/homebrew"
 SERVICES_DIR="${HOMEBREW_DIR}/services"

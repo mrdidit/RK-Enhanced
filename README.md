@@ -97,7 +97,7 @@ The bundled installer downloads the latest stable Decky Loader and the newest
 RK-Enhanced release, including pre-releases:
 
 ```sh
-curl -fL https://raw.githubusercontent.com/thefiqs/RK-Enhanced/main/install.sh | sh
+curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh
 ```
 
 Run it as `root` on the ROCKNIX device. Review `install.sh` before piping it to a
@@ -110,8 +110,15 @@ For a manual installation, extract the release asset so the final layout is:
 /storage/homebrew/plugins/RK-Enhanced/
 ├── dist/index.js
 ├── main.py
+├── updater.sh
 └── plugin.json
 ```
+
+After a release containing the detached updater is installed, Utils →
+**Reinstall latest release** can download and validate the newest GitHub release,
+back up the current plugin, close Steam, replace RK-Enhanced, restart Decky and
+relaunch Steam through ROCKNIX's native Steam startup script. Any running game
+is terminated, so save progress before confirming the reinstall.
 
 ## Development
 

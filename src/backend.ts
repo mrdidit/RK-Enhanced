@@ -6,6 +6,8 @@ export const getTelemetry = () => call<[], Telemetry>("get_telemetry");
 export const setBypassCharging = (enabled: boolean) => call<[boolean], boolean>("set_bypass_charging", enabled);
 export const getLog = () => call<[], string>("get_log");
 export const clearLog = () => call<[], boolean>("clear_log");
+export const getUpdateStatus = () => call<[], string>("get_update_status");
+export const reinstallLatestRelease = () => call<[], boolean>("reinstall_latest_release");
 export const applyProfile = (profile: HardwareProfile) => call<[HardwareProfile], boolean>("apply_profile", profile);
 export const savePreset = (name: string, profile: HardwareProfile) => call<[string, HardwareProfile], State>("save_preset", name, profile);
 export const restoreSteamDefault = () => call<[], State>("restore_steam_default");
