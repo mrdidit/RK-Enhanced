@@ -117,9 +117,9 @@ For a manual installation, extract the release asset so the final layout is:
 
 After a release containing the detached updater is installed, Utils →
 **Reinstall latest release** can download and validate the newest GitHub release,
-back up the current plugin, close Steam, replace RK-Enhanced, restart Decky and
-relaunch Steam through ROCKNIX's native Steam startup script. Any running game
-is terminated, so save progress before confirming the reinstall.
+back up the current plugin, replace RK-Enhanced and restart Decky while leaving
+Steam and any running game untouched. RK-Enhanced controls are briefly
+unavailable while Decky reloads.
 
 ## Development
 

@@ -4,7 +4,7 @@ import {
 } from "@decky/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, reinstallLatestRelease, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame } from "./backend";
+import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, installRelease, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame } from "./backend";
 import { currentGame } from "./game";
 import { Monitor } from "./Monitor";
 import { Logs } from "./Logs";
@@ -231,13 +231,13 @@ export function Content() {
     strDescription="Replace Steam Default with the original ROCKNIX settings copied during setup?"
     strOKButtonText="Restore" strCancelButtonText="Cancel"
     onOK={() => run(async () => installState(await restoreSteamDefault(), DEFAULT), "Steam Default restored")} />);
-  const confirmReinstall = () => showModal(<ConfirmModal
-    strTitle={updateInfo?.update_available ? `Update to ${updateInfo.latest}?` : "Reinstall latest RK-Enhanced?"}
-    strDescription="This closes Steam and any running game, downloads the newest GitHub release, backs up the current plugin, installs it, then relaunches Steam."
-    strOKButtonText={updateInfo?.update_available ? "Update" : "Reinstall"} strCancelButtonText="Cancel"
+  const confirmRelease = (target: string, action: "Update" | "Reinstall" | "Downgrade") => showModal(<ConfirmModal
+    strTitle={`${action} ${target}?`}
+    strDescription={`This downloads ${target} from GitHub, backs up the current plugin, installs it, then reloads Decky. RK-Enhanced controls will be briefly unavailable.`}
+    strOKButtonText={action} strCancelButtonText="Cancel"
     onOK={() => run(async () => {
-      await reinstallLatestRelease();
-    }, "Update started; Steam will restart")} />);
+      await installRelease(target);
+    }, `${action} started; Decky will reload`)} />);
 
   const presets = <div className="rke-presets">
     <PanelSection>
@@ -389,9 +389,12 @@ export function Content() {
       <PanelSectionRow><Field label="Latest GitHub release"
         description={updateInfo?.latest || (updateError ? "Unavailable" : "Checking…")} /></PanelSectionRow>
       <PanelSectionRow><ButtonItem layout="below" disabled={busy || !updateInfo?.latest}
-        onClick={confirmReinstall}>{!updateInfo?.latest ? "Checking latest release…"
+        onClick={() => updateInfo?.latest && confirmRelease(updateInfo.latest,
+          updateInfo.update_available ? "Update" : "Reinstall")}>{!updateInfo?.latest ? "Checking latest release…"
           : updateInfo.update_available ? `Update to ${updateInfo.latest}`
             : "Reinstall latest release"}</ButtonItem></PanelSectionRow>
+      {updateInfo?.previous && <PanelSectionRow><ButtonItem layout="below" disabled={busy}
+        onClick={() => confirmRelease(updateInfo.previous, "Downgrade")}>Downgrade to {updateInfo.previous}</ButtonItem></PanelSectionRow>}
       {updateError && <PanelSectionRow><Field label="Update check failed" description={updateError} /></PanelSectionRow>}
     </PanelSection>
   </div>;

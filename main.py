@@ -397,7 +397,7 @@ class Plugin:
         self.battery_discharge_samples = 0
         self.battery_discharge_last_sample = 0.0
         self.log_offsets = {}
-        self.latest_release_cache = (0.0, "")
+        self.latest_release_cache = (0.0, [])
         self.lock = None
 
     def _load(self):
@@ -929,34 +929,45 @@ class Plugin:
                     installed = status.split(marker, 1)[1].split(";", 1)[0].split(",", 1)[0].strip()
             installed = installed or "Unknown"
 
-            cached_at, latest = self.latest_release_cache
+            cached_at, releases = self.latest_release_cache
             error = ""
             try:
-                if not latest or time.monotonic() - cached_at >= 300:
+                if not releases or time.monotonic() - cached_at >= 300:
                     payload = json.loads(_run([
                         "curl", "-fsSL",
                         f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases?per_page=10",
                     ]))
-                    latest = next((
+                    releases = [
                         str(release.get("tag_name", ""))
                         for release in payload
                         if not release.get("draft") and any(
                             asset.get("name") == "RK-Enhanced.zip"
                             for asset in release.get("assets", [])
-                        )
-                    ), "")
-                    if not latest:
+                        ) and release.get("tag_name")
+                    ]
+                    if not releases:
                         raise RuntimeError("no published RK-Enhanced release was found")
-                    self.latest_release_cache = (time.monotonic(), latest)
+                    self.latest_release_cache = (time.monotonic(), releases)
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as reason:
                 error = str(reason)
+            latest = releases[0] if releases else ""
+            previous = ""
+            if installed in releases:
+                position = releases.index(installed)
+                if position + 1 < len(releases):
+                    previous = releases[position + 1]
             return {"installed": installed, "latest": latest,
                     "update_available": bool(latest and installed != latest),
-                    "error": error}
+                    "previous": previous, "error": error}
         return await asyncio.to_thread(work)
 
-    async def reinstall_latest_release(self):
+    async def install_release(self, version):
         def work():
+            requested = str(version).strip()
+            if (not requested or len(requested) > 64 or
+                    any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                        for character in requested)):
+                raise ValueError("invalid release version")
             source = Path(__file__).resolve().parent / "updater.sh"
             if not source.exists():
                 raise RuntimeError("updater.sh is missing from this RK-Enhanced installation")
@@ -964,12 +975,19 @@ class Plugin:
             shutil.copy2(source, target)
             target.chmod(0o755)
             _atomic_text(self.settings_dir / UPDATE_STATUS_FILE,
-                         "Starting the RK-Enhanced reinstall…\n")
+                         f"Starting installation of {requested}…\n")
             _run(["systemctl", "reset-failed", "rk-enhanced-update.service"], check=False)
-            _run(["systemd-run", "--unit=rk-enhanced-update", "--collect", str(target)])
-            decky.logger.info("Detached latest-release reinstall started")
+            _run(["systemd-run", "--unit=rk-enhanced-update", "--collect",
+                  str(target), requested])
+            decky.logger.info(f"Detached release installation started: {requested}")
             return True
         return await asyncio.to_thread(work)
+
+    async def reinstall_latest_release(self):
+        info = await self.get_update_info()
+        if not info["latest"]:
+            raise RuntimeError(info["error"] or "latest release is unavailable")
+        return await self.install_release(info["latest"])
 
     async def _main(self):
         decky.logger.info("RK-Enhanced loaded; native ROCKNIX fancontrol remains in ownership")

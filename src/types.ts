@@ -86,5 +86,6 @@ export interface UpdateInfo {
   installed: string;
   latest: string;
   update_available: boolean;
+  previous: string;
   error: string;
 }

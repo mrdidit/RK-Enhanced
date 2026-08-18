@@ -7,7 +7,7 @@ export const setBypassCharging = (enabled: boolean) => call<[boolean], boolean>(
 export const getLog = () => call<[], string>("get_log");
 export const clearLog = () => call<[], boolean>("clear_log");
 export const getUpdateInfo = () => call<[], UpdateInfo>("get_update_info");
-export const reinstallLatestRelease = () => call<[], boolean>("reinstall_latest_release");
+export const installRelease = (version: string) => call<[string], boolean>("install_release", version);
 export const applyProfile = (profile: HardwareProfile) => call<[HardwareProfile], boolean>("apply_profile", profile);
 export const savePreset = (name: string, profile: HardwareProfile) => call<[string, HardwareProfile], State>("save_preset", name, profile);
 export const restoreSteamDefault = () => call<[], State>("restore_steam_default");
