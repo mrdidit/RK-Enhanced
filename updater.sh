@@ -8,6 +8,7 @@ PLUGINS_DIR="/storage/homebrew/plugins"
 PLUGIN_DIR="${PLUGINS_DIR}/RK-Enhanced"
 BACKUP_ROOT="/storage/homebrew/plugin-backups"
 STATUS_FILE="/storage/homebrew/settings/RK-Enhanced/update-status.txt"
+INSTALLED_VERSION_FILE="/storage/homebrew/settings/RK-Enhanced/installed-version.txt"
 STEAM_COMMAND="/usr/bin/start_steam_arm64.sh"
 STEAM_DESKTOP="/storage/.local/share/applications/Steam.desktop"
 
@@ -18,12 +19,29 @@ write_status() {
 }
 
 relaunch_steam() {
+    # Stopping Steam's gamescope scope can leave ROCKNIX's Sway session in
+    # transition. The native Steam launcher reads its output geometry from
+    # Sway, so wait until that query works before invoking it.
+    systemctl start essway.service >/dev/null 2>&1 || true
+    attempt=0
+    while [ "${attempt}" -lt 15 ]; do
+        if swaymsg -t get_outputs 2>/dev/null | jq -e \
+            'any(.[]; .focused == true and .current_mode.width > 0 and .current_mode.height > 0)' \
+            >/dev/null 2>&1; then
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    if [ "${attempt}" -ge 15 ]; then
+        return 1
+    fi
     relaunch_id="$(date +%s)"
     systemd-run --unit="rk-enhanced-steam-relaunch-${relaunch_id}" --collect \
-        "${STEAM_COMMAND}" "${STEAM_DESKTOP}" steam >/dev/null 2>&1 || true
+        "${STEAM_COMMAND}" "${STEAM_DESKTOP}" steam >/dev/null 2>&1
 }
 
-for command in curl jq unzip sha256sum systemctl systemd-run; do
+for command in curl jq unzip sha256sum systemctl systemd-run swaymsg; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         write_status "Update failed: missing ${command}"
         exit 1
@@ -102,9 +120,14 @@ mv "${staged}" "${PLUGIN_DIR}"
 chmod 755 "${PLUGIN_DIR}/updater.sh"
 
 systemctl start plugin_loader.service
-write_status "Installed ${version}; relaunching Steam…"
+printf '%s\n' "${version}" > "${INSTALLED_VERSION_FILE}"
 if [ "${steam_was_active}" -eq 1 ]; then
-    relaunch_steam
+    write_status "Installed ${version}; relaunching Steam…"
+    if ! relaunch_steam; then
+        write_status "Installed ${version}, but Steam could not be relaunched automatically"
+    fi
+else
+    write_status "Installed ${version}"
 fi
 
 trap - EXIT INT TERM

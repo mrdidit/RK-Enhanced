@@ -20,7 +20,8 @@ different backends, so RK-Enhanced is not a direct copy of NDC-Enhanced.
 ## Current features
 
 - Live battery, signed battery flow, thermal, CPU, GPU, fan, memory and clock
-  monitoring with severity-based colours.
+  monitoring with severity-based colours, a representative CPU temperature
+  and a separate CPU hotspot reading.
 - Bypass charging control on supported ROCKNIX kernels, including holding,
   charging and discharging states plus a smoothed remaining-time estimate.
 - CPU governor and per-cluster frequency limits.

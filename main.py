@@ -16,6 +16,8 @@ DEFAULT_PRESET = "Steam Default"
 LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default")
 SETTINGS_FILE = "settings.json"
 UPDATE_STATUS_FILE = "update-status.txt"
+INSTALLED_VERSION_FILE = "installed-version.txt"
+UPDATE_REPOSITORY = "mrdidit/RK-Enhanced"
 FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
@@ -45,8 +47,18 @@ def _read_ints(path):
 
 
 def _run(command, check=True):
+    environment = os.environ.copy()
+    # PyInstaller-based Decky builds prepend their private libraries to child
+    # processes. System tools such as curl must use ROCKNIX's own OpenSSL.
+    for variable in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+        original = environment.pop(f"{variable}_ORIG", None)
+        if original:
+            environment[variable] = original
+        else:
+            environment.pop(variable, None)
     process = subprocess.run(command, text=True, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, timeout=15, check=False)
+                             stderr=subprocess.PIPE, timeout=15, check=False,
+                             env=environment)
     if check and process.returncode:
         raise RuntimeError(process.stderr.strip() or f"command failed: {command[0]}")
     return process.stdout.strip()
@@ -385,6 +397,7 @@ class Plugin:
         self.battery_discharge_samples = 0
         self.battery_discharge_last_sample = 0.0
         self.log_offsets = {}
+        self.latest_release_cache = (0.0, "")
         self.lock = None
 
     def _load(self):
@@ -734,15 +747,22 @@ class Plugin:
                     gpu_percent = min(100.0, busy * 100 / elapsed)
             self.last_gpu_sample = (gpu_engine_ns, now_ns)
         cpu_package_temps, cpu_core_temps, gpu_temps = [], [], []
-        for root in (Path("/sys/devices/virtual/thermal"), Path("/sys/class/thermal")):
-            for zone in root.glob("thermal_zone*"):
-                kind, value = _read(zone / "type").lower(), _read_int(zone / "temp")
-                if value and kind.startswith("cpuss"):
-                    cpu_package_temps.append(value)
-                elif value and kind.startswith("cpu"):
-                    cpu_core_temps.append(value)
-                elif value and kind.startswith(("gpu", "gpuss")):
-                    gpu_temps.append(value)
+        primary_gpu_temps = []
+        # /sys/devices/virtual/thermal and /sys/class/thermal expose the same
+        # zones. Scan the class path once so each sensor has equal weight.
+        for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+            kind = _read(zone / "type").lower().replace("_", "-")
+            value = _read_int(zone / "temp")
+            if not 0 < value < 150000:
+                continue
+            if kind.startswith("cpuss"):
+                cpu_package_temps.append(value)
+            elif kind.startswith("cpu"):
+                cpu_core_temps.append(value)
+            elif kind.startswith(("gpu", "gpuss")):
+                gpu_temps.append(value)
+                if kind.startswith("gpuss0-") or kind in ("gpuss0", "gpu-thermal"):
+                    primary_gpu_temps.append(value)
         mem_total = mem_available = 0
         for line in _read("/proc/meminfo").splitlines():
             if line.startswith("MemTotal:"):
@@ -812,7 +832,15 @@ class Plugin:
                 round(sum(cpu_core_temps) / len(cpu_core_temps) / 1000, 1)
                 if cpu_core_temps else 0
             ),
-            "gpu_temperature": round(max(gpu_temps) / 1000, 1) if gpu_temps else 0,
+            "cpu_hotspot_temperature": round(
+                max(cpu_package_temps + cpu_core_temps) / 1000, 1
+            ) if cpu_package_temps or cpu_core_temps else 0,
+            # gpuss0 is the primary Adreno temperature used by MangoApp on
+            # both observed Qualcomm layouts. Fall back to the hottest GPU
+            # zone on devices which expose a different naming scheme.
+            "gpu_temperature": round(
+                max(primary_gpu_temps or gpu_temps) / 1000, 1
+            ) if primary_gpu_temps or gpu_temps else 0,
             "cpu_percent": round(cpu_percent, 1),
             "gpu_percent": round(gpu_percent, 1),
             "cpu_clocks": [{"id": item["id"], "cpus": item["cpus"], "frequency": item["current"],
@@ -889,10 +917,43 @@ class Plugin:
             return True
         return await asyncio.to_thread(work)
 
-    async def get_update_status(self):
-        return await asyncio.to_thread(
-            _read, self.settings_dir / UPDATE_STATUS_FILE, "No reinstall has been run yet."
-        )
+    async def get_update_info(self):
+        def work():
+            installed = _read(Path(__file__).resolve().parent / "VERSION")
+            if not installed:
+                installed = _read(self.settings_dir / INSTALLED_VERSION_FILE)
+            if not installed:
+                status = _read(self.settings_dir / UPDATE_STATUS_FILE)
+                marker = "Installed "
+                if marker in status:
+                    installed = status.split(marker, 1)[1].split(";", 1)[0].split(",", 1)[0].strip()
+            installed = installed or "Unknown"
+
+            cached_at, latest = self.latest_release_cache
+            error = ""
+            try:
+                if not latest or time.monotonic() - cached_at >= 300:
+                    payload = json.loads(_run([
+                        "curl", "-fsSL",
+                        f"https://api.github.com/repos/{UPDATE_REPOSITORY}/releases?per_page=10",
+                    ]))
+                    latest = next((
+                        str(release.get("tag_name", ""))
+                        for release in payload
+                        if not release.get("draft") and any(
+                            asset.get("name") == "RK-Enhanced.zip"
+                            for asset in release.get("assets", [])
+                        )
+                    ), "")
+                    if not latest:
+                        raise RuntimeError("no published RK-Enhanced release was found")
+                    self.latest_release_cache = (time.monotonic(), latest)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as reason:
+                error = str(reason)
+            return {"installed": installed, "latest": latest,
+                    "update_available": bool(latest and installed != latest),
+                    "error": error}
+        return await asyncio.to_thread(work)
 
     async def reinstall_latest_release(self):
         def work():

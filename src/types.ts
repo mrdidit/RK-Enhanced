@@ -60,6 +60,7 @@ export interface Telemetry {
   battery_watts: number;
   battery_flow_watts: number;
   cpu_temperature: number;
+  cpu_hotspot_temperature: number;
   gpu_temperature: number;
   cpu_percent: number;
   gpu_percent: number;
@@ -80,3 +81,10 @@ export interface Telemetry {
 }
 
 export interface GameRef { appid: string; name: string }
+
+export interface UpdateInfo {
+  installed: string;
+  latest: string;
+  update_available: boolean;
+  error: string;
+}

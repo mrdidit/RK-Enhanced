@@ -100,6 +100,7 @@ export function Monitor({ active }: { active: boolean }) {
       <Metric label="CPU load" value={`${data.cpu_percent.toFixed(1)}%`} percent={data.cpu_percent} color={severity(data.cpu_percent, 70, 90)} />
       <Metric label="GPU load" value={`${data.gpu_percent.toFixed(1)}%`} percent={data.gpu_percent} color={severity(data.gpu_percent, 70, 90)} />
       <Metric label="CPU temperature" value={data.cpu_temperature ? `${data.cpu_temperature.toFixed(1)}°C` : "Unavailable"} percent={data.cpu_temperature || undefined} color={temperatureColor(data.cpu_temperature)} />
+      <Metric label="CPU hotspot" value={data.cpu_hotspot_temperature ? `${data.cpu_hotspot_temperature.toFixed(1)}°C` : "Unavailable"} percent={data.cpu_hotspot_temperature || undefined} color={temperatureColor(data.cpu_hotspot_temperature)} />
       <Metric label="GPU temperature" value={data.gpu_temperature ? `${data.gpu_temperature.toFixed(1)}°C` : "Unavailable"} percent={data.gpu_temperature || undefined} color={temperatureColor(data.gpu_temperature)} />
       <Metric label="Fan" value={`${data.fan_percent}%`} percent={data.fan_percent} color="#40a9ff" />
       <Metric label="Memory used" value={usedMemory(data.memory_used_mb)} percent={data.memory_percent} color={severity(data.memory_percent, 75, 90)} />

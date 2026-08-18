@@ -138,4 +138,7 @@ if ! systemctl is-active --quiet plugin_loader.service; then
     exit 1
 fi
 
+mkdir -p "${HOMEBREW_DIR}/settings/RK-Enhanced"
+printf '%s\n' "${rke_version}" > "${HOMEBREW_DIR}/settings/RK-Enhanced/installed-version.txt"
+
 echo "Installed Decky ${decky_version} and RK-Enhanced ${rke_version}."

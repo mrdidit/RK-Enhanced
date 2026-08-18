@@ -4,12 +4,12 @@ import {
 } from "@decky/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateStatus, reinstallLatestRelease, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame } from "./backend";
+import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, reinstallLatestRelease, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame } from "./backend";
 import { currentGame } from "./game";
 import { Monitor } from "./Monitor";
 import { Logs } from "./Logs";
 import { styles } from "./styles";
-import type { GameRef, HardwareProfile, State, Telemetry } from "./types";
+import type { GameRef, HardwareProfile, State, Telemetry, UpdateInfo } from "./types";
 
 const DEFAULT = "Steam Default";
 const option = (data: string | number, label?: string) => ({ data, label: label ?? String(data) });
@@ -55,7 +55,8 @@ export function Content() {
   const [live, setLive] = useState<Telemetry | null>(null);
   const [systemCurve, setSystemCurve] = useState<HardwareProfile["fan_curve"]>([]);
   const [utility, setUtility] = useState<"Logs" | "Fan" | null>(null);
-  const [updateStatus, setUpdateStatus] = useState("");
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateError, setUpdateError] = useState("");
 
   const installState = useCallback((next: State, preferred?: string) => {
     setState(next);
@@ -123,7 +124,11 @@ export function Content() {
   }, [tab]);
   useEffect(() => {
     if (tab !== "Utils") return;
-    void getUpdateStatus().then(setUpdateStatus).catch(() => {});
+    setUpdateError("");
+    void getUpdateInfo().then(info => {
+      setUpdateInfo(info);
+      setUpdateError(info.error);
+    }).catch(reason => setUpdateError(String(reason)));
   }, [tab]);
 
   const update = (change: (profile: HardwareProfile) => void) => setDraft(current => {
@@ -226,12 +231,12 @@ export function Content() {
     strDescription="Replace Steam Default with the original ROCKNIX settings copied during setup?"
     strOKButtonText="Restore" strCancelButtonText="Cancel"
     onOK={() => run(async () => installState(await restoreSteamDefault(), DEFAULT), "Steam Default restored")} />);
-  const confirmReinstall = () => showModal(<ConfirmModal strTitle="Reinstall latest RK-Enhanced?"
+  const confirmReinstall = () => showModal(<ConfirmModal
+    strTitle={updateInfo?.update_available ? `Update to ${updateInfo.latest}?` : "Reinstall latest RK-Enhanced?"}
     strDescription="This closes Steam and any running game, downloads the newest GitHub release, backs up the current plugin, installs it, then relaunches Steam."
-    strOKButtonText="Reinstall" strCancelButtonText="Cancel"
+    strOKButtonText={updateInfo?.update_available ? "Update" : "Reinstall"} strCancelButtonText="Cancel"
     onOK={() => run(async () => {
       await reinstallLatestRelease();
-      setUpdateStatus("Update started. Steam will close shortly…");
     }, "Update started; Steam will restart")} />);
 
   const presets = <div className="rke-presets">
@@ -379,11 +384,15 @@ export function Content() {
         <PanelSectionRow><ButtonItem layout="below" disabled={busy || systemCurve.length < 2}
           onClick={() => run(async () => installState(await saveSystemFanCurve(systemCurve), selected), "ROCKNIX Custom fan curve saved")}>Save system fan curve</ButtonItem></PanelSectionRow>
       </>}
-      <PanelSectionRow><Field label="GitHub releases"
-        description="github.com/mrdidit/RK-Enhanced/releases" /></PanelSectionRow>
-      <PanelSectionRow><ButtonItem layout="below" disabled={busy}
-        onClick={confirmReinstall}>Reinstall latest release</ButtonItem></PanelSectionRow>
-      {updateStatus && <PanelSectionRow><Field label={updateStatus} /></PanelSectionRow>}
+      <PanelSectionRow><Field label="Installed release"
+        description={updateInfo?.installed || "Checking…"} /></PanelSectionRow>
+      <PanelSectionRow><Field label="Latest GitHub release"
+        description={updateInfo?.latest || (updateError ? "Unavailable" : "Checking…")} /></PanelSectionRow>
+      <PanelSectionRow><ButtonItem layout="below" disabled={busy || !updateInfo?.latest}
+        onClick={confirmReinstall}>{!updateInfo?.latest ? "Checking latest release…"
+          : updateInfo.update_available ? `Update to ${updateInfo.latest}`
+            : "Reinstall latest release"}</ButtonItem></PanelSectionRow>
+      {updateError && <PanelSectionRow><Field label="Update check failed" description={updateError} /></PanelSectionRow>}
     </PanelSection>
   </div>;
 
