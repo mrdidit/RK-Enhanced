@@ -61,6 +61,23 @@ if [ -z "${version}" ] || [ -z "${url}" ]; then
     exit 1
 fi
 
+# Keep the current detached updater when moving backwards through the
+# published release order. Older plugin code can then safely return to the
+# latest release without restoring obsolete lifecycle behavior.
+preserve_updater=0
+installed_version="$(cat "${INSTALLED_VERSION_FILE}" 2>/dev/null || true)"
+if [ -n "${requested_version}" ] && [ -n "${installed_version}" ]; then
+    installed_index="$(jq -r --arg version "${installed_version}" \
+        '[.[] | select(.draft == false) | select(any(.assets[]; .name == "RK-Enhanced.zip")) | .tag_name] | index($version) // -1' \
+        "${metadata}")"
+    requested_index="$(jq -r --arg version "${requested_version}" \
+        '[.[] | select(.draft == false) | select(any(.assets[]; .name == "RK-Enhanced.zip")) | .tag_name] | index($version) // -1' \
+        "${metadata}")"
+    if [ "${installed_index}" -ge 0 ] && [ "${requested_index}" -gt "${installed_index}" ]; then
+        preserve_updater=1
+    fi
+fi
+
 curl -fL "${url}" -o "${work_dir}/RK-Enhanced.zip"
 if [ -n "${digest}" ]; then
     expected="${digest#sha256:}"
@@ -77,6 +94,10 @@ if [ ! -f "${staged}/plugin.json" ] || [ ! -f "${staged}/main.py" ] || \
    [ ! -f "${staged}/dist/index.js" ] || [ ! -f "${staged}/updater.sh" ]; then
     write_status "Update failed: invalid release layout"
     exit 1
+fi
+if [ "${preserve_updater}" -eq 1 ]; then
+    cp "$0" "${staged}/updater.sh"
+    chmod 755 "${staged}/updater.sh"
 fi
 
 write_status "Installing ${version}; Decky is reloading…"

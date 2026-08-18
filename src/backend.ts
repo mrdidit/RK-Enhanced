@@ -4,6 +4,8 @@ import type { HardwareProfile, State, Telemetry, UpdateInfo } from "./types";
 export const getState = () => call<[], State>("get_state");
 export const getTelemetry = () => call<[], Telemetry>("get_telemetry");
 export const setBypassCharging = (enabled: boolean) => call<[boolean], boolean>("set_bypass_charging", enabled);
+export const unlockExperimental = (code: string) => call<[string], State>("unlock_experimental", code);
+export const lockExperimental = () => call<[], State>("lock_experimental");
 export const getLog = () => call<[], string>("get_log");
 export const clearLog = () => call<[], boolean>("clear_log");
 export const getUpdateInfo = () => call<[], UpdateInfo>("get_update_info");

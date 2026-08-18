@@ -12,8 +12,8 @@ from tempfile import NamedTemporaryFile
 
 import decky
 
-DEFAULT_PRESET = "Steam Default"
-LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default")
+DEFAULT_PRESET = "RK-E Default"
+LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default", "Steam Default")
 SETTINGS_FILE = "settings.json"
 UPDATE_STATUS_FILE = "update-status.txt"
 INSTALLED_VERSION_FILE = "installed-version.txt"
@@ -22,7 +22,6 @@ FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
 KGSL_GPU_ROOT = Path("/sys/class/kgsl/kgsl-3d0")
-COOLING_PROFILES = ["quiet", "moderate", "aggressive", "custom"]
 
 
 def _read(path, default=""):
@@ -265,7 +264,6 @@ def _capabilities():
     common = sorted(set.intersection(*(set(item["governors"]) for item in cpu))) if cpu else []
     return {
         "cpu": cpu, "cpu_governors": common, "gpu": _gpu_capability(),
-        "cooling_profiles": COOLING_PROFILES,
         "schedulers": _scheduler_capabilities(),
         "fan_available": bool(_rocknix_env("DEVICE_PWM_FAN") or FAN_CONFIG.exists()),
     }
@@ -280,7 +278,7 @@ def _current_profile(capabilities=None):
         "cpu_governor": governors[0] if governors else "",
         "cpu_min": {item["id"]: item["minimum"] for item in cpu},
         "cpu_max": {item["id"]: item["maximum"] for item in cpu},
-        "cooling_profile": _get_setting("cooling.profile", "moderate"),
+        "cooling_profile": "custom",
         "fan_curve": _fan_curve(),
         "cpu_scheduler": "lavd" if (
             "lavd" in capabilities["schedulers"] and
@@ -330,9 +328,10 @@ def _validate_profile(profile, capabilities):
         clean.pop("gpu_governor", None)
         clean.pop("gpu_min", None)
         clean.pop("gpu_max", None)
-    cooling = str(clean.get("cooling_profile", ""))
-    if cooling not in capabilities["cooling_profiles"]:
-        raise ValueError("unsupported cooling profile")
+    # RK-E presets always contain an independent curve. ROCKNIX's effective
+    # cooling mode decides whether that curve may be installed; RK-E never
+    # changes cooling.profile itself.
+    clean["cooling_profile"] = "custom"
     curve = clean.get("fan_curve")
     if not isinstance(curve, list) or not 2 <= len(curve) <= 16:
         raise ValueError("fan curve must contain 2-16 points")
@@ -386,6 +385,8 @@ class Plugin:
         settings = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
         self.settings_dir = Path(settings) if settings else Path(__file__).resolve().parent / "settings"
         self.settings_path = self.settings_dir / SETTINGS_FILE
+        self.fan_guard_marker = self.settings_dir / "fan-curve-session.active"
+        self.canonical_fan_config = self.settings_dir / "rocknix-custom-fancontrol.conf"
         self.active_preset = DEFAULT_PRESET
         self.active_appid = ""
         self.last_cpu_sample = None
@@ -399,6 +400,7 @@ class Plugin:
         self.log_offsets = {}
         self.latest_release_cache = (0.0, [])
         self.lock = None
+        self.game_watch_task = None
 
     def _load(self):
         try:
@@ -409,14 +411,22 @@ class Plugin:
             data = {"presets": {}, "game_profiles": {}}
         data.setdefault("presets", {})
         data.setdefault("game_profiles", {})
+        data.setdefault("experimental_unlocked", False)
         changed = False
+        previous_schema = int(data.get("preset_schema", 0) or 0)
+        if previous_schema < 2 and self.settings_path.exists():
+            migration_backup = self.settings_dir / "settings-before-preset-schema-2.json"
+            if not migration_backup.exists():
+                shutil.copy2(self.settings_path, migration_backup)
         legacy = next((name for name in LEGACY_DEFAULT_PRESETS if name in data["presets"]), None)
         if "system_fan_curve" not in data:
             source = data["presets"].get(legacy, {}) if legacy else {}
             data["system_fan_curve"] = _normalize_fan_curve(source.get("fan_curve", _fan_curve()))
             changed = True
         if legacy and DEFAULT_PRESET not in data["presets"]:
-            data["presets"][DEFAULT_PRESET] = data["presets"][legacy]
+            data["presets"][DEFAULT_PRESET] = json.loads(json.dumps(data["presets"][legacy]))
+            data["presets"][DEFAULT_PRESET]["fan_curve"] = json.loads(
+                json.dumps(data["system_fan_curve"]))
             changed = True
         for old_name in LEGACY_DEFAULT_PRESETS:
             if old_name in data["presets"]:
@@ -432,6 +442,16 @@ class Plugin:
         if DEFAULT_PRESET not in data["presets"]:
             data["presets"][DEFAULT_PRESET] = _current_profile()
             changed = True
+        if previous_schema < 2:
+            # The new model seeds RK-E Default from the protected system curve
+            # exactly once, then lets both copies evolve independently.
+            data["presets"][DEFAULT_PRESET]["fan_curve"] = json.loads(
+                json.dumps(data["system_fan_curve"]))
+            data["presets"][DEFAULT_PRESET]["cooling_profile"] = "custom"
+            data["steam_default_original"] = json.loads(
+                json.dumps(data["presets"][DEFAULT_PRESET]))
+            data["preset_schema"] = 2
+            changed = True
         if not isinstance(data.get("steam_default_original"), dict):
             data["steam_default_original"] = json.loads(json.dumps(data["presets"][DEFAULT_PRESET]))
             changed = True
@@ -439,6 +459,9 @@ class Plugin:
             data["steam_default"] = DEFAULT_PRESET
             changed = True
         for preset in data["presets"].values():
+            if preset.get("cooling_profile") != "custom":
+                preset["cooling_profile"] = "custom"
+                changed = True
             normalized = _normalize_fan_curve(preset.get("fan_curve", []))
             if preset.get("fan_curve") != normalized:
                 preset["fan_curve"] = normalized
@@ -449,7 +472,52 @@ class Plugin:
             changed = True
         if changed:
             self._save(data)
+        self._write_canonical_fan_config(data["system_fan_curve"])
+        if not FAN_CONFIG.exists():
+            _write_fan_curve(data["system_fan_curve"])
         return data
+
+    def _write_canonical_fan_config(self, curve):
+        descending = sorted(curve, key=lambda point: point[0], reverse=True)
+        if not any(point[0] == 0 for point in descending):
+            descending.append([0, 0])
+        speeds = " ".join(str(point[1]) for point in descending)
+        temps = " ".join(str(point[0]) for point in descending)
+        _atomic_text(self.canonical_fan_config,
+                     f"SPEEDS=({speeds})\nTEMPS=({temps})\n")
+
+    def _fan_session_active(self):
+        return self.fan_guard_marker.exists()
+
+    def _start_fan_guard(self):
+        if self._fan_session_active():
+            return
+        source = Path(__file__).resolve().parent / "fan-restore-guard.sh"
+        if not source.exists():
+            raise RuntimeError("fan restoration guard is missing")
+        guard = self.settings_dir / "fan-restore-guard.sh"
+        shutil.copy2(source, guard)
+        guard.chmod(0o755)
+        _atomic_text(self.fan_guard_marker, f"{os.getpid()}\n")
+        try:
+            unit = f"rke-fan-restore-guard-{os.getpid()}-{time.monotonic_ns()}"
+            _run(["systemd-run", f"--unit={unit}", "--collect",
+                  str(guard), str(self.fan_guard_marker),
+                  str(self.canonical_fan_config), str(FAN_CONFIG)])
+        except Exception:
+            self.fan_guard_marker.unlink(missing_ok=True)
+            raise
+
+    def _restore_system_fan_curve(self):
+        if not self._fan_session_active():
+            return False
+        data = self._load()
+        _write_fan_curve(data["system_fan_curve"])
+        self.fan_guard_marker.unlink(missing_ok=True)
+        if _get_setting("cooling.profile", "") == "custom":
+            _restart_fancontrol()
+        decky.logger.info("Restored protected ROCKNIX Custom fan curve")
+        return True
 
     def _save(self, data):
         self.settings_dir.mkdir(parents=True, exist_ok=True)
@@ -457,8 +525,11 @@ class Plugin:
 
     def _state(self):
         data = self._load()
+        effective = _get_setting("cooling.profile", "")
         return {"capabilities": _capabilities(), **data,
-                "active_preset": self.active_preset, "active_appid": self.active_appid}
+                "active_preset": self.active_preset, "active_appid": self.active_appid,
+                "effective_cooling_profile": effective,
+                "fan_curve_active": effective == "custom" and self._fan_session_active()}
 
     def _apply(self, profile, capabilities=None):
         capabilities = capabilities or _capabilities()
@@ -472,17 +543,16 @@ class Plugin:
             path = _gpu_path()
             (path / "governor").write_text(clean["gpu_governor"])
             _write_gpu_range(path, clean["gpu_min"], clean["gpu_max"])
-        if clean["cooling_profile"] == "custom":
-            # Native ROCKNIX fancontrol remains the controller. The active
-            # preset supplies the temporary Custom curve it should execute.
+        effective_cooling = _get_setting("cooling.profile", "")
+        if effective_cooling == "custom":
+            self._start_fan_guard()
             _write_fan_curve(clean["fan_curve"])
-        _set_setting("cooling.profile", clean["cooling_profile"])
-        decky.logger.info(
-            f"Restarting native fancontrol: profile={clean['cooling_profile']} "
-            f"curve={'/storage/.config/fancontrol.conf' if clean['cooling_profile'] == 'custom' else 'stock'}"
-        )
-        fancontrol_pid = _restart_fancontrol()
-        decky.logger.info(f"Native fancontrol restarted successfully: pid={fancontrol_pid}")
+            fancontrol_pid = _restart_fancontrol()
+            decky.logger.info(
+                f"Applied RK-E fan curve through native fancontrol: pid={fancontrol_pid}")
+        else:
+            decky.logger.info(
+                f"RK-E fan curve inactive: effective ROCKNIX cooling profile is {effective_cooling or 'unknown'}")
         if "lavd" in capabilities["schedulers"]:
             action = "start" if clean["cpu_scheduler"] == "lavd" else "stop"
             _run(["systemctl", action, "scx_lavd.service"])
@@ -520,7 +590,7 @@ class Plugin:
             self._save(data)
             if self.active_preset == DEFAULT_PRESET:
                 self._apply(restored, capabilities)
-            decky.logger.info("Restored Steam Default from the original ROCKNIX snapshot")
+            decky.logger.info("Restored RK-E Default from its original setup snapshot")
             return self._state()
         return await asyncio.to_thread(work)
 
@@ -608,9 +678,11 @@ class Plugin:
             data = self._load()
             data["system_fan_curve"] = clean
             self._save(data)
-            _write_fan_curve(clean)
-            _set_setting("cooling.profile", "custom")
-            _restart_fancontrol()
+            self._write_canonical_fan_config(clean)
+            if not self._fan_session_active():
+                _write_fan_curve(clean)
+                if _get_setting("cooling.profile", "") == "custom":
+                    _restart_fancontrol()
             decky.logger.info(f"Saved ROCKNIX Custom system fan curve: {clean}")
             return self._state()
         return await asyncio.to_thread(work)
@@ -633,7 +705,12 @@ class Plugin:
             target = str(appid or "")
             data = self._load()
             preset = data["game_profiles"].get(target, data["steam_default"])
-            if target == self.active_appid and preset == self.active_preset:
+            needs_fan_apply = (
+                _get_setting("cooling.profile", "") == "custom" and
+                not self._fan_session_active()
+            )
+            if (target == self.active_appid and preset == self.active_preset and
+                    not needs_fan_apply):
                 return {"applied": False, "preset": self.active_preset}
             self.active_appid = target
             self.gpu_fdinfo_paths = []
@@ -643,6 +720,94 @@ class Plugin:
             self.active_preset = preset
             return {"applied": True, "preset": preset}
         return await asyncio.to_thread(work)
+
+    def _steam_scope_active(self):
+        cgroups = (
+            Path("/sys/fs/cgroup/systemd/system.slice/steam-bigpicture.scope/cgroup.procs"),
+            Path("/sys/fs/cgroup/unified/system.slice/steam-bigpicture.scope/cgroup.procs"),
+            Path("/sys/fs/cgroup/pids/system.slice/steam-bigpicture.scope/cgroup.procs"),
+        )
+        return any(_read(cgroup) for cgroup in cgroups if cgroup.exists())
+
+    def _detect_steam_app(self):
+        cgroups = (
+            Path("/sys/fs/cgroup/systemd/system.slice/steam-bigpicture.scope/cgroup.procs"),
+            Path("/sys/fs/cgroup/unified/system.slice/steam-bigpicture.scope/cgroup.procs"),
+            Path("/sys/fs/cgroup/pids/system.slice/steam-bigpicture.scope/cgroup.procs"),
+        )
+        pids = []
+        for cgroup in cgroups:
+            if cgroup.exists():
+                pids = _read(cgroup).splitlines()
+                break
+        ignored = (
+            "pw-audio-namesp", "network.cr", "steamwebhelper", "pressure-vessel",
+            "reaper", "wineserver", "services.exe", "explorer.exe", "rpcss.exe",
+            "plugplay.exe", "svchost.exe", "conhost.exe",
+        )
+        candidates = {}
+        for value in pids:
+            try:
+                pid = int(value)
+                process = Path("/proc") / value
+                comm = _read(process / "comm").lower()
+                if not comm or any(comm.startswith(name) for name in ignored):
+                    continue
+                environment = (process / "environ").read_bytes().split(b"\0")
+            except (OSError, ValueError):
+                continue
+            appid = ""
+            for variable in environment:
+                if variable.startswith((b"SteamAppId=", b"SteamGameId=")):
+                    candidate = variable.split(b"=", 1)[1].decode(errors="ignore")
+                    if candidate.isdigit() and candidate != "0":
+                        appid = candidate
+                        break
+            if appid:
+                candidates[appid] = max(pid, candidates.get(appid, 0))
+        if not candidates:
+            return ""
+        # The newest qualifying game process wins if Steam is briefly
+        # transitioning between two applications.
+        return max(candidates, key=candidates.get)
+
+    async def _game_watch_loop(self):
+        pending, confirmations = None, 0
+        steam_was_active = False
+        while True:
+            try:
+                steam_active = await asyncio.to_thread(self._steam_scope_active)
+                if not steam_active:
+                    steam_was_active = False
+                    pending, confirmations = None, 0
+                    self.active_appid = ""
+                    self.active_preset = DEFAULT_PRESET
+                    await asyncio.sleep(2)
+                    continue
+                detected = await asyncio.to_thread(self._detect_steam_app)
+                if not steam_was_active:
+                    steam_was_active = True
+                    pending, confirmations = detected, 2
+                elif detected == self.active_appid:
+                    pending, confirmations = None, 0
+                    await asyncio.sleep(2)
+                    continue
+                elif detected == pending:
+                    confirmations += 1
+                else:
+                    pending, confirmations = detected, 1
+                if confirmations >= 2:
+                    result = await self.activate_game(detected)
+                    decky.logger.info(
+                        f"Backend game watcher: appid={detected or 'Steam'} "
+                        f"preset={result['preset']} applied={result['applied']}")
+                    pending, confirmations = None, 0
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                raise
+            except Exception as reason:
+                decky.logger.error(f"Backend game watcher failed: {reason}")
+                await asyncio.sleep(5)
 
     def _find_gamescope_pid(self):
         if self.gamescope_pid:
@@ -863,6 +1028,8 @@ class Plugin:
 
     async def set_bypass_charging(self, enabled):
         def work():
+            if bool(enabled) and not self._load().get("experimental_unlocked", False):
+                raise RuntimeError("unlock experimental controls in Utils first")
             behaviour = Path("/sys/class/power_supply/battery/charge_behaviour")
             if not behaviour.exists():
                 raise RuntimeError("bypass charging is unavailable on this device")
@@ -877,6 +1044,26 @@ class Plugin:
                 raise RuntimeError("ROCKNIX did not accept the bypass charging setting")
             decky.logger.info(f"Bypass charging {'enabled' if enabled else 'disabled'}")
             return True
+        return await asyncio.to_thread(work)
+
+    async def unlock_experimental(self, code):
+        def work():
+            if str(code) != "bypasstest":
+                raise ValueError("incorrect experimental unlock code")
+            data = self._load()
+            data["experimental_unlocked"] = True
+            self._save(data)
+            decky.logger.info("Experimental controls unlocked")
+            return self._state()
+        return await asyncio.to_thread(work)
+
+    async def lock_experimental(self):
+        def work():
+            data = self._load()
+            data["experimental_unlocked"] = False
+            self._save(data)
+            decky.logger.info("Experimental controls hidden")
+            return self._state()
         return await asyncio.to_thread(work)
 
     def _log_text(self):
@@ -991,13 +1178,22 @@ class Plugin:
 
     async def _main(self):
         decky.logger.info("RK-Enhanced loaded; native ROCKNIX fancontrol remains in ownership")
-        await asyncio.to_thread(self._load)
+        def initialise():
+            if self._fan_session_active():
+                self._restore_system_fan_curve()
+            self._load()
+        await asyncio.to_thread(initialise)
+        self.game_watch_task = asyncio.create_task(self._game_watch_loop())
 
     async def _unload(self):
-        def restore_system_curve():
-            data = self._load()
-            _write_fan_curve(data["system_fan_curve"])
-            _set_setting("cooling.profile", "custom")
-            _restart_fancontrol()
-        await asyncio.to_thread(restore_system_curve)
-        decky.logger.info("RK-Enhanced unloaded; restored the system ROCKNIX Custom curve")
+        if self.game_watch_task is not None:
+            self.game_watch_task.cancel()
+            try:
+                await self.game_watch_task
+            except asyncio.CancelledError:
+                pass
+            self.game_watch_task = None
+        restored = await asyncio.to_thread(self._restore_system_fan_curve)
+        decky.logger.info(
+            "RK-Enhanced unloaded; protected fan curve restored" if restored
+            else "RK-Enhanced unloaded; no fan curve session required restoration")

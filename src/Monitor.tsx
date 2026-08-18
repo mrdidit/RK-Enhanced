@@ -1,6 +1,6 @@
-import { Field, PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
+import { Field, PanelSection, PanelSectionRow } from "@decky/ui";
 import { useEffect, useState } from "react";
-import { getTelemetry, setBypassCharging } from "./backend";
+import { getTelemetry } from "./backend";
 import type { Telemetry } from "./types";
 
 const cpuMhz = (khz: number) => `${Math.round(khz / 1000)} MHz`;
@@ -46,7 +46,6 @@ const Heading = ({ children }: { children: string }) =>
 export function Monitor({ active }: { active: boolean }) {
   const [data, setData] = useState<Telemetry | null>(null);
   const [error, setError] = useState("");
-  const [bypassBusy, setBypassBusy] = useState(false);
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
@@ -69,15 +68,6 @@ export function Monitor({ active }: { active: boolean }) {
   const bypassHolding = bypassCharging && Math.abs(data.battery_flow_watts) < 0.2;
   const bypassDischarging = bypassCharging && data.battery_flow_watts <= -0.2;
   const bypassFilling = bypassCharging && data.battery_flow_watts >= 0.2;
-  const toggleBypass = async (enabled: boolean) => {
-    setBypassBusy(true);
-    try {
-      await setBypassCharging(enabled);
-      setData(await getTelemetry());
-      setError("");
-    } catch (reason) { setError(String(reason)); }
-    finally { setBypassBusy(false); }
-  };
   return <div className="rke-monitor">
     <PanelSection>
       <Metric label={bypassHolding ? "Bypass charging" : bypassDischarging ? "Battery remaining" : bypassFilling ? "Battery until full" : data.battery_status === "Charging" ? "Battery until full" : "Battery remaining"}
@@ -87,8 +77,6 @@ export function Monitor({ active }: { active: boolean }) {
             ? `${duration(data.battery_seconds)} · ${data.battery_percent}%`
             : "Calculating…"}
         percent={data.battery_percent} color={bypassCharging ? "#45aaf2" : batteryColor(data.battery_percent)} />
-      <PanelSectionRow><ToggleField label="Bypass charging" checked={bypassCharging}
-        disabled={bypassBusy} onChange={enabled => void toggleBypass(enabled)} /></PanelSectionRow>
       <Metric label={bypassCharging ? "Battery flow" : data.battery_status === "Charging" ? "Charging power" : "Power draw"}
         value={bypassHolding ? "Holding charge" : data.battery_watts > 0
           ? `${bypassFilling ? "Charging · " : bypassDischarging ? "Drawing · " : ""}${data.battery_watts.toFixed(1)} W`

@@ -35,7 +35,6 @@ export interface Capabilities {
   cpu: CpuPolicy[];
   cpu_governors: string[];
   gpu: GpuCapability;
-  cooling_profiles: string[];
   schedulers: string[];
   fan_available: boolean;
 }
@@ -46,9 +45,12 @@ export interface State {
   game_profiles: Record<string, string>;
   steam_default: string;
   system_fan_curve: FanPoint[];
+  experimental_unlocked: boolean;
   steam_default_original: HardwareProfile;
   active_preset: string;
   active_appid: string;
+  effective_cooling_profile: string;
+  fan_curve_active: boolean;
 }
 
 export interface Telemetry {

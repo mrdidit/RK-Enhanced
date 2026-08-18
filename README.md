@@ -1,129 +1,412 @@
 # RK-Enhanced
 
-**RK-Enhanced** stands for **ROCKNIX Kontrol Enhanced**. It is an experimental
-Decky Loader plugin for controlling and monitoring ROCKNIX-based ARM handhelds
-from Steam's Quick Access Menu.
+**RK-Enhanced — ROCKNIX Kontrol Enhanced** is a Decky Loader plugin providing
+performance controls, automatic per-game presets, fan-curve management, and
+live hardware monitoring for ROCKNIX-based ARM handhelds.
 
-This project is a reworked successor to
+RK-Enhanced is built on the foundation established by Seilent's original
+[ROCKNIX Control](https://github.com/seilent/rocknix-control). Its ROCKNIX
+integration and Decky control concepts made this project possible.
+
+The project later evolved through
 [Rocknix-Control-Enhanced](https://github.com/thefiqs/Rocknix-Control-Enhanced/tree/preset-delete-button),
-with ideas and UI work ported from
-[NDC-Enhanced](https://github.com/thefiqs/NDC-Enhanced). ROCKNIX and NovaDeck use
-different backends, so RK-Enhanced is not a direct copy of NDC-Enhanced.
+with additional interface concepts and improvements inspired by
+[NDC-Enhanced](https://github.com/thefiqs/NDC-Enhanced).
+
+ROCKNIX and NovaDeck expose different services, settings, and hardware
+interfaces. RK-Enhanced therefore uses a ROCKNIX-specific backend rather than
+directly copying NDC-Enhanced.
 
 > [!WARNING]
-> RK-Enhanced is early pre-release software. It has known bugs, has only had
-> limited hardware testing, and still has plenty of room for improvement. CPU,
-> GPU, scheduler and fan settings affect the running system. Keep a recovery
-> path available and do not assume every ROCKNIX device exposes identical
-> interfaces.
+> RK-Enhanced is beta software. Hardware controls affect the running system,
+> and support can vary between devices and ROCKNIX builds. Keep a recovery
+> path available and expect unfinished areas.
 
-## Current features
+## What RK-Enhanced does
 
-- Live battery, signed battery flow, thermal, CPU, GPU, fan, memory and clock
-  monitoring with severity-based colours, a representative CPU temperature
-  and a separate CPU hotspot reading.
-- Bypass charging control on supported ROCKNIX kernels, including holding,
-  charging and discharging states plus a smoothed remaining-time estimate.
-- CPU governor and per-cluster frequency limits.
-- GPU governor and frequency limits where ROCKNIX exposes them.
-- Kernel or supported `sched_ext` scheduler selection.
-- Editable Steam default and reusable performance presets.
-- Per-game preset assignment with a configurable Steam fallback preset.
-- Combined Save & Apply actions on Performance, Fan Curves and Presets.
-- Native ROCKNIX Custom system curve plus independent custom curves in Steam
-  and per-game presets.
-- Runtime log viewer in the Utils tab.
+### Live monitoring
 
-## Fan-control design
+The Monitor tab provides an at-a-glance view of:
 
-RK-Enhanced does **not** run a competing fan-control loop. ROCKNIX's native
-`fancontrol.service` remains responsible for continuously driving the fan.
+- Battery level and estimated remaining or charging time
+- Charging power, battery draw, and bypass state
+- CPU and GPU load
+- Representative CPU temperature
+- CPU hotspot temperature
+- GPU temperature
+- Fan speed
+- Used memory
+- Live CPU cluster clocks
+- GPU clock and governor
+- CPU scheduler
+- CPU queue status
+- Active thermal limits
 
-The system ROCKNIX Custom curve is managed only in Utils. On first setup,
-RK-Enhanced imports an existing `/storage/.config/fancontrol.conf`, or creates a
-safe curve when none exists. The initial Steam Default preset copies that
-system curve.
+Temperature and load indicators use severity-based colours so unusual
+conditions can be recognised quickly.
 
-Steam Default and per-game presets may select Quiet, Moderate, Aggressive, or
-Custom. Each preset choosing Custom stores its own independent curve. While
-that preset is active, RK-Enhanced writes its curve to `fancontrol.conf` and
-reloads native fancontrol. When RK-Enhanced unloads, it restores the separately
-saved system ROCKNIX Custom curve. This changes configuration only; ROCKNIX's
-native service remains responsible for continuously controlling the fan.
+Battery estimates use smoothed measurements where kernel-provided values are
+unreliable. Longer estimates are shortened to forms such as `10h+` to preserve
+the Quick Access Menu layout.
+
+### Performance controls
+
+Performance settings can be stored independently in every preset:
+
+- CPU governor
+- Minimum and maximum frequency for each CPU cluster
+- GPU governor
+- GPU maximum frequency
+- Kernel or supported `sched_ext` scheduler
+
+Save & Apply controls are available at convenient points throughout the
+Performance tab.
+
+### Fan curves
+
+Every RK-E preset contains an independent, editable fan curve.
+
+RK-Enhanced does not run a competing fan-control loop. ROCKNIX's native
+`fancontrol.service` continues to control the hardware.
+
+When ROCKNIX cooling is already set to **Custom**, RK-Enhanced:
+
+1. Protects the system ROCKNIX Custom curve.
+2. Writes the active RK-E preset curve to `fancontrol.conf`.
+3. Reloads native fancontrol.
+4. Restores the protected curve when Steam exits or Decky stops unexpectedly.
+
+RK-Enhanced never changes the active ROCKNIX cooling-profile selection.
+
+For RK-E fan curves to operate, configure either:
+
+- **ROCKNIX Settings → Cooling Profile → Custom**, or
+- **Per-System Advanced Configuration → Steam → Cooling Profile → Custom**
+
+Steam's **Default** option also works when the System cooling profile is
+Custom.
+
+When another cooling profile is active, the Fan Curves tab displays a red
+warning and disables its Save & Apply controls. Performance settings remain
+available.
+
+### ROCKNIX Custom curve
+
+ROCKNIX provides one native Custom curve through:
+
+```text
+/storage/.config/fancontrol.conf
+```
+
+RK-Enhanced adds a graphical editor for this curve under:
+
+```text
+Utils → Edit ROCKNIX Custom fan curve
+```
+
+If `fancontrol.conf` does not exist, Utils can create it with a safe initial
+curve. The file can then be inspected and modified graphically through
+RK-Enhanced; a terminal or external file manager is not required.
+
+Curve configuration and curve activation are deliberately separate. RK-Enhanced
+provides the graphical configuration, while the active cooling profile is
+selected through ROCKNIX Settings or Steam's Per-System Advanced Configuration.
+
+During first setup, the ROCKNIX Custom curve is copied into **RK-E Default**.
+After that initial copy, both curves are completely independent:
+
+- **ROCKNIX Custom** is the protected system curve.
+- **RK-E Default** is the standard Steam preset.
+- Additional presets each contain their own fan curve.
+
+Editing ROCKNIX Custom does not silently overwrite RK-E Default or other
+presets.
+
+### Presets and automatic game switching
+
+The preset system contains:
+
+- **RK-E Default**
+- Additional named presets
+
+A new preset copies the complete currently selected preset, including:
+
+- CPU configuration
+- GPU configuration
+- Scheduler
+- Fan curve
+
+Any preset can be selected as the Steam default.
+
+While a game is running, the Presets tab provides a dedicated **Game preset**
+dropdown. Selecting an entry assigns and immediately applies that preset.
+
+A lightweight backend watcher monitors Steam independently of the Decky panel:
+
+```text
+Steam idle
+    ↓
+RK-E Default or selected Steam default
+    ↓
+Game starts
+    ↓
+Assigned game preset
+    ↓
+Game exits
+    ↓
+Steam default restored
+```
+
+The watcher reads the small Steam systemd process scope, avoids global process
+scanning, and debounces launch and exit transitions. Preset switching therefore
+continues while the RK-Enhanced panel is closed.
+
+### Utilities
+
+The Utils tab contains:
+
+- Runtime logs
+- ROCKNIX Custom fan-curve editor
+- Installed and latest release discovery
+- Update to the latest published release
+- Reinstall the current release
+- Downgrade to the previous published release
+- Hidden experimental controls
+
+Release discovery includes GitHub pre-releases.
+
+Updates are installed by a detached updater that:
+
+1. Downloads and validates the selected release.
+2. Creates a rollback copy.
+3. Replaces the plugin.
+4. Reloads Decky.
+5. Leaves Steam and running games untouched.
+
+Downgrading preserves the safer current updater so reinstalling a newer release
+cannot restore obsolete Steam lifecycle behaviour.
+
+### Experimental bypass charging
+
+Bypass charging is currently hidden behind the experimental controls section in
+Utils.
+
+On supported kernels, RK-Enhanced writes `inhibit-charge` or `auto` to:
+
+```text
+/sys/class/power_supply/battery/charge_behaviour
+```
+
+The written mode is read back and verified. Bypass behaviour depends on the
+device and power supply:
+
+- Sufficient external power may hold the battery level.
+- A weak charger may still allow partial battery discharge.
+- Some combinations may continue charging slowly.
+- Unsupported kernels may not expose the required control.
+
+Hiding experimental controls safely disables bypass first.
+
+## Hardware support
+
+Development and live testing currently focus on Qualcomm-based ROCKNIX
+handhelds, including:
+
+- Snapdragon SM8650
+- Snapdragon SM8750
+
+RK-Enhanced discovers CPU policies, GPU interfaces, thermal zones, fan
+controls, and battery features at runtime. Controls unavailable on a device
+should be omitted or reported as unavailable.
+
+Broader hardware validation is still required.
 
 ## GPU monitoring
 
-On Qualcomm/Adreno devices exposing KGSL, RK-Enhanced follows MangoHud and reads
-the system-wide `gpu_busy_percentage` metric from
-`/sys/class/kgsl/kgsl-3d0`. On systems without that metric it falls back to the
-active Steam game's unique DRM clients and their `drm-engine-gpu` time. When no
-game is running it monitors gamescope instead. Process discovery is cached and
-does not repeatedly scan every process and file descriptor on each sample.
+On Qualcomm/Adreno devices exposing KGSL, RK-Enhanced reads:
 
-## Battery and bypass charging
+```text
+/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage
+```
 
-On supported devices, the Monitor tab controls bypass charging through
-`/sys/class/power_supply/battery/charge_behaviour`. RK-Enhanced writes
-`inhibit-charge` to enable bypass and `auto` to restore normal charging, then
-reads the active bracketed mode back to verify the change.
+This provides system-wide GPU activity and closely follows the value used by
+MangoApp.
 
-While bypass is active, the battery bar is blue and signed battery flow reports
-whether the battery is holding charge, charging, or supplementing a weak power
-supply. When the battery is discharging, RK-Enhanced calculates remaining time
-from the charge counter and a smoothed current sample instead of trusting the
-kernel estimate after near-zero-current periods. It displays `Calculating…`
-until the initial sample window is ready, then updates the estimate every five
-seconds. Times use readable forms such as `6h 11m`.
+When KGSL activity is unavailable, RK-Enhanced can fall back to DRM client
+engine accounting associated with the active Steam application or gamescope.
+Process and file-descriptor discovery is cached to avoid expensive repeated
+scans.
 
-## Known limitations
+## Temperature monitoring
 
-- This remains early pre-release software; regressions and incomplete workflows
-  should be expected.
-- Hardware discovery and writable sysfs controls can differ between ROCKNIX
-  devices and builds.
-- Active-game GPU usage currently targets Qualcomm KGSL and MSM DRM layouts
-  tested during development; other drivers may need additional support.
-- Decky or SteamWebHelper restarts can occasionally leave old PluginLoader
-  workers behind on this ROCKNIX/FEX setup.
-- Preset, session restoration and fan-curve workflows need broader real-world
-  testing.
-- The UI and controller/touch interaction still need refinement.
+Thermal-zone discovery is designed to work across different Qualcomm layouts.
 
-Bug reports should include the ROCKNIX build, device model, steps to reproduce
-and relevant output from the plugin's Utils → Logs view.
+Current representation:
+
+- **CPU temperature:** average of available CPU package sensors
+- **CPU hotspot:** hottest valid CPU or CPU-package sensor
+- **GPU temperature:** primary GPU package sensor, with a fallback to the
+  hottest GPU sensor
+
+Colour thresholds:
+
+- Green: below 50°C
+- Yellow: 50–69°C
+- Orange: 70–84°C
+- Red: 85°C and above
+
+The representative CPU value is intended to describe overall package
+conditions, while CPU hotspot highlights the hottest observed area.
+
+## Design challenges
+
+### ROCKNIX has one Custom fan slot
+
+ROCKNIX always reads the same `fancontrol.conf` file. Multiple RK-E curves
+therefore require controlled temporary replacement rather than separate native
+fan slots. The restoration guard exists to keep this process recoverable.
+
+### ROCKNIX cooling overrides are global
+
+An explicit Steam cooling override can be copied into the global ROCKNIX
+setting. After Steam exits, ROCKNIX may leave that value active instead of
+restoring the earlier System profile.
+
+For example:
+
+```text
+System: Quiet
+Steam: Aggressive
+```
+
+may leave the System profile at Aggressive afterward. RK-Enhanced deliberately
+does not alter or restore ROCKNIX profile selections.
+
+### Decky runs through FEX
+
+On the tested ARM ROCKNIX environment, Decky and plugin workers run through
+FEX. This introduces several complications:
+
+- System tools can inherit incompatible private libraries.
+- Graceful PluginLoader shutdown can occasionally hang.
+- Old child processes may survive a failed restart.
+- Frontend bundles must be classic scripts rather than ES modules.
+
+RK-Enhanced sanitises child-process library variables and emits its frontend as
+an IIFE bundle to remain compatible with this environment.
+
+### Hardware interfaces vary
+
+Thermal names, CPU clusters, GPU drivers, battery controls, fan paths, and
+writable sysfs entries can differ between devices and ROCKNIX versions.
+Runtime discovery reduces hard-coded assumptions, but cannot replace testing
+across real hardware.
+
+### Monitoring must remain lightweight
+
+Telemetry polling can itself affect performance if implemented carelessly.
+RK-Enhanced caches expensive discovery, avoids duplicate pollers, and starts
+Monitor polling only while the Monitor tab is visible.
+
+The automatic game watcher reads only Steam's small process cgroup rather than
+repeatedly scanning the whole system.
+
+## Current limitations
+
+- Hardware coverage remains limited.
+- Qualcomm KGSL and MSM DRM receive the strongest GPU-monitoring support.
+- Thermal sensor naming may require additional device-specific handling.
+- Utils can create `/storage/.config/fancontrol.conf` when it is missing and
+  graphically edit the ROCKNIX Custom curve afterward. Activation still occurs
+  through ROCKNIX or Steam cooling-profile settings.
+- Native ROCKNIX profile overrides may remain active after Steam exits.
+- Crash recovery and restoration need broader long-duration testing.
+- Touch, controller navigation, and compact-screen layouts still need
+  refinement.
+- Experimental bypass charging is not ready for general exposure.
+- Preset import, export, and sharing are not yet available.
+- TDP control is not currently implemented.
+
+## Roadmap
+
+### Beta stabilisation
+
+- Stress-test launch, exit, crash, sleep, resume, and reboot transitions
+- Validate restoration after forced PluginLoader termination
+- Expand SM8650 and SM8750 device testing
+- Improve detection of unsupported and partially supported controls
+- Add clearer diagnostics when sysfs writes fail
+- Refine controller and touch navigation
+- Reduce remaining layout inconsistencies
+- Review every preset migration path
+
+### Hardware expansion
+
+- Add more Qualcomm GPU layouts
+- Improve non-KGSL GPU monitoring
+- Build a reusable device-capability registry
+- Validate additional battery and charging interfaces
+- Improve thermal-zone classification
+- Investigate safe power and TDP controls where hardware support exists
+
+### Preset improvements
+
+- Import and export presets
+- Duplicate presets explicitly
+- Display the effective preset and reason for selection
+- Add assignment summaries
+- Add optional preset reset points
+- Improve conflict handling when settings change outside RK-Enhanced
+
+### Diagnostics and recovery
+
+- Export a compact diagnostic report
+- Include device, ROCKNIX build, sensor discovery, and recent logs
+- Add restoration self-tests
+- Detect stale configuration sessions at boot
+- Improve recovery guidance when Decky or Steam becomes unavailable
+
+### Longer-term direction
+
+- Broader ARM handheld support
+- More device-specific safeguards
+- Optional performance recommendations based on detected capabilities
+- Stable preset schema with backward-compatible migrations
+- A polished 1.0 release after sufficient hardware coverage and recovery
+  testing
 
 ## Installation
 
-The bundled installer downloads the latest stable Decky Loader and the newest
-RK-Enhanced release, including pre-releases:
+Run the installer as `root` on the ROCKNIX device:
 
 ```sh
 curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh
 ```
 
-Run it as `root` on the ROCKNIX device. Review `install.sh` before piping it to a
-shell. The installer keeps rollback copies of the previous Decky binary and
-RK-Enhanced plugin directory.
+The installer retrieves the latest published RK-Enhanced release, including
+pre-releases, and installs Decky Loader when required. Review `install.sh`
+before piping it into a shell.
 
-For a manual installation, extract the release asset so the final layout is:
+Manual layout:
 
 ```text
 /storage/homebrew/plugins/RK-Enhanced/
 ├── dist/index.js
+├── fan-restore-guard.sh
 ├── main.py
 ├── updater.sh
 └── plugin.json
 ```
 
-After a release containing the detached updater is installed, Utils →
-**Reinstall latest release** can download and validate the newest GitHub release,
-back up the current plugin, replace RK-Enhanced and restart Decky while leaving
-Steam and any running game untouched. RK-Enhanced controls are briefly
-unavailable while Decky reloads.
-
 ## Development
 
-Requirements include Node.js and pnpm:
+Requirements:
+
+- Node.js
+- pnpm
+- Python 3
+
+Validation and build:
 
 ```sh
 pnpm install
@@ -132,10 +415,91 @@ pnpm typecheck
 pnpm build
 ```
 
-The frontend bundle is intentionally emitted as an IIFE. The Decky frontend on
-the tested ROCKNIX build evaluates plugin bundles as classic scripts, so an ESM
-bundle fails with `Unexpected token: export`.
+The frontend is emitted as an IIFE because the tested Decky/FEX environment
+evaluates plugin bundles as classic scripts. An ESM bundle fails with:
+
+```text
+Unexpected token: export
+```
+
+## Reporting problems
+
+Useful reports include:
+
+- Device model and SoC
+- ROCKNIX build
+- RK-Enhanced version
+- Exact reproduction steps
+- Expected and observed behaviour
+- Relevant output from Utils → Logs
+
+## Origins and acknowledgements
+
+RK-Enhanced would not exist without **Seilent's original
+[ROCKNIX Control](https://github.com/seilent/rocknix-control)**.
+
+That project established the core idea of bringing ROCKNIX hardware controls
+into Decky's Quick Access Menu and provided the foundation from which
+Rocknix-Control-Enhanced and RK-Enhanced developed.
+
+Further development draws from:
+
+- [ROCKNIX Control](https://github.com/seilent/rocknix-control) by Seilent — the
+  original foundation
+- [Rocknix-Control-Enhanced](https://github.com/thefiqs/Rocknix-Control-Enhanced/tree/preset-delete-button)
+  — the earlier enhanced fork
+- [NDC-Enhanced](https://github.com/thefiqs/NDC-Enhanced) — interface and
+  workflow inspiration
+- The ROCKNIX project and its device-specific services, quirks, and hardware
+  support
+
+RK-Enhanced continues that work with deep respect for the projects and
+contributors that made it possible.
+
+## Development collaboration
+
+RK-Enhanced is developed through hands-on hardware testing, direct ROCKNIX
+inspection, and iterative coding collaboration with **Codex**.
+
+Development has used **GPT-5.6 Sol**, with reasoning effort scaled from
+**Light through Ultra** according to task complexity. Hardware behaviour and
+final decisions are validated against real devices rather than accepted from
+generated output alone.
 
 ## License
 
 MIT
+
+## Screenshots
+
+### Utils
+
+![RK-Enhanced Utils](docs/screenshots/utils.jpg)
+
+### Presets
+
+![RK-Enhanced presets](docs/screenshots/presets.jpg)
+
+### Fan curves and live fan output
+
+![RK-Enhanced fan curve live output](docs/screenshots/fan-curves-live.jpg)
+
+### Fan-curve editor
+
+![RK-Enhanced fan-curve editor](docs/screenshots/fan-curves.jpg)
+
+### GPU performance controls
+
+![RK-Enhanced GPU performance controls](docs/screenshots/performance-gpu.jpg)
+
+### CPU performance controls
+
+![RK-Enhanced CPU performance controls](docs/screenshots/performance-cpu.jpg)
+
+### Monitor clocks and runtime
+
+![RK-Enhanced clocks and runtime monitoring](docs/screenshots/monitor-runtime.jpg)
+
+### Live performance monitor
+
+![RK-Enhanced live performance monitor](docs/screenshots/monitor-performance.jpg)

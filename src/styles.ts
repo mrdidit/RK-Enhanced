@@ -13,6 +13,8 @@ export const styles = `
   .rke-presets .rke-action-button { box-sizing: border-box !important; width: calc(100% - 12px) !important; margin-left: 12px !important; }
   .rke-save-apply { box-sizing: border-box; width: calc(100% - 12px); margin: 5px 0 7px 12px; }
   .rke-save-apply .${gamepadDialogClasses.Field} { opacity: .72; font-size: 11px; text-align: center; }
+  .rke-fan-warning .${gamepadDialogClasses.Field},
+  .rke-fan-warning .${gamepadDialogClasses.FieldDescription} { color: #ff5b5b !important; opacity: 1 !important; }
   .rke-section-heading { width: 100%; box-sizing: border-box; padding: 8px 0 10px; text-align: center; text-transform: uppercase; font-size: 16px; font-weight: 700; letter-spacing: .04em; }
   .rke-cluster-heading { width: 100%; box-sizing: border-box; padding: 12px 0 4px; text-align: center; font-size: 15px; font-weight: 600; }
   .rke-cluster-heading small { display: block; margin-top: 3px; opacity: .66; font-size: 11px; font-weight: 400; }

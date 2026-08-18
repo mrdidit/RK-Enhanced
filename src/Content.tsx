@@ -1,17 +1,17 @@
 import {
   ButtonItem, ConfirmModal, DropdownItem, Field, PanelSection, PanelSectionRow,
-  showModal, SliderField, Tabs, TextField,
+  showModal, SliderField, Tabs, TextField, ToggleField,
 } from "@decky/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, installRelease, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame } from "./backend";
+import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setBypassCharging, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
 import { currentGame } from "./game";
 import { Monitor } from "./Monitor";
 import { Logs } from "./Logs";
 import { styles } from "./styles";
 import type { GameRef, HardwareProfile, State, Telemetry, UpdateInfo } from "./types";
 
-const DEFAULT = "Steam Default";
+const DEFAULT = "RK-E Default";
 const option = (data: string | number, label?: string) => ({ data, label: label ?? String(data) });
 const cpuMhz = (khz: number) => `${Math.round(khz / 1000)} MHz`;
 const gpuMhz = (hz: number) => `${Math.round(hz / 1_000_000)} MHz`;
@@ -57,6 +57,9 @@ export function Content() {
   const [utility, setUtility] = useState<"Logs" | "Fan" | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateError, setUpdateError] = useState("");
+  const [experimentalCode, setExperimentalCode] = useState("");
+  const [showExperimentalUnlock, setShowExperimentalUnlock] = useState(false);
+  const [bypassBusy, setBypassBusy] = useState(false);
 
   const installState = useCallback((next: State, preferred?: string) => {
     setState(next);
@@ -115,13 +118,13 @@ export function Content() {
     return () => window.clearInterval(timer);
   }, [game?.appid, load]);
   useEffect(() => {
-    if (tab !== "Fan") return;
+    if (tab !== "Fan" && !(tab === "Utils" && state?.experimental_unlocked)) return;
     let cancelled = false;
     const refresh = () => getTelemetry().then(value => { if (!cancelled) setLive(value); }).catch(() => {});
     void refresh();
     const timer = window.setInterval(refresh, 2000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [tab]);
+  }, [tab, state?.experimental_unlocked]);
   useEffect(() => {
     if (tab !== "Utils") return;
     setUpdateError("");
@@ -154,6 +157,15 @@ export function Content() {
     } catch (error) { setMessage(String(error)); }
     finally { setBusy(false); }
   };
+  const toggleBypass = async (enabled: boolean) => {
+    setBypassBusy(true);
+    try {
+      await setBypassCharging(enabled);
+      setLive(await getTelemetry());
+      setMessage(`Bypass charging ${enabled ? "enabled" : "disabled"}`);
+    } catch (error) { setMessage(String(error)); }
+    finally { setBypassBusy(false); }
+  };
 
   if (!state || !draft) return <PanelSection title="RK-Enhanced"><Field label={message} /></PanelSection>;
   const names = Object.keys(state.presets);
@@ -162,15 +174,19 @@ export function Content() {
   const assigned = game ? state.game_profiles[game.appid] : undefined;
   const dirty = JSON.stringify(draft) !== JSON.stringify(state.presets[selected]);
   const valid = cpuPolicies.length > 0;
+  const effectiveCooling = live?.cooling_profile || state.effective_cooling_profile;
+  const fanCanApply = effectiveCooling === "custom";
 
   const saveAndApply = () => run(
     async () => installState(await savePreset(selected, draft), selected),
     `${selected} saved and applied`,
   );
-  const saveApplyControl = () => <div className="rke-save-apply">
-    <PanelSectionRow><ButtonItem layout="below" disabled={busy || !valid}
+  const saveApplyControl = (fanOnly = false) => <div className="rke-save-apply">
+    <PanelSectionRow><ButtonItem layout="below" disabled={busy || !valid || (fanOnly && !fanCanApply)}
       onClick={() => void saveAndApply()}>Save &amp; Apply</ButtonItem></PanelSectionRow>
-    <PanelSectionRow><Field label={`Saves and applies changes to ${selected}.`} /></PanelSectionRow>
+    <PanelSectionRow><Field label={fanOnly && !fanCanApply
+      ? "Unavailable until ROCKNIX cooling is set to Custom."
+      : `Saves and applies changes to ${selected}.`} /></PanelSectionRow>
   </div>;
 
   const choosePreset = (name: string) => {
@@ -227,10 +243,10 @@ export function Content() {
     strDescription={`Delete “${selected}” and remove all of its game assignments?`}
     strOKButtonText="Delete" strCancelButtonText="Cancel"
     onOK={() => run(async () => { const next = await deletePreset(selected); installState(next, DEFAULT); }, "Preset deleted")} />);
-  const confirmRestoreSteam = () => showModal(<ConfirmModal strTitle="Restore Steam Default?"
-    strDescription="Replace Steam Default with the original ROCKNIX settings copied during setup?"
+  const confirmRestoreSteam = () => showModal(<ConfirmModal strTitle="Restore RK-E Default?"
+    strDescription="Replace RK-E Default with the original settings and ROCKNIX Custom curve copied during setup?"
     strOKButtonText="Restore" strCancelButtonText="Cancel"
-    onOK={() => run(async () => installState(await restoreSteamDefault(), DEFAULT), "Steam Default restored")} />);
+    onOK={() => run(async () => installState(await restoreSteamDefault(), DEFAULT), "RK-E Default restored")} />);
   const confirmRelease = (target: string, action: "Update" | "Reinstall" | "Downgrade") => showModal(<ConfirmModal
     strTitle={`${action} ${target}?`}
     strDescription={`This downloads ${target} from GitHub, backs up the current plugin, installs it, then reloads Decky. RK-Enhanced controls will be briefly unavailable.`}
@@ -248,8 +264,8 @@ export function Content() {
           : `Steam uses ${state.steam_default}`} /></PanelSectionRow>
       <SelectRow label="Steam default preset" value={state.steam_default} values={names} disabled={busy}
         onChange={(name: string) => run(async () => installState(await setSteamDefault(name), name), `Steam default preset set to ${name}`)} />
-      {game && <PanelSectionRow><ButtonItem layout="below" disabled={busy}
-        onClick={() => run(async () => installState(await assignGame(game.appid, selected), selected), `${selected} assigned to ${game.name}`)}>Assign selected preset</ButtonItem></PanelSectionRow>}
+      {game && <SelectRow label="Game preset" value={assigned || state.steam_default} values={names} disabled={busy}
+        onChange={(name: string) => run(async () => installState(await assignGame(game.appid, name), name), `${name} assigned and applied to ${game.name}`)} />}
       {game && assigned && <PanelSectionRow><ButtonItem layout="below" disabled={busy}
         onClick={() => run(async () => installState(await unassignGame(game.appid), state.steam_default), `Assignment removed; ${state.steam_default} will be used`)}>Remove assignment</ButtonItem></PanelSectionRow>}
     </PanelSection>
@@ -259,7 +275,7 @@ export function Content() {
       <PanelSectionRow><Field label={dirty ? "Unsaved changes" : selected === state.active_preset ? "Active preset" : "Saved preset"} /></PanelSectionRow>
       {saveApplyControl()}
       {selected === DEFAULT && <PanelSectionRow><ButtonItem layout="below" disabled={busy}
-        onClick={confirmRestoreSteam}>Restore original Steam Default</ButtonItem></PanelSectionRow>}
+        onClick={confirmRestoreSteam}>Restore original RK-E Default</ButtonItem></PanelSectionRow>}
       <PanelSectionRow><ButtonItem layout="below" disabled={busy}
         onClick={() => setPresetForm(current => current === "new" ? null : "new")}>{presetForm === "new" ? "Cancel new preset" : "New preset"}</ButtonItem></PanelSectionRow>
       {presetForm === "new" && <>
@@ -330,15 +346,17 @@ export function Content() {
   </div>;
 
   const fan = <div>
-    {saveApplyControl()}
+    {saveApplyControl(true)}
     <PanelSection>
-      <SelectRow label="ROCKNIX cooling profile" value={draft.cooling_profile} values={state.capabilities.cooling_profiles}
-        disabled={!state.capabilities.fan_available}
-        onChange={value => update(profile => { profile.cooling_profile = value; })} />
       {!state.capabilities.fan_available && <PanelSectionRow><Field label="Fan control unavailable on this device" /></PanelSectionRow>}
-      {draft.cooling_profile === "custom" && <>
-        <PanelSectionRow><Field label={`${selected} custom curve`}
-          description="Saved inside this preset. It temporarily replaces fancontrol.conf while this preset is active." /></PanelSectionRow>
+      {state.capabilities.fan_available && <>
+        <div className={!fanCanApply ? "rke-fan-warning" : ""}><PanelSectionRow><Field
+          label={state.fan_curve_active ? "Preset fan curve active" : fanCanApply ? "Preset fan curve ready" : "Preset fan curve inactive"}
+          description={state.fan_curve_active
+            ? "ROCKNIX native fancontrol is running this preset curve."
+            : fanCanApply
+              ? "ROCKNIX Custom is active. Press Save & Apply to install this preset curve."
+              : `ROCKNIX cooling is ${effectiveCooling || "unknown"}. In ROCKNIX Settings, set Cooling Profile to Custom. For Steam, use Per-System Advanced Configuration → Steam → Cooling Profile → Custom. Default also works when the System profile is Custom.`} /></PanelSectionRow></div>
         {draft.fan_curve.map(([temp, pwm], index) => <div key={index}>
           <PanelSectionRow><SliderField label={`Point ${index + 1} temperature`} description={`${Math.round(temp / 1000)}°C`}
             value={temp} min={10000 + index * 1000} max={120000 - (draft.fan_curve.length - 1 - index) * 1000}
@@ -356,7 +374,7 @@ export function Content() {
         </span>
       </Field></PanelSectionRow>
     </PanelSection>
-    {saveApplyControl()}
+    {saveApplyControl(true)}
   </div>;
 
   const utils = <div className="rke-utils">
@@ -366,11 +384,11 @@ export function Content() {
       </ButtonItem></PanelSectionRow>
       {utility === "Logs" && <Logs />}
       <PanelSectionRow><ButtonItem layout="below" onClick={() => setUtility(current => current === "Fan" ? null : "Fan")}>
-        {utility === "Fan" ? "Hide ROCKNIX Custom fan curve" : "ROCKNIX Custom fan curve"}
+        {utility === "Fan" ? "Hide ROCKNIX Custom fan curve" : "Edit ROCKNIX Custom fan curve"}
       </ButtonItem></PanelSectionRow>
       {utility === "Fan" && <>
-        <PanelSectionRow><Field label="Native ROCKNIX custom profile"
-          description="Edits /storage/.config/fancontrol.conf" /></PanelSectionRow>
+        <PanelSectionRow><Field label="Protected system curve"
+          description="Edits ROCKNIX's Custom curve. Active RK-E preset curves remain independent." /></PanelSectionRow>
         {systemCurve.map(([temp, pwm], index) => <div key={index}>
           <PanelSectionRow><SliderField label={`Point ${index + 1} temperature`} description={`${Math.round(temp / 1000)}°C`}
             value={temp} min={10000 + index * 1000} max={120000 - (systemCurve.length - 1 - index) * 1000}
@@ -383,6 +401,32 @@ export function Content() {
         {systemCurve.length < 16 && <PanelSectionRow><ButtonItem layout="below" onClick={addSystemCurvePoint}>Add point above hottest</ButtonItem></PanelSectionRow>}
         <PanelSectionRow><ButtonItem layout="below" disabled={busy || systemCurve.length < 2}
           onClick={() => run(async () => installState(await saveSystemFanCurve(systemCurve), selected), "ROCKNIX Custom fan curve saved")}>Save system fan curve</ButtonItem></PanelSectionRow>
+      </>}
+      {!state.experimental_unlocked && <>
+        <PanelSectionRow><ButtonItem layout="below" onClick={() => setShowExperimentalUnlock(current => !current)}>
+          {showExperimentalUnlock ? "Hide experimental unlock" : "Experimental controls"}
+        </ButtonItem></PanelSectionRow>
+        {showExperimentalUnlock && <>
+          <PanelSectionRow><TextField label="Unlock code" value={experimentalCode}
+            onChange={event => setExperimentalCode(event.target.value)} /></PanelSectionRow>
+          <PanelSectionRow><ButtonItem layout="below" disabled={busy || !experimentalCode}
+            onClick={() => run(async () => {
+              installState(await unlockExperimental(experimentalCode), selected);
+              setExperimentalCode(""); setShowExperimentalUnlock(false);
+            }, "Experimental controls unlocked")}>Unlock</ButtonItem></PanelSectionRow>
+        </>}
+      </>}
+      {state.experimental_unlocked && <>
+        <PanelSectionRow><Field label="Experimental: bypass charging"
+          description="Stops battery charging on supported devices. Power behaviour depends on the charger and hardware." /></PanelSectionRow>
+        <PanelSectionRow><ToggleField label="Bypass charging" checked={live?.bypass_charging || false}
+          disabled={bypassBusy} onChange={enabled => void toggleBypass(enabled)} /></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" disabled={busy || bypassBusy}
+          onClick={() => run(async () => {
+            if (live?.bypass_charging) await setBypassCharging(false);
+            installState(await lockExperimental(), selected);
+            setLive(await getTelemetry());
+          }, "Experimental controls hidden")}>Hide experimental controls</ButtonItem></PanelSectionRow>
       </>}
       <PanelSectionRow><Field label="Installed release"
         description={updateInfo?.installed || "Checking…"} /></PanelSectionRow>

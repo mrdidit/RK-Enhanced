@@ -26,9 +26,9 @@ jobs:
       - name: Assemble plugin
         run: |
           mkdir -p release/RK-Enhanced
-          cp -r dist main.py plugin.json install.sh updater.sh README.md LICENSE release/RK-Enhanced/
+          cp -r dist docs main.py plugin.json fan-restore-guard.sh install.sh updater.sh README.md LICENSE release/RK-Enhanced/
           printf '%s\n' "${GITHUB_REF_NAME}" > release/RK-Enhanced/VERSION
-          chmod 755 release/RK-Enhanced/install.sh release/RK-Enhanced/updater.sh
+          chmod 755 release/RK-Enhanced/fan-restore-guard.sh release/RK-Enhanced/install.sh release/RK-Enhanced/updater.sh
           cd release
           zip -r RK-Enhanced.zip RK-Enhanced
       - uses: actions/upload-artifact@v4
