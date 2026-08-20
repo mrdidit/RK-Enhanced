@@ -1,5 +1,6 @@
 import { Field, PanelSection, PanelSectionRow } from "@decky/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { Ref } from "react";
 import { getTelemetry } from "./backend";
 import type { Telemetry } from "./types";
 
@@ -34,18 +35,27 @@ function Meter({ value, color = "#59bf40" }: { value: number; color?: string }) 
 }
 
 function Metric({ label, value, percent, color, detail, valueColor }: { label: string; value: string; percent?: number; color?: string; detail?: string; valueColor?: string }) {
-  return <PanelSectionRow><Field focusable highlightOnFocus label={label}
+  return <PanelSectionRow><Field label={label} bottomSeparator="none"
     description={percent === undefined ? detail : <Meter value={percent} color={color} />}>
     <span style={{ display: "block", width: "100%", textAlign: "right", color: valueColor, fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>{value}</span>
   </Field></PanelSectionRow>;
 }
 
-const Heading = ({ children }: { children: string }) =>
-  <div style={{ width: "100%", textAlign: "center", fontSize: 18, fontWeight: 700, padding: "10px 0 4px" }}>{children}</div>;
+const Heading = ({ children, headingRef, onActivate }: {
+  children: string;
+  headingRef?: Ref<HTMLDivElement>;
+  onActivate?: () => void;
+}) =>
+  <div className="rke-monitor-heading-row">
+    <Field ref={headingRef} className="rke-monitor-heading" focusable highlightOnFocus
+      bottomSeparator="none" label={<span className="rke-monitor-heading-label">{children}</span>}
+      onActivate={onActivate} onClick={onActivate} />
+  </div>;
 
 export function Monitor({ active }: { active: boolean }) {
   const [data, setData] = useState<Telemetry | null>(null);
   const [error, setError] = useState("");
+  const powerHeadingRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
@@ -68,8 +78,13 @@ export function Monitor({ active }: { active: boolean }) {
   const bypassHolding = bypassCharging && Math.abs(data.battery_flow_watts) < 0.2;
   const bypassDischarging = bypassCharging && data.battery_flow_watts <= -0.2;
   const bypassFilling = bypassCharging && data.battery_flow_watts >= 0.2;
+  const backToTop = () => {
+    powerHeadingRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    powerHeadingRef.current?.focus();
+  };
   return <div className="rke-monitor">
     <PanelSection>
+      <Heading headingRef={powerHeadingRef}>Power &amp; Battery</Heading>
       <Metric label={bypassHolding ? "Bypass charging" : bypassDischarging ? "Battery remaining" : bypassFilling ? "Battery until full" : data.battery_status === "Charging" ? "Battery until full" : "Battery remaining"}
         value={bypassHolding
           ? `${data.battery_percent}%`
@@ -101,17 +116,21 @@ export function Monitor({ active }: { active: boolean }) {
         value={cpuMhz(clock.frequency)}
         percent={clock.maximum ? clock.frequency * 100 / clock.maximum : 0}
         color="#45aaf2" />)}
-      {data.gpu_frequency_max > 0 && <Metric label={`GPU · ${data.gpu_governor || "unknown"}`}
-        value={gpuMhz(data.gpu_frequency)} percent={data.gpu_frequency * 100 / data.gpu_frequency_max} color="#45aaf2" />}
+      {data.gpu_frequency_max > 0 && <>
+        <Metric label="GPU governor" value={data.gpu_governor || "Unavailable"} />
+        <Metric label="GPU clock" value={gpuMhz(data.gpu_frequency)}
+          percent={data.gpu_frequency * 100 / data.gpu_frequency_max} color="#45aaf2" />
+      </>}
     </PanelSection>
     <PanelSection>
       <Heading>Runtime</Heading>
-      <Metric label="Cooling profile" value={data.cooling_profile || "Unavailable"} />
+      <Metric label="ROCKNIX cooling profile" value={data.cooling_profile || "Unavailable"} />
       <Metric label="CPU scheduler" value={data.scheduler === "lavd" ? "LAVD (sched_ext)" : "Kernel default"} />
       <Metric label="CPU queue" value={logicalCpus ? queueStatus : "Unavailable"}
         detail={logicalCpus ? `${oneMinuteLoad.toFixed(1)} / ${logicalCpus} cores` : undefined}
         valueColor={queueStatus === "Overloaded" ? "#fc5c65" : queueStatus === "Busy" ? "#fed330" : "#26de81"} />
       {error && <PanelSectionRow><Field label={error} /></PanelSectionRow>}
+      <Heading onActivate={backToTop}>Back to top</Heading>
     </PanelSection>
   </div>;
 }

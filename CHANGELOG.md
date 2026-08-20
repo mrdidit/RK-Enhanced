@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.0-beta.3 — 2026-08-21
+
+### UI improvements and cleanup
+
+- Enlarges the tab header and shoulder-button hints, and makes tab focus visible.
+- Adds consistent focusable section headings and Back to top navigation across
+  Monitor, Performance, and Fan Curve.
+- Compacts performance and fan controls, removes redundant row separators, and
+  places live slider values beside their labels.
+- Reorganises Presets into clearer Preset Management and Game Assignment
+  sections.
+- Opens logs in a large centred modal with controller-friendly scrolling,
+  newest-first entries, compact timestamps, and reliable close controls.
+
 ## v0.2.0-beta.2 — 2026-08-18
 
 This patch focuses on correct CPU boost handling and recoverable ownership of
