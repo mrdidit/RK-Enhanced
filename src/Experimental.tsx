@@ -18,11 +18,16 @@ const BATTERY_CHOICES = [
   ...BATTERY_LIMITS.map(limit => choice(`limit-${limit}`, `Limit ${limit}%`)),
 ];
 const PUMP_CHOICES = [
-  choice("normal", "Qualcomm/Normal"),
+  choice("normal", "Qcom Normal"),
   choice("slow", "Slow 25 W"),
   choice("fast", "Fast 36 W"),
 ];
 type ChargingControl = "battery-policy" | "pump-profile";
+const GREEN = "#26de81";
+const BLUE = "#45aaf2";
+const YELLOW = "#fed330";
+const ORANGE = "#f39c3d";
+const RED = "#fc5c65";
 
 const Heading = ({ title, headingRef, onActivate }: {
   title: string;
@@ -65,31 +70,116 @@ const pumpLabel = (pump: PumpProfileStatus) => {
   if (!pump.valid) return pump.available ? "Unavailable" : "Unsupported";
   if (pump.profile === "slow") return "Slow 25 W";
   if (pump.profile === "fast") return "Fast 36 W";
-  return "Qualcomm/Normal";
+  return "Qcom Normal";
 };
 
-const phaseLabel = (pump: PumpProfileStatus) => {
-  if (!pump.valid) return "Unavailable";
-  if (pump.phase === "off") return "Off";
-  if (pump.phase === "starting") return "Starting";
-  if (pump.phase === "active") return "Active";
-  if (pump.phase === "error") return "Error";
-  return "Transitional/Unknown";
+const phaseDisplay = (pump: PumpProfileStatus) => {
+  if (pump.stale) return { value: "Stale", color: ORANGE };
+  if (!pump.valid) return { value: "Unavailable", color: ORANGE };
+  if (pump.phase === "off") return { value: "Off", color: BLUE };
+  if (pump.phase === "starting") return { value: "Starting", color: YELLOW };
+  if (pump.phase === "active") return { value: "Active", color: GREEN };
+  if (pump.phase === "error") return { value: "Error", color: RED };
+  return { value: "Transitional/Unknown", color: ORANGE };
 };
 
-const behaviourLabel = (battery: BatteryPolicyStatus) => {
-  if (!battery.valid || !battery.charge_behaviour) return "Unavailable";
-  return battery.charge_behaviour === "inhibit-charge" ? "Inhibit charge" : "Auto";
+const behaviourDisplay = (battery: BatteryPolicyStatus) => {
+  if (battery.stale) return { value: "Stale", color: ORANGE };
+  if (!battery.valid || !battery.charge_behaviour)
+    return { value: "Unavailable", color: ORANGE };
+  return battery.charge_behaviour === "inhibit-charge"
+    ? { value: "Paused", color: BLUE }
+    : { value: "Allowed", color: GREEN };
 };
 
-const healthLabel = (online?: boolean, health?: string) => {
-  if (!health) return "Unavailable";
-  return `${health} · ${online ? "Online" : "Off"}`;
+const batteryStatusDisplay = (battery: BatteryPolicyStatus) => {
+  if (battery.stale) return { value: "Stale", color: ORANGE };
+  const value = battery.battery_status?.trim();
+  if (!battery.valid || !value) return { value: "Unavailable", color: ORANGE };
+  const normalized = value.toLowerCase();
+  if (normalized === "charging" || normalized === "full")
+    return { value, color: GREEN };
+  if (normalized === "discharging" || normalized === "not charging")
+    return { value, color: BLUE };
+  if (normalized.includes("error") || normalized.includes("failure"))
+    return { value, color: RED };
+  return { value, color: ORANGE };
+};
+
+const usbSourceDisplay = (pump: PumpProfileStatus) => {
+  if (pump.stale) return { value: "Stale", color: ORANGE };
+  if (!pump.valid) return { value: "Unavailable", color: ORANGE };
+  if (!pump.usb_online) return { value: "Offline", color: BLUE };
+  const source = pump.usb_type?.trim();
+  if (!source || source === "Unknown") return { value: "Unknown", color: ORANGE };
+  const labels: Record<string, string> = {
+    PD_PPS: "PD-PPS",
+    PD: "USB-PD",
+    PD_DRP: "USB-PD DRP",
+    SDP: "Standard USB",
+    CDP: "Charging USB",
+    DCP: "Dedicated charger",
+    ACA: "Accessory charger",
+    C: "USB-C",
+    USB_C: "USB-C",
+    Apple_Brick_ID: "Apple charger",
+  };
+  return {
+    value: labels[source] || source.replace(/_/g, " "),
+    color: source === "PD_PPS" ? GREEN : labels[source] ? BLUE : ORANGE,
+  };
+};
+
+const pumpHealthDisplay = (pump: PumpProfileStatus, online?: boolean, health?: string) => {
+  if (pump.stale) return { value: "Stale", color: ORANGE };
+  if (!pump.valid || online === undefined || !health)
+    return { value: "Unavailable", color: ORANGE };
+  if (health === "Good")
+    return online ? { value: "On", color: GREEN } : { value: "Off", color: BLUE };
+  if (health.toLowerCase() === "unknown") return { value: health, color: ORANGE };
+  return { value: `${health}${online ? " · On" : ""}`, color: RED };
+};
+
+const batteryTemperatureDisplay = (temperature: number | null) => {
+  if (temperature === null || !Number.isSafeInteger(temperature))
+    return { value: "Unavailable", color: ORANGE };
+  const celsius = temperature / 10;
+  const color = celsius < 0 || celsius >= 50 ? RED
+    : celsius >= 45 ? ORANGE : celsius >= 35 ? YELLOW : GREEN;
+  return { value: `${celsius.toFixed(1)}°C`, color };
 };
 
 const capturedTime = (seconds?: number) => seconds
   ? new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
   : "Unavailable";
+
+const formatInputWatts = (microwatts: string) => {
+  if (!/^\d+$/.test(microwatts)) return null;
+  try {
+    const value = BigInt(microwatts);
+    if (value > 9223372036854775807n) return null;
+    const tenths = (value + 50000n) / 100000n;
+    return `${tenths / 10n}.${tenths % 10n} W`;
+  } catch {
+    return null;
+  }
+};
+
+const inputPowerDisplay = (status: ChargingStatus, current: boolean) => {
+  const input = status.pump.input_power;
+  if (status.battery.stale || status.pump.stale || input?.stale)
+    return { value: "Stale", description: input?.error };
+  if (!current || !status.coherent || !input?.available)
+    return { value: "Unavailable", description: input?.error };
+  if (input.path === "offline") return { value: "Offline" };
+  if (input.path === "transition") return { value: "Transitioning…" };
+  if (input.path === "unavailable") return { value: "Unavailable" };
+  if (!input.valid || input.microwatts === null)
+    return { value: "Unavailable", description: input.error };
+  const watts = formatInputWatts(input.microwatts);
+  if (!watts) return { value: "Unavailable", description: input.error };
+  return { value: watts };
+};
 
 const statusError = (status: BatteryPolicyStatus | PumpProfileStatus) =>
   status.refresh_error || status.error || status.transition_reason || "";
@@ -205,6 +295,7 @@ export function Experimental({ active }: { active: boolean }) {
     const session = activationSession.current;
     busyRef.current = true;
     setBusy(true);
+    setCurrentRefreshSucceeded(false);
     setLastOperation(null);
     setRequestError(null);
     try {
@@ -271,6 +362,20 @@ export function Experimental({ active }: { active: boolean }) {
     battery?.available && battery.valid && !battery.stale && !battery.transitional &&
     pump?.available && pump.valid && !pump.stale && !pump.transitional);
   const controlsDisabled = busy || !pairReady;
+  const inputPower = currentStatus
+    ? inputPowerDisplay(currentStatus, pairReady && !busy) : null;
+  const behaviour = currentStatus ? behaviourDisplay(currentStatus.battery) : null;
+  const batteryStatus = currentStatus ? batteryStatusDisplay(currentStatus.battery) : null;
+  const pumpPhase = currentStatus ? phaseDisplay(currentStatus.pump) : null;
+  const usbSource = currentStatus ? usbSourceDisplay(currentStatus.pump) : null;
+  const batteryTemperature = currentStatus
+    ? batteryTemperatureDisplay(currentStatus.battery_temperature_deci_c) : null;
+  const masterPump = currentStatus ? pumpHealthDisplay(
+    currentStatus.pump, currentStatus.pump.master_online,
+    currentStatus.pump.master_health) : null;
+  const slavePump = currentStatus ? pumpHealthDisplay(
+    currentStatus.pump, currentStatus.pump.slave_online,
+    currentStatus.pump.slave_health) : null;
   const batteryOperationText = operation?.kind === "battery-policy" ? operationText
     : requestError?.kind === "battery-policy" ? requestError.message : "";
   const pumpOperationText = operation?.kind === "pump-profile" ? operationText
@@ -283,8 +388,9 @@ export function Experimental({ active }: { active: boolean }) {
         disabled={controlsDisabled}
         selectedOption={batterySelection(battery)} rgOptions={BATTERY_CHOICES}
         onChange={(selected: any) => changeBattery(String(selected.data))} /></PanelSectionRow>
-      <PanelSectionRow><Field label="Limit 100 behavior" bottomSeparator="none"
-        description="Stops charging at 100% and resumes at 95%." /></PanelSectionRow>
+      {batterySelection(battery) === "limit-100" &&
+        <PanelSectionRow><Field label="Limit 100 behavior" bottomSeparator="none"
+          description="Stops charging at 100% and resumes at 95%." /></PanelSectionRow>}
       {batteryOperationText && <div className={operation?.kind === "battery-policy" && operation.ok ? "rke-experimental-notice" : "rke-experimental-error"}>
         <PanelSectionRow><Field label={operation?.kind === "battery-policy" && operation.ok ? "Request completed" : operation?.timed_out ? "Request timed out" : "Request refused"}
           description={batteryOperationText} bottomSeparator="none" /></PanelSectionRow>
@@ -323,14 +429,23 @@ export function Experimental({ active }: { active: boolean }) {
       {currentStatus && <>
         <StatusRow label="Battery policy" value={policyLabel(currentStatus.battery)} />
         <StatusRow label="Capacity" value={currentStatus.battery.capacity === undefined ? "Unavailable" : `${currentStatus.battery.capacity}%`} />
-        <StatusRow label="Observed behaviour" value={behaviourLabel(currentStatus.battery)} />
-        <StatusRow label="Battery status" value={currentStatus.battery.battery_status || "Unavailable"} />
+        <StatusRow label="Battery charging" value={behaviour?.value || "Unavailable"}
+          color={behaviour?.color} />
+        <StatusRow label="Battery status" value={batteryStatus?.value || "Unavailable"}
+          color={batteryStatus?.color} />
         <StatusRow label="Pump selection" value={pumpLabel(currentStatus.pump)} />
-        <StatusRow label="Pump phase" value={phaseLabel(currentStatus.pump)}
-          color={currentStatus.pump.phase === "active" ? "#26de81" : currentStatus.pump.phase === "error" ? "#fc5c65" : currentStatus.pump.phase === "starting" ? "#fed330" : undefined} />
-        <StatusRow label="USB source" value={currentStatus.pump.usb_type || "Unavailable"} />
-        <StatusRow label="Master pump" value={healthLabel(currentStatus.pump.master_online, currentStatus.pump.master_health)} />
-        <StatusRow label="Slave pump" value={healthLabel(currentStatus.pump.slave_online, currentStatus.pump.slave_health)} />
+        <StatusRow label="Pump phase" value={pumpPhase?.value || "Unavailable"}
+          color={pumpPhase?.color} />
+        <StatusRow label="USB source" value={usbSource?.value || "Unavailable"}
+          color={usbSource?.color} />
+        <StatusRow label="USB input power" value={inputPower?.value || "Unavailable"}
+          description={inputPower?.description} />
+        <StatusRow label="Battery temperature" value={batteryTemperature?.value || "Unavailable"}
+          color={batteryTemperature?.color} />
+        <StatusRow label="Master pump" value={masterPump?.value || "Unavailable"}
+          color={masterPump?.color} />
+        <StatusRow label="Slave pump" value={slavePump?.value || "Unavailable"}
+          color={slavePump?.color} />
         {currentStatus.pump.last_end_reason && currentStatus.pump.last_end_reason !== "none" &&
           <StatusRow label="Last pump stop" value={currentStatus.pump.last_end_reason} />}
         {currentStatus.pump.last_error !== undefined && currentStatus.pump.last_error !== 0 &&
