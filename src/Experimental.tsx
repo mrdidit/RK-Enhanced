@@ -396,9 +396,8 @@ export function Experimental({ active }: { active: boolean }) {
           description={batteryOperationText} bottomSeparator="none" /></PanelSectionRow>
       </div>}
       {battery && !battery.available && <div className="rke-experimental-error"><PanelSectionRow><Field
-        label="Battery policy unsupported" bottomSeparator="none"
-        description="/usr/bin/charging_mode is unavailable or reports that this device is unsupported." /></PanelSectionRow></div>}
-      {battery && statusError(battery) && <div className={battery.transitional ? "rke-experimental-warning" : "rke-experimental-error"}>
+        label="Battery policy unsupported" bottomSeparator="none" /></PanelSectionRow></div>}
+      {battery?.available && statusError(battery) && <div className={battery.transitional ? "rke-experimental-warning" : "rke-experimental-error"}>
         <PanelSectionRow><Field label={battery.stale ? "Battery status stale" : battery.transitional ? "Battery status transitional" : "Battery status unavailable"}
           description={statusError(battery)} bottomSeparator="none" /></PanelSectionRow>
       </div>}
@@ -415,9 +414,8 @@ export function Experimental({ active }: { active: boolean }) {
           description={pumpOperationText} bottomSeparator="none" /></PanelSectionRow>
       </div>}
       {pump && !pump.available && <div className="rke-experimental-error"><PanelSectionRow><Field
-        label="Pump profiles unsupported" bottomSeparator="none"
-        description="/usr/bin/kpfe_fast_charge is unavailable or reports that this device is unsupported." /></PanelSectionRow></div>}
-      {pump && statusError(pump) && <div className={pump.transitional ? "rke-experimental-warning" : "rke-experimental-error"}>
+        label="Pump profiles unsupported" bottomSeparator="none" /></PanelSectionRow></div>}
+      {pump?.available && statusError(pump) && <div className={pump.transitional ? "rke-experimental-warning" : "rke-experimental-error"}>
         <PanelSectionRow><Field label={pump.stale ? "Pump status stale" : pump.transitional ? "Pump status transitional" : "Pump status unavailable"}
           description={statusError(pump)} bottomSeparator="none" /></PanelSectionRow>
       </div>}

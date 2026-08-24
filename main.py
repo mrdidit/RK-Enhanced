@@ -452,6 +452,7 @@ class Plugin:
         self.monitor_generation = 0
         self.monitor_revision = 0
         self.monitor_bypass_active = False
+        self.monitor_charging_valid = None
         self.battery_discharge_ema = None
         self.battery_discharge_samples = 0
         self.battery_discharge_last_sample = 0.0
@@ -1080,9 +1081,14 @@ class Plugin:
         self.battery_discharge_samples = 0
         self.battery_discharge_last_sample = 0.0
 
-    def _invalidate_current_monitor_locked(self):
+    def _invalidate_current_monitor_locked(self, force=False):
+        advance_revision = bool(
+            force or self.monitor_charging_valid is not False or
+            self.monitor_bypass_active)
         self.monitor_bypass_active = False
-        self.monitor_revision += 1
+        self.monitor_charging_valid = False
+        if advance_revision:
+            self.monitor_revision += 1
         self._reset_bypass_estimate_locked()
 
     @staticmethod
@@ -1285,7 +1291,11 @@ class Plugin:
                 raise RuntimeError("monitor activation is stale")
             self.monitor_session = monitor_session
             self.monitor_generation = monitor_generation
-            self._invalidate_current_monitor_locked()
+            self._invalidate_current_monitor_locked(force=True)
+            # The new activation has not observed a charging status yet. Its
+            # first invalid result must invalidate any telemetry that raced it,
+            # while repeated invalid results can then reuse that revision.
+            self.monitor_charging_valid = None
             return self._monitor_epoch_locked()
 
     async def end_monitor_session(self, monitor_session, monitor_generation):
@@ -1293,14 +1303,14 @@ class Plugin:
             monitor_session, monitor_generation)
         with self.monitor_lock:
             if self._monitor_current_locked(monitor_session, monitor_generation):
-                self._invalidate_current_monitor_locked()
+                self._invalidate_current_monitor_locked(force=True)
                 self.monitor_session = ""
             elif monitor_generation > self.monitor_generation:
                 # Tombstone an end which overtakes its begin RPC, so that the
                 # delayed activation cannot resurrect a hidden Monitor tab.
                 self.monitor_generation = monitor_generation
                 self.monitor_session = ""
-                self._invalidate_current_monitor_locked()
+                self._invalidate_current_monitor_locked(force=True)
             return self._monitor_epoch_locked()
 
     async def invalidate_monitor_charging_status(
@@ -1345,14 +1355,14 @@ class Plugin:
                     raise RuntimeError("monitor activation changed during charging refresh")
                 bypass_active = self._status_bypass_active(status)
                 if not status.get("coherent"):
-                    self.monitor_revision += 1
-                    self.monitor_bypass_active = False
-                    self._reset_bypass_estimate_locked()
-                elif bypass_active != self.monitor_bypass_active:
-                    self.monitor_revision += 1
-                    self.monitor_bypass_active = bypass_active
-                if not bypass_active:
-                    self._reset_bypass_estimate_locked()
+                    self._invalidate_current_monitor_locked()
+                else:
+                    self.monitor_charging_valid = True
+                    if bypass_active != self.monitor_bypass_active:
+                        self.monitor_revision += 1
+                        self.monitor_bypass_active = bypass_active
+                    if not bypass_active:
+                        self._reset_bypass_estimate_locked()
                 status["monitor_generation"] = self.monitor_generation
                 status["charging_revision"] = self.monitor_revision
         issues = []
@@ -1380,7 +1390,7 @@ class Plugin:
             self.charging.set_battery_policy, mode, limit)
         with self.monitor_lock:
             if self.monitor_session:
-                self._invalidate_current_monitor_locked()
+                self._invalidate_current_monitor_locked(force=True)
         operation = result.get("operation") or {}
         decky.logger.info(
             f"Charging policy request {operation.get('requested', mode)}: "

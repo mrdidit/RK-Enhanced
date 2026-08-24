@@ -248,8 +248,9 @@ export function Monitor({ active }: { active: boolean }) {
           : batteryPolicy.transitional ? "Transitional/Unknown"
             : batteryPolicy.mode === "limit" ? `Limit ${batteryPolicy.limit}%`
               : batteryPolicy.mode === "bypass" ? "Bypass" : "Normal";
-  const batteryPolicyDetail = chargingError || batteryPolicy?.refresh_error ||
-    batteryPolicy?.error || batteryPolicy?.transition_reason;
+  const batteryPolicyDetail = chargingError || (batteryPolicy?.available
+    ? batteryPolicy.refresh_error || batteryPolicy.error || batteryPolicy.transition_reason
+    : undefined);
   const batteryPolicyRow = <Metric label="Battery policy"
     value={`${batteryPolicyLabel}${batteryPolicy?.stale ? " · Stale" : ""}`}
     detail={batteryPolicyDetail} valueColor={chargingError ? "#fc5c65" : undefined} />;

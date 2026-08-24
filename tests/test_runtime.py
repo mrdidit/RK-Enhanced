@@ -192,6 +192,7 @@ class MonitorBypassFreshnessTests(unittest.IsolatedAsyncioTestCase):
         plugin.monitor_generation = 0
         plugin.monitor_revision = 0
         plugin.monitor_bypass_active = False
+        plugin.monitor_charging_valid = None
         plugin.battery_discharge_ema = None
         plugin.battery_discharge_samples = 0
         plugin.battery_discharge_last_sample = 0.0
@@ -293,7 +294,7 @@ class MonitorBypassFreshnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.battery_discharge_samples, 0)
         self.assertEqual(plugin.battery_discharge_last_sample, 0.0)
 
-    async def test_incoherent_refresh_advances_revision_even_when_bypass_is_clear(self):
+    async def test_incoherent_refresh_advances_revision_once_when_bypass_is_clear(self):
         async def inline_to_thread(function, *arguments):
             return function(*arguments)
 
@@ -319,10 +320,64 @@ class MonitorBypassFreshnessTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(
                 self.main.asyncio, "to_thread", new=inline_to_thread):
             status = await plugin.get_charging_status("monitor-current", 550)
+            repeated = await plugin.get_charging_status("monitor-current", 550)
 
         self.assertEqual(status["charging_revision"], initial_revision + 1)
+        self.assertEqual(
+            repeated["charging_revision"], status["charging_revision"])
         self.assertFalse(plugin.monitor_bypass_active)
+        self.assertFalse(plugin.monitor_charging_valid)
         self.assertIsNone(plugin.battery_discharge_ema)
+
+    async def test_coherent_recovery_allows_one_later_failure_invalidation(self):
+        async def inline_to_thread(function, *arguments):
+            return function(*arguments)
+
+        class ChangingCharging:
+            outcome = "incoherent"
+
+            @classmethod
+            def get_status(cls):
+                if cls.outcome == "failure":
+                    raise RuntimeError("status failed")
+                return {
+                    "captured_at": 1.0,
+                    "battery": {"available": True, "valid": True,
+                                "stale": False, "transitional": False,
+                                "mode": "normal", "command": {}},
+                    "pump": {"available": True, "valid": True,
+                             "stale": False, "transitional": False,
+                             "command": {}},
+                    "coherent": cls.outcome == "coherent",
+                    "operation": None,
+                }
+
+        plugin = self.plugin(ChangingCharging())
+        await plugin.begin_monitor_session("monitor-current", 560)
+
+        with mock.patch.object(
+                self.main.asyncio, "to_thread", new=inline_to_thread):
+            invalid = await plugin.get_charging_status("monitor-current", 560)
+            ChangingCharging.outcome = "coherent"
+            recovered = await plugin.get_charging_status("monitor-current", 560)
+            ChangingCharging.outcome = "failure"
+            with self.assertRaisesRegex(RuntimeError, "status failed"):
+                await plugin.get_charging_status("monitor-current", 560)
+            failed_revision = plugin.monitor_revision
+            # The frontend also invalidates after an RPC failure; this must be
+            # idempotent with the backend failure invalidation.
+            explicit = await plugin.invalidate_monitor_charging_status(
+                "monitor-current", 560)
+            with self.assertRaisesRegex(RuntimeError, "status failed"):
+                await plugin.get_charging_status("monitor-current", 560)
+
+        self.assertEqual(
+            recovered["charging_revision"], invalid["charging_revision"])
+        self.assertTrue(recovered["coherent"])
+        self.assertEqual(failed_revision, recovered["charging_revision"] + 1)
+        self.assertEqual(explicit["revision"], failed_revision)
+        self.assertEqual(plugin.monitor_revision, failed_revision)
+        self.assertFalse(plugin.monitor_charging_valid)
 
     async def test_usb_input_power_status_is_bound_to_generation_and_revision(self):
         async def inline_to_thread(function, *arguments):
@@ -423,6 +478,23 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertIn('const batteryPolicyLabel = chargingError ? "Unavailable"', monitor)
         self.assertNotIn(
             'batteryPolicy?.available && <Metric label="Battery policy"', monitor)
+
+    def test_unsupported_charging_ui_hides_helper_paths_and_raw_details(self):
+        experimental = (ROOT / "src" / "Experimental.tsx").read_text()
+        monitor = (ROOT / "src" / "Monitor.tsx").read_text()
+
+        self.assertIn('label="Battery policy unsupported"', experimental)
+        self.assertIn('label="Pump profiles unsupported"', experimental)
+        self.assertNotIn(
+            "/usr/bin/charging_mode is unavailable", experimental)
+        self.assertNotIn(
+            "/usr/bin/kpfe_fast_charge is unavailable", experimental)
+        self.assertIn(
+            "battery?.available && statusError(battery)", experimental)
+        self.assertIn(
+            "pump?.available && statusError(pump)", experimental)
+        self.assertIn(
+            "chargingError || (batteryPolicy?.available", monitor)
 
     def test_monitor_labels_existing_battery_side_charging_power(self):
         monitor = (ROOT / "src" / "Monitor.tsx").read_text()
