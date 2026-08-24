@@ -26,14 +26,6 @@ def read_int(path, default=0):
         return default
 
 
-def active_charge_behaviour(path):
-    value = read(path)
-    for option in value.split():
-        if option.startswith("[") and option.endswith("]"):
-            return option[1:-1]
-    return value
-
-
 def clean_environment():
     environment = os.environ.copy()
     for variable in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
@@ -207,16 +199,6 @@ def main():
                             changes.append("CPU scheduler")
                 except Exception as reason:
                     errors.append(f"scheduler: {reason}")
-            charging = controls.get("charging")
-            if charging and charging.get("applied") is not None:
-                try:
-                    path = Path(charging["path"])
-                    if (path.exists() and active_charge_behaviour(path) ==
-                            charging["applied"]):
-                        path.write_text(str(charging["baseline"]))
-                        changes.append("charging behaviour")
-                except Exception as reason:
-                    errors.append(f"charging: {reason}")
         else:
             changes.append("runtime controls skipped after reboot")
 

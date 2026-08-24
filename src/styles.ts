@@ -20,6 +20,12 @@ export const styles = `
   .rke-boost-notice .${gamepadDialogClasses.FieldDescription} { color: #69b9ff !important; opacity: 1 !important; }
   .rke-boost-warning .${gamepadDialogClasses.Field},
   .rke-boost-warning .${gamepadDialogClasses.FieldDescription} { color: #ff5b5b !important; opacity: 1 !important; }
+  .rke-experimental-error .${gamepadDialogClasses.Field},
+  .rke-experimental-error .${gamepadDialogClasses.FieldDescription} { color: #ff5b5b !important; opacity: 1 !important; }
+  .rke-experimental-warning .${gamepadDialogClasses.Field},
+  .rke-experimental-warning .${gamepadDialogClasses.FieldDescription} { color: #fed330 !important; opacity: 1 !important; }
+  .rke-experimental-notice .${gamepadDialogClasses.Field},
+  .rke-experimental-notice .${gamepadDialogClasses.FieldDescription} { color: #69b9ff !important; opacity: 1 !important; }
   .rke-monitor-heading-row { display: flex; align-items: center; gap: 7px; box-sizing: border-box; width: 100%; padding: 7px 7px 4px; }
   .rke-monitor-heading-row::before,
   .rke-monitor-heading-row::after { content: ""; height: 1px; flex: 1 1 auto; background: rgba(255,255,255,.2); }

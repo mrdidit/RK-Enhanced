@@ -58,9 +58,10 @@ export interface State {
 }
 
 export interface Telemetry {
+  monitor_generation: number;
+  charging_revision: number;
   battery_percent: number;
   battery_status: string;
-  bypass_charging: boolean;
   battery_seconds: number;
   battery_estimate_ready: boolean;
   battery_watts: number;
@@ -85,6 +86,88 @@ export interface Telemetry {
   load_average: number[];
   thermal_limit: string;
 }
+
+export interface ChargingCommandResult {
+  command: string[];
+  started: boolean;
+  ok: boolean;
+  timed_out: boolean;
+  exit_status: number | null;
+  stdout: string;
+  stderr: string;
+  kind?: "battery-policy" | "pump-profile";
+  requested?: string;
+}
+
+interface ChargingComponentStatus {
+  available: boolean;
+  valid: boolean;
+  stale: boolean;
+  transitional: boolean;
+  captured_at: number;
+  error: string;
+  refresh_error: string;
+  transition_reason?: string;
+  command: ChargingCommandResult;
+}
+
+export interface BatteryPolicyStatus extends ChargingComponentStatus {
+  mode?: "normal" | "bypass" | "limit";
+  limit?: number | null;
+  capacity?: number;
+  charge_behaviour?: "auto" | "inhibit-charge";
+  start_threshold?: number;
+  end_threshold?: number;
+  battery_status?: string;
+}
+
+export type UsbInputPowerPath =
+  "offline" | "qcom" | "dual-pump" | "transition" | "unavailable";
+
+export interface UsbInputPowerStatus {
+  available: boolean;
+  valid: boolean;
+  stale: boolean;
+  path: UsbInputPowerPath;
+  microwatts: string | null;
+  error: string;
+}
+
+export interface PumpProfileStatus extends ChargingComponentStatus {
+  enabled?: boolean;
+  profile?: "normal" | "slow" | "fast";
+  state?: "idle" | "pump-init" | "pump" | "error";
+  phase?: "off" | "starting" | "active" | "error" | "transitional";
+  last_error?: number;
+  last_end_reason?: string;
+  requested_voltage_uv?: number;
+  usb_online?: boolean;
+  usb_type?: string;
+  charge_behaviour?: "auto" | "inhibit-charge";
+  master_online?: boolean;
+  master_health?: string;
+  slave_online?: boolean;
+  slave_health?: string;
+  input_power?: UsbInputPowerStatus;
+}
+
+export interface ChargingStatus {
+  captured_at: number;
+  battery: BatteryPolicyStatus;
+  pump: PumpProfileStatus;
+  battery_temperature_deci_c: number | null;
+  coherent: boolean;
+  operation: ChargingCommandResult | null;
+  monitor_generation?: number;
+  charging_revision?: number;
+}
+
+export interface MonitorEpoch {
+  generation: number;
+  revision: number;
+}
+
+export type BatteryLimit = 50 | 60 | 70 | 80 | 90 | 100;
 
 export interface GameRef { appid: string; name: string }
 

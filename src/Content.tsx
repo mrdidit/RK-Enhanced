@@ -1,10 +1,12 @@
 import {
   ButtonItem, ConfirmModal, DropdownItem, Field, PanelSection, PanelSectionRow,
-  showModal, SliderField, Tabs, TextField, ToggleField,
+  showModal, SliderField, Tabs, TextField,
 } from "@decky/ui";
+import { useQuickAccessVisible } from "@decky/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
-import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setBypassCharging, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
+import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
+import { Experimental } from "./Experimental";
 import { currentGame } from "./game";
 import { Monitor } from "./Monitor";
 import { Logs } from "./Logs";
@@ -62,6 +64,7 @@ const FrequencyLabel = ({ name, value }: { name: string; value: string }) =>
   <span className="rke-frequency-label"><span>{name}</span><span>{value}</span></span>;
 
 export function Content() {
+  const panelVisible = useQuickAccessVisible();
   const [tab, setTab] = useState("Monitor");
   const [tabBarFocused, setTabBarFocused] = useState(false);
   const [state, setState] = useState<State | null>(null);
@@ -80,7 +83,6 @@ export function Content() {
   const [updateError, setUpdateError] = useState("");
   const [experimentalCode, setExperimentalCode] = useState("");
   const [showExperimentalUnlock, setShowExperimentalUnlock] = useState(false);
-  const [bypassBusy, setBypassBusy] = useState(false);
   const performanceTopRef = useRef<HTMLDivElement>(null);
   const fanTopRef = useRef<HTMLDivElement>(null);
 
@@ -127,12 +129,16 @@ export function Content() {
     return () => window.clearInterval(timer);
   }, [game?.appid, load]);
   useEffect(() => {
-    if (tab !== "Fan" && !(tab === "Utils" && state?.experimental_unlocked)) return;
+    if (tab !== "Fan") return;
     let cancelled = false;
     const refresh = () => getTelemetry().then(value => { if (!cancelled) setLive(value); }).catch(() => {});
     void refresh();
     const timer = window.setInterval(refresh, 2000);
     return () => { cancelled = true; window.clearInterval(timer); };
+  }, [tab]);
+  useEffect(() => {
+    if (tab === "Experimental" && state && !state.experimental_unlocked)
+      setTab("Utils");
   }, [tab, state?.experimental_unlocked]);
   useEffect(() => {
     if (tab !== "Utils") return;
@@ -166,16 +172,6 @@ export function Content() {
     } catch (error) { setMessage(String(error)); }
     finally { setBusy(false); }
   };
-  const toggleBypass = async (enabled: boolean) => {
-    setBypassBusy(true);
-    try {
-      await setBypassCharging(enabled);
-      setLive(await getTelemetry());
-      setMessage(`Bypass charging ${enabled ? "enabled" : "disabled"}`);
-    } catch (error) { setMessage(String(error)); }
-    finally { setBypassBusy(false); }
-  };
-
   if (!state || !draft) return <PanelSection title="RK-Enhanced"><Field label={message} /></PanelSection>;
   const names = Object.keys(state.presets);
   const cpuPolicies = state.capabilities.cpu;
@@ -267,9 +263,11 @@ export function Content() {
     strOKButtonText="Restore" strCancelButtonText="Cancel"
     onOK={() => run(async () => installState(await restoreSteamDefault(), DEFAULT), "RK-E Default restored")} />);
   const confirmRelease = (target: string, action: "Update" | "Reinstall" | "Downgrade") => showModal(<ConfirmModal
-    strTitle={`${action} ${target}?`}
-    strDescription={`This downloads ${target} from GitHub, backs up the current plugin, installs it, then reloads Decky. RK-Enhanced controls will be briefly unavailable.`}
-    strOKButtonText={action} strCancelButtonText="Cancel"
+    strTitle={action === "Downgrade" ? `Unsafe downgrade to ${target}?` : `${action} ${target}?`}
+    strDescription={action === "Downgrade"
+      ? `Older RK-Enhanced releases may directly write, capture, or restore charging state. First select Battery Normal and Pump Qualcomm/Normal in the current Experimental tab and confirm both statuses, then hide Experimental. Downgrade only for recovery and reboot immediately afterward. Keeping the current updater does not make the older charging backend safe. The current plugin will be backed up.`
+      : `This downloads ${target} from GitHub, backs up the current plugin, installs it, then reloads Decky. RK-Enhanced controls will be briefly unavailable.`}
+    strOKButtonText={action === "Downgrade" ? "Downgrade anyway" : action} strCancelButtonText="Cancel"
     onOK={() => run(async () => {
       await installRelease(target);
     }, `${action} started; Decky will reload`)} />);
@@ -469,15 +467,11 @@ export function Content() {
         </>}
       </>}
       {state.experimental_unlocked && <>
-        <PanelSectionRow><Field label="Experimental: bypass charging"
-          description="Stops battery charging on supported devices. Power behaviour depends on the charger and hardware." /></PanelSectionRow>
-        <PanelSectionRow><ToggleField label="Bypass charging" checked={live?.bypass_charging || false}
-          disabled={bypassBusy} onChange={enabled => void toggleBypass(enabled)} /></PanelSectionRow>
-        <PanelSectionRow><ButtonItem layout="below" disabled={busy || bypassBusy}
+        <PanelSectionRow><Field label="Experimental tab enabled"
+          description="Battery policy, pump profiles, and charging status are available in the Experimental tab." /></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" disabled={busy}
           onClick={() => run(async () => {
-            if (live?.bypass_charging) await setBypassCharging(false);
             installState(await lockExperimental(), selected);
-            setLive(await getTelemetry());
           }, "Experimental controls hidden")}>Hide experimental controls</ButtonItem></PanelSectionRow>
       </>}
       <PanelSectionRow><Field label="Installed release"
@@ -489,19 +483,27 @@ export function Content() {
           updateInfo.update_available ? "Update" : "Reinstall")}>{!updateInfo?.latest ? "Checking latest release…"
           : updateInfo.update_available ? `Update to ${updateInfo.latest}`
             : "Reinstall latest release"}</ButtonItem></PanelSectionRow>
-      {updateInfo?.previous && <PanelSectionRow><ButtonItem layout="below" disabled={busy}
-        onClick={() => confirmRelease(updateInfo.previous, "Downgrade")}>Downgrade to {updateInfo.previous}</ButtonItem></PanelSectionRow>}
+      {updateInfo?.previous && <>
+        <PanelSectionRow><ButtonItem layout="below" disabled={busy}
+          onClick={() => confirmRelease(updateInfo.previous, "Downgrade")}>Downgrade to {updateInfo.previous}</ButtonItem></PanelSectionRow>
+        <PanelSectionRow><Field label="Downgrade warning"
+          description="Older releases may directly own charging state. Return Battery and Pump to Normal, confirm status, hide Experimental, then downgrade and reboot immediately." /></PanelSectionRow>
+      </>}
       {updateError && <PanelSectionRow><Field label="Update check failed" description={updateError} /></PanelSectionRow>}
     </PanelSection>
   </div>;
 
   const tabContent = (content: ReactNode) => <div className="rke-content">{content}</div>;
   const tabs = [
-    { id: "Monitor", title: "Monitor", content: tabContent(<Monitor active={tab === "Monitor"} />) },
+    { id: "Monitor", title: "Monitor", content: tabContent(<Monitor active={panelVisible && tab === "Monitor"} />) },
     { id: "Performance", title: "Performance", content: tabContent(performance) },
     { id: "Fan", title: "Fan Curves", content: tabContent(fan) },
     { id: "Presets", title: "Presets", content: tabContent(presets) },
     { id: "Utils", title: "Utils", content: tabContent(utils) },
+    ...(state.experimental_unlocked ? [{
+      id: "Experimental", title: "Experimental",
+      content: tabContent(<Experimental active={panelVisible && tab === "Experimental"} />),
+    }] : []),
   ];
   const activeTitle = tabs.find(item => item.id === tab)?.title || tab;
   return <div className="rke-tabs"

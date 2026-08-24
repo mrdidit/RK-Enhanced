@@ -1,8 +1,26 @@
 import { Field, PanelSection, PanelSectionRow } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import type { Ref } from "react";
-import { getTelemetry } from "./backend";
-import type { Telemetry } from "./types";
+import {
+  beginMonitorSession, endMonitorSession, getChargingStatus, getTelemetry,
+  invalidateMonitorChargingStatus,
+} from "./backend";
+import type { ChargingStatus, MonitorEpoch, Telemetry } from "./types";
+
+interface MonitorActivation {
+  session: string;
+  generation: number;
+}
+
+let lastMonitorGeneration = 0;
+const newMonitorActivation = (): MonitorActivation => {
+  const clockGeneration = Date.now() * 1000;
+  lastMonitorGeneration = Math.max(clockGeneration, lastMonitorGeneration + 1);
+  return {
+    session: `monitor-${lastMonitorGeneration}-${Math.random().toString(36).slice(2)}`,
+    generation: lastMonitorGeneration,
+  };
+};
 
 const cpuMhz = (khz: number) => `${Math.round(khz / 1000)} MHz`;
 const gpuMhz = (hz: number) => `${Math.round(hz / 1_000_000)} MHz`;
@@ -53,28 +71,200 @@ const Heading = ({ children, headingRef, onActivate }: {
   </div>;
 
 export function Monitor({ active }: { active: boolean }) {
-  const [data, setData] = useState<Telemetry | null>(null);
+  const [telemetrySnapshot, setTelemetrySnapshot] = useState<{ session: string; data: Telemetry } | null>(null);
+  const [chargingSnapshot, setChargingSnapshot] = useState<{ session: string; status: ChargingStatus } | null>(null);
+  const [readyActivation, setReadyActivation] = useState<MonitorActivation | null>(null);
   const [error, setError] = useState("");
+  const [chargingError, setChargingError] = useState("");
+  const monitorActivation = useRef<MonitorActivation>({ session: "", generation: 0 });
+  const previouslyActive = useRef(false);
+  const acceptedChargingRevision = useRef(-1);
+  const telemetryRequestGeneration = useRef(0);
+  const chargingRequestGeneration = useRef(0);
+  const chargingRefreshActive = useRef(false);
   const powerHeadingRef = useRef<HTMLDivElement>(null);
+  if (active !== previouslyActive.current) {
+    previouslyActive.current = active;
+    if (active) {
+      monitorActivation.current = newMonitorActivation();
+    }
+  }
+  const currentActivation = monitorActivation.current;
+  const sessionReady = Boolean(
+    active && readyActivation &&
+    readyActivation.session === currentActivation.session &&
+    readyActivation.generation === currentActivation.generation);
+  const data = sessionReady && telemetrySnapshot?.session === currentActivation.session &&
+    telemetrySnapshot.data.monitor_generation === currentActivation.generation
+    ? telemetrySnapshot.data : null;
+  const charging = sessionReady && chargingSnapshot?.session === currentActivation.session &&
+    chargingSnapshot.status.monitor_generation === currentActivation.generation
+    ? chargingSnapshot.status : null;
   useEffect(() => {
-    if (!active) return;
+    if (!active) {
+      setReadyActivation(null);
+      return;
+    }
+    const activation = { ...monitorActivation.current };
     let cancelled = false;
+    setReadyActivation(null);
+    setTelemetrySnapshot(null);
+    setChargingSnapshot(null);
+    setError("");
+    setChargingError("");
+    acceptedChargingRevision.current = -1;
+    telemetryRequestGeneration.current += 1;
+    chargingRequestGeneration.current += 1;
+    void beginMonitorSession(activation.session, activation.generation).then(epoch => {
+      if (!cancelled && epoch.generation === activation.generation) {
+        acceptedChargingRevision.current = epoch.revision;
+        setReadyActivation(activation);
+      }
+    }).catch(reason => {
+      if (!cancelled) {
+        setReadyActivation(null);
+        setError(String(reason));
+        setChargingError(String(reason));
+      }
+    });
+    return () => {
+      cancelled = true;
+      acceptedChargingRevision.current = -1;
+      telemetryRequestGeneration.current += 1;
+      chargingRequestGeneration.current += 1;
+      chargingRefreshActive.current = false;
+      void endMonitorSession(activation.session, activation.generation).catch(() => undefined);
+    };
+  }, [active]);
+  useEffect(() => {
+    if (!sessionReady || !readyActivation) return;
+    const activation = { ...readyActivation };
+    let cancelled = false;
+    let timer = 0;
+    const schedule = (delay: number) => {
+      if (!cancelled) timer = window.setTimeout(refresh, delay);
+    };
     const refresh = async () => {
+      if (chargingRefreshActive.current) {
+        schedule(200);
+        return;
+      }
+      const requestGeneration = ++telemetryRequestGeneration.current;
       try {
-        const next = await getTelemetry();
-        if (!cancelled) { setData(next); setError(""); }
-      } catch (reason) { if (!cancelled) setError(String(reason)); }
+        const next = await getTelemetry(activation.session, activation.generation);
+        if (!cancelled && requestGeneration === telemetryRequestGeneration.current &&
+          next.monitor_generation === activation.generation &&
+          next.charging_revision === acceptedChargingRevision.current) {
+          setTelemetrySnapshot({ session: activation.session, data: next });
+          setError("");
+        }
+      } catch (reason) {
+        if (!cancelled && requestGeneration === telemetryRequestGeneration.current) {
+          setTelemetrySnapshot(null);
+          setError(String(reason));
+        }
+      } finally {
+        schedule(1000);
+      }
     };
     void refresh();
-    const timer = window.setInterval(refresh, 1000);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, [active]);
-  if (!data) return <PanelSection title="Live Monitor"><Field label={error || "Reading sensors…"} /></PanelSection>;
+    return () => {
+      cancelled = true;
+      telemetryRequestGeneration.current += 1;
+      window.clearTimeout(timer);
+    };
+  }, [sessionReady, readyActivation]);
+  useEffect(() => {
+    if (!sessionReady || !readyActivation) {
+      setChargingSnapshot(null);
+      setChargingError("");
+      return;
+    }
+    // Charging policy is session-sensitive. Do not reuse a snapshot captured
+    // before this Monitor activation while the current refresh is pending.
+    setChargingSnapshot(null);
+    setChargingError("");
+    const activation = { ...readyActivation };
+    let cancelled = false;
+    let timer = 0;
+    const refresh = async () => {
+      let next: ChargingStatus | null = null;
+      const requestGeneration = ++chargingRequestGeneration.current;
+      chargingRefreshActive.current = true;
+      try {
+        next = await getChargingStatus(activation.session, activation.generation);
+        if (next.monitor_generation !== activation.generation ||
+          typeof next.charging_revision !== "number") {
+          throw new Error("charging status did not match the current Monitor activation");
+        }
+        if (!cancelled && requestGeneration === chargingRequestGeneration.current) {
+          if (acceptedChargingRevision.current !== next.charging_revision) {
+            acceptedChargingRevision.current = next.charging_revision;
+            telemetryRequestGeneration.current += 1;
+            setTelemetrySnapshot(null);
+          }
+          setChargingSnapshot({ session: activation.session, status: next });
+          setChargingError("");
+        }
+      } catch (reason) {
+        if (!cancelled && requestGeneration === chargingRequestGeneration.current) {
+          acceptedChargingRevision.current = -1;
+          telemetryRequestGeneration.current += 1;
+          setTelemetrySnapshot(null);
+          setChargingSnapshot(null);
+          setChargingError(String(reason));
+          try {
+            const epoch: MonitorEpoch = await invalidateMonitorChargingStatus(
+              activation.session, activation.generation);
+            if (!cancelled && requestGeneration === chargingRequestGeneration.current &&
+              epoch.generation === activation.generation) {
+              acceptedChargingRevision.current = epoch.revision;
+            }
+          } catch {
+            // Leave the accepted revision invalid until a current refresh succeeds.
+          }
+        }
+      }
+      if (!cancelled && requestGeneration === chargingRequestGeneration.current) {
+        chargingRefreshActive.current = false;
+        const fast = next?.pump.valid &&
+          (next.pump.phase === "starting" || next.pump.phase === "active");
+        timer = window.setTimeout(refresh, fast ? 1500 : 7000);
+      }
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      chargingRequestGeneration.current += 1;
+      chargingRefreshActive.current = false;
+      window.clearTimeout(timer);
+    };
+  }, [sessionReady, readyActivation]);
+  const batteryPolicy = charging?.battery;
+  const batteryPolicyLabel = chargingError ? "Unavailable"
+    : !batteryPolicy ? "Reading…"
+      : !batteryPolicy.available ? "Unsupported"
+        : !batteryPolicy.valid ? "Unavailable"
+          : batteryPolicy.transitional ? "Transitional/Unknown"
+            : batteryPolicy.mode === "limit" ? `Limit ${batteryPolicy.limit}%`
+              : batteryPolicy.mode === "bypass" ? "Bypass" : "Normal";
+  const batteryPolicyDetail = chargingError || batteryPolicy?.refresh_error ||
+    batteryPolicy?.error || batteryPolicy?.transition_reason;
+  const batteryPolicyRow = <Metric label="Battery policy"
+    value={`${batteryPolicyLabel}${batteryPolicy?.stale ? " · Stale" : ""}`}
+    detail={batteryPolicyDetail} valueColor={chargingError ? "#fc5c65" : undefined} />;
+  if (!data) return <div className="rke-monitor"><PanelSection>
+    <Heading headingRef={powerHeadingRef}>Power &amp; Battery</Heading>
+    {batteryPolicyRow}
+    <PanelSectionRow><Field label={error || "Reading sensors…"} bottomSeparator="none" /></PanelSectionRow>
+  </PanelSection></div>;
   const logicalCpus = data.cpu_clocks.reduce((total, clock) => total + clock.cpus.length, 0);
   const oneMinuteLoad = data.load_average[0] || 0;
   const queueStatus = logicalCpus && oneMinuteLoad > logicalCpus ? "Overloaded"
     : logicalCpus && oneMinuteLoad >= logicalCpus * 0.75 ? "Busy" : "Normal";
-  const bypassCharging = data.bypass_charging;
+  const bypassCharging = Boolean(
+    charging?.coherent && batteryPolicy?.available && batteryPolicy.valid && !batteryPolicy.stale &&
+    !batteryPolicy.transitional && batteryPolicy.mode === "bypass");
   const bypassHolding = bypassCharging && Math.abs(data.battery_flow_watts) < 0.2;
   const bypassDischarging = bypassCharging && data.battery_flow_watts <= -0.2;
   const bypassFilling = bypassCharging && data.battery_flow_watts >= 0.2;
@@ -85,6 +275,7 @@ export function Monitor({ active }: { active: boolean }) {
   return <div className="rke-monitor">
     <PanelSection>
       <Heading headingRef={powerHeadingRef}>Power &amp; Battery</Heading>
+      {batteryPolicyRow}
       <Metric label={bypassHolding ? "Bypass charging" : bypassDischarging ? "Battery remaining" : bypassFilling ? "Battery until full" : data.battery_status === "Charging" ? "Battery until full" : "Battery remaining"}
         value={bypassHolding
           ? `${data.battery_percent}%`
@@ -92,7 +283,7 @@ export function Monitor({ active }: { active: boolean }) {
             ? `${duration(data.battery_seconds)} · ${data.battery_percent}%`
             : "Calculating…"}
         percent={data.battery_percent} color={bypassCharging ? "#45aaf2" : batteryColor(data.battery_percent)} />
-      <Metric label={bypassCharging ? "Battery flow" : data.battery_status === "Charging" ? "Charging power" : "Power draw"}
+      <Metric label={bypassCharging ? "Battery flow" : data.battery_status === "Charging" ? "Battery charge power" : "Power draw"}
         value={bypassHolding ? "Holding charge" : data.battery_watts > 0
           ? `${bypassFilling ? "Charging · " : bypassDischarging ? "Drawing · " : ""}${data.battery_watts.toFixed(1)} W`
           : "Unavailable"}

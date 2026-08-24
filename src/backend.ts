@@ -1,9 +1,24 @@
 import { call } from "@decky/api";
-import type { HardwareProfile, State, Telemetry, UpdateInfo } from "./types";
+import type { BatteryLimit, ChargingStatus, HardwareProfile, MonitorEpoch, State, Telemetry, UpdateInfo } from "./types";
 
 export const getState = () => call<[], State>("get_state");
-export const getTelemetry = () => call<[], Telemetry>("get_telemetry");
-export const setBypassCharging = (enabled: boolean) => call<[boolean], boolean>("set_bypass_charging", enabled);
+export const beginMonitorSession = (session: string, generation: number) =>
+  call<[string, number], MonitorEpoch>("begin_monitor_session", session, generation);
+export const endMonitorSession = (session: string, generation: number) =>
+  call<[string, number], MonitorEpoch>("end_monitor_session", session, generation);
+export const invalidateMonitorChargingStatus = (session: string, generation: number) =>
+  call<[string, number], MonitorEpoch>("invalidate_monitor_charging_status", session, generation);
+export const getTelemetry = (monitorSession?: string, monitorGeneration?: number) => monitorSession === undefined
+  ? call<[], Telemetry>("get_telemetry")
+  : call<[string, number], Telemetry>("get_telemetry", monitorSession, monitorGeneration!);
+export const getChargingStatus = (monitorSession?: string, monitorGeneration?: number) => monitorSession === undefined
+  ? call<[], ChargingStatus>("get_charging_status")
+  : call<[string, number], ChargingStatus>("get_charging_status", monitorSession, monitorGeneration!);
+type BatteryPolicyRequest = ["normal" | "bypass"] | ["limit", BatteryLimit];
+export const setBatteryPolicy = (...request: BatteryPolicyRequest) =>
+  call<BatteryPolicyRequest, ChargingStatus>("set_battery_policy", ...request);
+export const setPumpProfile = (profile: "normal" | "slow" | "fast", experimentalRiskConfirmed: boolean) =>
+  call<["normal" | "slow" | "fast", boolean], ChargingStatus>("set_pump_profile", profile, experimentalRiskConfirmed);
 export const unlockExperimental = (code: string) => call<[string], State>("unlock_experimental", code);
 export const lockExperimental = () => call<[], State>("lock_experimental");
 export const getLog = () => call<[], string>("get_log");

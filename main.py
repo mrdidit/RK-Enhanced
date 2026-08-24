@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import contextmanager
 import fcntl
+import importlib.util
 import json
 import os
 import signal
@@ -15,6 +16,20 @@ from tempfile import NamedTemporaryFile
 
 import decky
 
+
+def _charging_controller_class():
+    """Load the sibling module when Decky omits the plugin path from sys.path."""
+    module_path = Path(__file__).with_name("charging.py")
+    spec = importlib.util.spec_from_file_location("rke_charging", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load charging integration from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ChargingController
+
+
+ChargingController = _charging_controller_class()
+
 DEFAULT_PRESET = "RK-E Default"
 LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default", "Steam Default")
 SETTINGS_FILE = "settings.json"
@@ -25,7 +40,6 @@ FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
 KGSL_GPU_ROOT = Path("/sys/class/kgsl/kgsl-3d0")
-CHARGE_BEHAVIOUR = Path("/sys/class/power_supply/battery/charge_behaviour")
 
 
 def _read(path, default=""):
@@ -117,14 +131,6 @@ def _exclusive_file_lock(path):
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def _active_charge_behaviour(path=CHARGE_BEHAVIOUR):
-    value = _read(path)
-    for option in value.split():
-        if option.startswith("[") and option.endswith("]"):
-            return option[1:-1]
-    return value
 
 
 def _cpu_capabilities():
@@ -441,12 +447,19 @@ class Plugin:
         self.gamescope_pid = None
         self.gpu_fdinfo_paths = []
         self.gpu_fdinfo_refresh = 0.0
+        self.monitor_lock = threading.RLock()
+        self.monitor_session = ""
+        self.monitor_generation = 0
+        self.monitor_revision = 0
+        self.monitor_bypass_active = False
         self.battery_discharge_ema = None
         self.battery_discharge_samples = 0
         self.battery_discharge_last_sample = 0.0
         self.log_offsets = {}
         self.latest_release_cache = (0.0, [])
         self.session_lock = threading.RLock()
+        self.charging = ChargingController(self.settings_dir)
+        self.charging_status_warning = ""
         self.lock = None
         self.game_watch_task = None
 
@@ -574,13 +587,6 @@ class Plugin:
                 "baseline": _service_active("scx_lavd.service"),
                 "applied": None,
             }
-        charging = None
-        if CHARGE_BEHAVIOUR.exists():
-            charging = {
-                "path": str(CHARGE_BEHAVIOUR),
-                "baseline": _active_charge_behaviour(),
-                "applied": None,
-            }
         return {
             "version": 1,
             "owner_pid": os.getpid(),
@@ -590,7 +596,6 @@ class Plugin:
                 "cpu": cpu,
                 "gpu": gpu,
                 "scheduler": scheduler,
-                "charging": charging,
                 "fan": {"applied": False},
             },
         }
@@ -1048,7 +1053,92 @@ class Plugin:
                 continue
         return total
 
-    def _telemetry(self):
+    @staticmethod
+    def _monitor_identity(monitor_session, monitor_generation):
+        if (not isinstance(monitor_session, str) or not monitor_session or
+                len(monitor_session) > 128):
+            raise ValueError("monitor session must be a non-empty token")
+        if (isinstance(monitor_generation, bool) or
+                not isinstance(monitor_generation, int) or
+                not 0 < monitor_generation <= 9_007_199_254_740_991):
+            raise ValueError("monitor generation must be a positive safe integer")
+        return monitor_session, monitor_generation
+
+    def _monitor_current_locked(self, monitor_session, monitor_generation):
+        return bool(
+            self.monitor_session == monitor_session and
+            self.monitor_generation == monitor_generation)
+
+    def _monitor_epoch_locked(self):
+        return {
+            "generation": self.monitor_generation,
+            "revision": self.monitor_revision,
+        }
+
+    def _reset_bypass_estimate_locked(self):
+        self.battery_discharge_ema = None
+        self.battery_discharge_samples = 0
+        self.battery_discharge_last_sample = 0.0
+
+    def _invalidate_current_monitor_locked(self):
+        self.monitor_bypass_active = False
+        self.monitor_revision += 1
+        self._reset_bypass_estimate_locked()
+
+    @staticmethod
+    def _status_bypass_active(status):
+        battery = status.get("battery") or {}
+        return bool(
+            status.get("coherent") and battery.get("available") and
+            battery.get("valid") and not battery.get("stale") and
+            not battery.get("transitional") and battery.get("mode") == "bypass")
+
+    def _update_bypass_estimate(
+            self, monitor_session, monitor_generation, monitor_revision,
+            bypass_charging, battery_flow_watts, current_ua, charge_uah,
+            battery_seconds, battery_estimate_ready):
+        with self.monitor_lock:
+            if (not self._monitor_current_locked(
+                    monitor_session, monitor_generation) or
+                    self.monitor_revision != monitor_revision):
+                raise RuntimeError("monitor charging state changed during telemetry")
+            if bypass_charging and battery_flow_watts <= -0.2:
+                discharge_ua = abs(current_ua)
+                now = time.monotonic()
+                sample_due = (self.battery_discharge_samples < 5 or
+                              now - self.battery_discharge_last_sample >= 5)
+                if sample_due:
+                    self.battery_discharge_ema = (
+                        discharge_ua if self.battery_discharge_ema is None else
+                        self.battery_discharge_ema * 0.8 + discharge_ua * 0.2)
+                    self.battery_discharge_samples += 1
+                    self.battery_discharge_last_sample = now
+                battery_estimate_ready = (
+                    self.battery_discharge_samples >= 5 and charge_uah > 0 and
+                    bool(self.battery_discharge_ema))
+                battery_seconds = (
+                    int(charge_uah * 3600 / self.battery_discharge_ema)
+                    if battery_estimate_ready else 0)
+            elif not bypass_charging or battery_flow_watts >= 0.2:
+                self._reset_bypass_estimate_locked()
+            return battery_seconds, battery_estimate_ready
+
+    def _telemetry(self, monitor_session=None, monitor_generation=None):
+        monitor_request = (
+            monitor_session is not None or monitor_generation is not None)
+        if monitor_request:
+            monitor_session, monitor_generation = self._monitor_identity(
+                monitor_session, monitor_generation)
+            with self.monitor_lock:
+                if not self._monitor_current_locked(
+                        monitor_session, monitor_generation):
+                    raise RuntimeError("monitor activation is stale")
+                monitor_revision = self.monitor_revision
+                bypass_charging = self.monitor_bypass_active
+        else:
+            monitor_generation = 0
+            monitor_revision = 0
+            bypass_charging = False
         cpu = _cpu_capabilities()
         governors = [_read(CPU_ROOT / f"policy{item['id']}" / "scaling_governor") for item in cpu]
         counters = []
@@ -1108,9 +1198,6 @@ class Plugin:
         fan_pwm = _read_int(pwm_path) if pwm_path else 0
         battery = Path("/sys/class/power_supply/battery")
         battery_status = _read(battery / "status")
-        charge_behaviour = _read(battery / "charge_behaviour", "auto")
-        bypass_charging = (charge_behaviour == "inhibit-charge" or
-                           "[inhibit-charge]" in charge_behaviour)
         voltage_uv = _read_int(battery / "voltage_now")
         current_ua = _read_int(battery / "current_now")
         battery_flow_watts = voltage_uv * current_ua / 1_000_000_000_000
@@ -1120,24 +1207,7 @@ class Plugin:
         battery_seconds = (_read_int(battery / "time_to_full_avg") if battery_filling
                            else _read_int(battery / "time_to_empty_avg"))
         battery_estimate_ready = battery_seconds > 0
-        if bypass_charging and battery_flow_watts <= -0.2:
-            discharge_ua = abs(current_ua)
-            now = time.monotonic()
-            sample_due = (self.battery_discharge_samples < 5 or
-                          now - self.battery_discharge_last_sample >= 5)
-            if sample_due:
-                self.battery_discharge_ema = (discharge_ua if self.battery_discharge_ema is None
-                                              else self.battery_discharge_ema * 0.8 + discharge_ua * 0.2)
-                self.battery_discharge_samples += 1
-                self.battery_discharge_last_sample = now
-            charge_uah = _read_int(battery / "charge_counter")
-            battery_estimate_ready = self.battery_discharge_samples >= 5 and charge_uah > 0
-            battery_seconds = (int(charge_uah * 3600 / self.battery_discharge_ema)
-                               if battery_estimate_ready else 0)
-        elif not bypass_charging or battery_flow_watts >= 0.2:
-            self.battery_discharge_ema = None
-            self.battery_discharge_samples = 0
-            self.battery_discharge_last_sample = 0.0
+        charge_uah = _read_int(battery / "charge_counter")
         try:
             load = [float(value) for value in _read("/proc/loadavg").split()[:3]]
         except ValueError:
@@ -1152,10 +1222,16 @@ class Plugin:
                 throttled_gpu = True
         thermal_limit = ("CPU + GPU" if throttled_cpu and throttled_gpu else
                          "CPU" if throttled_cpu else "GPU" if throttled_gpu else "Clear")
-        return {
+        if monitor_request:
+            battery_seconds, battery_estimate_ready = self._update_bypass_estimate(
+                monitor_session, monitor_generation, monitor_revision,
+                bypass_charging, battery_flow_watts, current_ua, charge_uah,
+                battery_seconds, battery_estimate_ready)
+        response = {
+            "monitor_generation": monitor_generation,
+            "charging_revision": monitor_revision,
             "battery_percent": _read_int(battery / "capacity"),
             "battery_status": battery_status,
-            "bypass_charging": bypass_charging,
             "battery_seconds": max(0, battery_seconds),
             "battery_estimate_ready": battery_estimate_ready,
             "battery_watts": round(battery_watts, 1),
@@ -1191,38 +1267,137 @@ class Plugin:
             "load_average": load,
             "thermal_limit": thermal_limit,
         }
+        if monitor_request:
+            with self.monitor_lock:
+                if (not self._monitor_current_locked(
+                        monitor_session, monitor_generation) or
+                        self.monitor_revision != monitor_revision):
+                    raise RuntimeError("monitor charging state changed during telemetry")
+        return response
 
-    async def get_telemetry(self):
-        return await asyncio.to_thread(self._telemetry)
+    async def begin_monitor_session(self, monitor_session, monitor_generation):
+        monitor_session, monitor_generation = self._monitor_identity(
+            monitor_session, monitor_generation)
+        with self.monitor_lock:
+            if self._monitor_current_locked(monitor_session, monitor_generation):
+                return self._monitor_epoch_locked()
+            if monitor_generation <= self.monitor_generation:
+                raise RuntimeError("monitor activation is stale")
+            self.monitor_session = monitor_session
+            self.monitor_generation = monitor_generation
+            self._invalidate_current_monitor_locked()
+            return self._monitor_epoch_locked()
 
-    async def set_bypass_charging(self, enabled):
-        def work():
-            if bool(enabled) and not self._load().get("experimental_unlocked", False):
-                raise RuntimeError("unlock experimental controls in Utils first")
-            behaviour = CHARGE_BEHAVIOUR
-            if not behaviour.exists():
-                raise RuntimeError("bypass charging is unavailable on this device")
-            requested = "inhibit-charge" if bool(enabled) else "auto"
-            capabilities = _capabilities()
-            with self.session_lock, _exclusive_file_lock(self.runtime_lock_path):
-                state = self._ensure_runtime_session_locked(capabilities)
-                charging = state["controls"].get("charging")
-                if charging is None:
-                    raise RuntimeError("bypass charging is unavailable in this runtime session")
-                charging["applied"] = requested
-                _atomic_text(self.runtime_state_path,
-                             json.dumps(state, indent=2, sort_keys=True) + "\n")
-                behaviour.write_text(requested)
-            self.battery_discharge_ema = None
-            self.battery_discharge_samples = 0
-            self.battery_discharge_last_sample = 0.0
-            active = _read(behaviour)
-            accepted = (active == requested or f"[{requested}]" in active)
-            if not accepted:
-                raise RuntimeError("ROCKNIX did not accept the bypass charging setting")
-            decky.logger.info(f"Bypass charging {'enabled' if enabled else 'disabled'}")
-            return True
-        return await asyncio.to_thread(work)
+    async def end_monitor_session(self, monitor_session, monitor_generation):
+        monitor_session, monitor_generation = self._monitor_identity(
+            monitor_session, monitor_generation)
+        with self.monitor_lock:
+            if self._monitor_current_locked(monitor_session, monitor_generation):
+                self._invalidate_current_monitor_locked()
+                self.monitor_session = ""
+            elif monitor_generation > self.monitor_generation:
+                # Tombstone an end which overtakes its begin RPC, so that the
+                # delayed activation cannot resurrect a hidden Monitor tab.
+                self.monitor_generation = monitor_generation
+                self.monitor_session = ""
+                self._invalidate_current_monitor_locked()
+            return self._monitor_epoch_locked()
+
+    async def invalidate_monitor_charging_status(
+            self, monitor_session, monitor_generation):
+        monitor_session, monitor_generation = self._monitor_identity(
+            monitor_session, monitor_generation)
+        with self.monitor_lock:
+            if not self._monitor_current_locked(
+                    monitor_session, monitor_generation):
+                raise RuntimeError("monitor activation is stale")
+            self._invalidate_current_monitor_locked()
+            return self._monitor_epoch_locked()
+
+    async def get_telemetry(self, monitor_session=None, monitor_generation=None):
+        return await asyncio.to_thread(
+            self._telemetry, monitor_session, monitor_generation)
+
+    async def get_charging_status(
+            self, monitor_session=None, monitor_generation=None):
+        monitor_request = (
+            monitor_session is not None or monitor_generation is not None)
+        if monitor_request:
+            monitor_session, monitor_generation = self._monitor_identity(
+                monitor_session, monitor_generation)
+            with self.monitor_lock:
+                if not self._monitor_current_locked(
+                        monitor_session, monitor_generation):
+                    raise RuntimeError("monitor activation is stale")
+        try:
+            status = await asyncio.to_thread(self.charging.get_status)
+        except Exception:
+            if monitor_request:
+                with self.monitor_lock:
+                    if self._monitor_current_locked(
+                            monitor_session, monitor_generation):
+                        self._invalidate_current_monitor_locked()
+            raise
+        if monitor_request:
+            with self.monitor_lock:
+                if not self._monitor_current_locked(
+                        monitor_session, monitor_generation):
+                    raise RuntimeError("monitor activation changed during charging refresh")
+                bypass_active = self._status_bypass_active(status)
+                if not status.get("coherent"):
+                    self.monitor_revision += 1
+                    self.monitor_bypass_active = False
+                    self._reset_bypass_estimate_locked()
+                elif bypass_active != self.monitor_bypass_active:
+                    self.monitor_revision += 1
+                    self.monitor_bypass_active = bypass_active
+                if not bypass_active:
+                    self._reset_bypass_estimate_locked()
+                status["monitor_generation"] = self.monitor_generation
+                status["charging_revision"] = self.monitor_revision
+        issues = []
+        for label in ("battery", "pump"):
+            component = status.get(label) or {}
+            if not component.get("valid"):
+                command = component.get("command") or {}
+                issues.append(
+                    f"{label}: {component.get('refresh_error') or component.get('error') or 'invalid status'} "
+                    f"(started={command.get('started', False)} "
+                    f"exit={command.get('exit_status')} timeout={command.get('timed_out', False)})")
+        warning = "; ".join(issues)
+        if warning != self.charging_status_warning:
+            if warning:
+                decky.logger.warning(f"Charging helper status unavailable: {warning}")
+            elif self.charging_status_warning:
+                decky.logger.info("Charging helper status recovered")
+            self.charging_status_warning = warning
+        return status
+
+    async def set_battery_policy(self, mode, limit=None):
+        if not self._load().get("experimental_unlocked", False):
+            raise RuntimeError("unlock experimental controls in Utils first")
+        result = await asyncio.to_thread(
+            self.charging.set_battery_policy, mode, limit)
+        with self.monitor_lock:
+            if self.monitor_session:
+                self._invalidate_current_monitor_locked()
+        operation = result.get("operation") or {}
+        decky.logger.info(
+            f"Charging policy request {operation.get('requested', mode)}: "
+            f"ok={operation.get('ok', False)} timeout={operation.get('timed_out', False)}")
+        return result
+
+    async def set_pump_profile(self, profile, experimental_risk_confirmed=False):
+        if not self._load().get("experimental_unlocked", False):
+            raise RuntimeError("unlock experimental controls in Utils first")
+        result = await asyncio.to_thread(
+            self.charging.set_pump_profile, profile,
+            experimental_risk_confirmed)
+        operation = result.get("operation") or {}
+        decky.logger.info(
+            f"Pump profile request {operation.get('requested', profile)}: "
+            f"ok={operation.get('ok', False)} timeout={operation.get('timed_out', False)}")
+        return result
 
     async def unlock_experimental(self, code):
         def work():
