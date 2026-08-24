@@ -14,11 +14,18 @@ from pathlib import Path
 
 BATTERY_HELPER = Path("/usr/bin/charging_mode")
 PUMP_HELPER = Path("/usr/bin/kpfe_fast_charge")
+BATTERY_TEMPERATURE = Path("/sys/class/power_supply/battery/temp")
 ALLOWED_LIMITS = (50, 60, 70, 80, 90, 100)
 BATTERY_MODES = ("normal", "bypass", "limit")
 PUMP_PROFILES = ("normal", "slow", "fast")
 PUMP_STATES = ("idle", "pump-init", "pump", "error")
 CHARGE_BEHAVIOURS = ("auto", "inhibit-charge")
+INPUT_POWER_FIELDS = (
+    "input_power_path", "input_power_valid", "input_power_uw")
+INPUT_POWER_PATHS = (
+    "offline", "qcom", "dual-pump", "transition", "unavailable")
+INPUT_POWER_PARSE_ERROR = object()
+SIGNED_64_MAX = 9_223_372_036_854_775_807
 STATUS_TIMEOUT = 5
 MUTATION_TIMEOUT = 30
 TRUSTED_ENVIRONMENT = {
@@ -102,15 +109,23 @@ def _execute(path, arguments, timeout):
     return result
 
 
-def _fields(output):
+def _fields(output, isolated_keys=()):
     values = {}
     for line in output.splitlines():
         if not line.strip():
             continue
         if "=" not in line:
+            if any(line.strip().startswith(key) for key in isolated_keys):
+                values[INPUT_POWER_PARSE_ERROR] = (
+                    f"malformed status line: {line}")
+                continue
             raise ValueError(f"malformed status line: {line}")
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip()
+        if key in values and key in isolated_keys:
+            values[INPUT_POWER_PARSE_ERROR] = (
+                f"invalid or duplicate status field: {key}")
+            continue
         if not key or key in values:
             raise ValueError(f"invalid or duplicate status field: {key or '<empty>'}")
         values[key] = value
@@ -181,11 +196,103 @@ def _reported_unsupported(result):
             "not supported on this device" in result["stderr"].lower())
 
 
+def _read_battery_temperature(path):
+    """Read one signed, tenths-Celsius battery temperature sample."""
+    try:
+        raw = Path(path).read_text().strip()
+    except (OSError, UnicodeError):
+        return None
+    if not re.fullmatch(r"-?\d+", raw):
+        return None
+    return int(raw)
+
+
 def _live_bypass(battery):
     return bool(
         battery and battery.get("available") and battery.get("valid") and
         not battery.get("stale") and not battery.get("transitional") and
         battery.get("mode") == "bypass")
+
+
+def _unavailable_input_power(error="", stale=False):
+    """Return one normalized, wattage-free optional telemetry result."""
+    return {
+        "available": False,
+        "valid": False,
+        "stale": stale,
+        "path": "unavailable",
+        "microwatts": None,
+        "error": error,
+    }
+
+
+def _pump_off_tuple(pump):
+    return bool(
+        not pump.get("enabled") and pump.get("profile") == "normal" and
+        pump.get("state") == "idle" and pump.get("last_error") == 0 and
+        pump.get("requested_voltage_uv") == 0 and
+        not pump.get("master_online") and not pump.get("slave_online"))
+
+
+def _parse_input_power(values, pump):
+    """Parse the public helper's optional three-field capability atomically."""
+    if INPUT_POWER_PARSE_ERROR in values:
+        return _unavailable_input_power(values[INPUT_POWER_PARSE_ERROR])
+    present = [key in values for key in INPUT_POWER_FIELDS]
+    if not any(present):
+        return _unavailable_input_power()
+    if not all(present):
+        return _unavailable_input_power(
+            "partial USB input-power status group")
+    try:
+        path = _required(values, "input_power_path")
+        if path not in INPUT_POWER_PATHS:
+            raise ValueError("unsupported USB input-power path")
+        valid = _boolean(values, "input_power_valid")
+        microwatts_text = _required(values, "input_power_uw")
+        if not re.fullmatch(r"\d+", microwatts_text):
+            raise ValueError("invalid USB input-power microwatts")
+        microwatts = int(microwatts_text)
+        if microwatts > SIGNED_64_MAX:
+            raise ValueError("USB input-power microwatts exceed signed-64 range")
+
+        if path in ("qcom", "dual-pump"):
+            if not valid:
+                raise ValueError("measured USB input-power path is not valid")
+        elif valid or microwatts != 0:
+            raise ValueError(
+                "non-measured USB input-power path must use the invalid zero sentinel")
+
+        if path == "offline":
+            if pump.get("usb_online") or not _pump_off_tuple(pump):
+                raise ValueError(
+                    "Offline USB input power conflicts with the base pump status")
+        elif path == "qcom":
+            if not pump.get("usb_online") or not _pump_off_tuple(pump):
+                raise ValueError(
+                    "Qualcomm USB input power conflicts with the base pump status")
+        elif path == "dual-pump":
+            if (pump.get("phase") != "active" or
+                    pump.get("requested_voltage_uv", 0) <= 0):
+                raise ValueError(
+                    "Dual-pump USB input power requires a complete Active pump status")
+
+        return {
+            "available": True,
+            "valid": valid,
+            "stale": False,
+            "path": path,
+            # Keep the signed-64 value as a decimal string across JSON so the
+            # frontend never receives a precision-losing JavaScript number.
+            "microwatts": str(microwatts) if valid else None,
+            "error": "",
+        }
+    except ValueError as reason:
+        return _unavailable_input_power(str(reason))
+
+
+def _invalidate_input_power(pump, reason, stale=False):
+    pump["input_power"] = _unavailable_input_power(reason, stale)
 
 
 def _parse_battery(result, available, captured_at):
@@ -250,7 +357,7 @@ def _parse_pump(result, available, captured_at):
         parsed["error"] = _command_error(result)
         return parsed
     try:
-        values = _fields(result["stdout"])
+        values = _fields(result["stdout"], isolated_keys=INPUT_POWER_FIELDS)
         enabled = _boolean(values, "enabled")
         profile = _required(values, "profile")
         if profile not in PUMP_PROFILES:
@@ -308,6 +415,7 @@ def _parse_pump(result, available, captured_at):
             ),
         })
         _enforce_pump_active_invariants(parsed)
+        parsed["input_power"] = _parse_input_power(values, parsed)
     except ValueError as reason:
         parsed["error"] = str(reason)
     return parsed
@@ -392,9 +500,11 @@ class ChargingController:
     """Serializes and validates all RKE charging helper interactions."""
 
     def __init__(self, settings_dir, battery_helper=BATTERY_HELPER,
-                 pump_helper=PUMP_HELPER):
+                 pump_helper=PUMP_HELPER,
+                 battery_temperature=BATTERY_TEMPERATURE):
         self.battery_helper = Path(battery_helper)
         self.pump_helper = Path(pump_helper)
+        self.battery_temperature = Path(battery_temperature)
         self.lock_path = Path(settings_dir) / "charging-control.lock"
         self.thread_lock = threading.RLock()
         self.last_good_battery = None
@@ -423,6 +533,8 @@ class ChargingController:
             self.battery_helper, ["status"], STATUS_TIMEOUT)
         pump_command = _execute(
             self.pump_helper, ["status"], STATUS_TIMEOUT)
+        battery_temperature_deci_c = _read_battery_temperature(
+            self.battery_temperature)
         battery_available = (
             _helper_available(self.battery_helper) and
             not _reported_unsupported(battery_command))
@@ -438,15 +550,23 @@ class ChargingController:
             battery, self.last_good_battery)
         pump, self.last_good_pump = self._retain_or_stale(
             pump, self.last_good_pump)
+        coherent = bool(
+            battery.get("available") and battery.get("valid") and
+            not battery.get("stale") and not battery.get("transitional") and
+            pump.get("available") and pump.get("valid") and
+            not pump.get("stale") and not pump.get("transitional"))
+        if not coherent:
+            _invalidate_input_power(
+                pump,
+                "USB input power requires a fresh, coherent charging status pair",
+                stale=bool(battery.get("stale") or pump.get("stale")),
+            )
         status = {
             "captured_at": captured_at,
             "battery": battery,
             "pump": pump,
-            "coherent": bool(
-                battery.get("available") and battery.get("valid") and
-                not battery.get("stale") and not battery.get("transitional") and
-                pump.get("available") and pump.get("valid") and
-                not pump.get("stale") and not pump.get("transitional")),
+            "battery_temperature_deci_c": battery_temperature_deci_c,
+            "coherent": coherent,
             "operation": operation,
         }
         self.latest_status = deepcopy(status)

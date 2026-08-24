@@ -64,6 +64,12 @@ slave_health=Good
 """
 
 
+def input_power(path, valid, microwatts):
+    return (f"input_power_path={path}\n"
+            f"input_power_valid={valid}\n"
+            f"input_power_uw={microwatts}\n")
+
+
 def executable(path, body):
     path.write_text("#!/bin/sh\nset -eu\n" + body)
     path.chmod(0o755)
@@ -198,6 +204,77 @@ class ChargingParserTests(unittest.TestCase):
         self.assertIn("source loss", pump["transition_reason"])
         self.assertIn("PD-PPS", pump["transition_reason"])
 
+    def test_valid_usb_input_power_tuples_are_parsed_atomically(self):
+        offline = PUMP_OFF.replace("usb_online=1", "usb_online=0")
+        starting = PUMP_ACTIVE.replace("state=pump", "state=pump-init")
+        cases = (
+            (PUMP_OFF, "qcom", "1", "39681000", True, "39681000"),
+            (PUMP_OFF, "qcom", "1", "0", True, "0"),
+            (PUMP_OFF, "qcom", "1", "9223372036854775807", True,
+             "9223372036854775807"),
+            (PUMP_ACTIVE, "dual-pump", "1", "25000000", True, "25000000"),
+            (PUMP_ACTIVE, "dual-pump", "1", "0", True, "0"),
+            (offline, "offline", "0", "0", False, None),
+            (starting, "transition", "0", "0", False, None),
+            (PUMP_OFF, "unavailable", "0", "0", False, None),
+        )
+
+        for base, path, valid, microwatts, measured, expected in cases:
+            with self.subTest(path=path, valid=valid, microwatts=microwatts):
+                parsed = charging._parse_pump(
+                    self.result(base + input_power(path, valid, microwatts)),
+                    True, 123.0)
+
+                self.assertTrue(parsed["valid"])
+                self.assertTrue(parsed["input_power"]["available"])
+                self.assertEqual(parsed["input_power"]["path"], path)
+                self.assertEqual(parsed["input_power"]["valid"], measured)
+                self.assertEqual(parsed["input_power"]["microwatts"], expected)
+                self.assertEqual(parsed["input_power"]["error"], "")
+
+    def test_legacy_helper_without_input_power_keeps_base_pump_valid(self):
+        parsed = charging._parse_pump(
+            self.result(PUMP_OFF), True, 123.0)
+
+        self.assertTrue(parsed["valid"])
+        self.assertEqual(parsed["phase"], "off")
+        self.assertFalse(parsed["input_power"]["available"])
+        self.assertFalse(parsed["input_power"]["valid"])
+        self.assertIsNone(parsed["input_power"]["microwatts"])
+        self.assertEqual(parsed["input_power"]["error"], "")
+
+    def test_malformed_input_power_invalidates_only_optional_telemetry(self):
+        offline = PUMP_OFF.replace("usb_online=1", "usb_online=0")
+        cases = (
+            PUMP_OFF + "input_power_path=qcom\ninput_power_valid=1\n",
+            PUMP_OFF + "input_power_path qcom\n" +
+            "input_power_valid=1\ninput_power_uw=1\n",
+            PUMP_OFF + input_power("qcom", "1", "1") +
+            "input_power_uw=2\n",
+            PUMP_OFF + input_power("other", "1", "1"),
+            PUMP_OFF + input_power("qcom", "true", "1"),
+            PUMP_OFF + input_power("qcom", "1", "-1"),
+            PUMP_OFF + input_power("qcom", "1", "9223372036854775808"),
+            PUMP_OFF + input_power("qcom", "0", "0"),
+            PUMP_OFF + input_power("offline", "0", "1"),
+            PUMP_OFF + input_power("offline", "0", "0"),
+            offline + input_power("qcom", "1", "1"),
+            PUMP_OFF + input_power("dual-pump", "1", "25000000"),
+        )
+
+        for output in cases:
+            with self.subTest(output=output.splitlines()[-3:]):
+                parsed = charging._parse_pump(
+                    self.result(output), True, 123.0)
+
+                self.assertTrue(parsed["valid"])
+                self.assertEqual(parsed["phase"], "off")
+                self.assertFalse(parsed["input_power"]["available"])
+                self.assertFalse(parsed["input_power"]["valid"])
+                self.assertEqual(parsed["input_power"]["path"], "unavailable")
+                self.assertIsNone(parsed["input_power"]["microwatts"])
+                self.assertTrue(parsed["input_power"]["error"])
+
 
 class ChargingBoundaryTests(unittest.TestCase):
     def test_public_wrapper_unsupported_result_is_detected(self):
@@ -218,6 +295,29 @@ class ChargingBoundaryTests(unittest.TestCase):
         self.assertFalse(charging._live_bypass({**live, "stale": True}))
         self.assertFalse(charging._live_bypass({**live, "transitional": True}))
         self.assertFalse(charging._live_bypass({**live, "available": False}))
+
+    def test_input_power_adds_no_private_or_direct_hardware_fallback(self):
+        source = Path(charging.__file__).read_text()
+
+        for forbidden in (
+                "qcom-battmgr-usb", "hl7139_master", "hl7139_slave",
+                "KPFE-CHARGE-MONITOR", "systemd-run", "/usr/lib/autostart"):
+            self.assertNotIn(forbidden, source)
+
+    def test_battery_temperature_is_signed_tenths_celsius(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temperature = Path(temporary) / "temp"
+            for raw, expected in (("360\n", 360), ("-15\n", -15),
+                                  ("", None), ("36.0\n", None),
+                                  ("unknown\n", None)):
+                with self.subTest(raw=raw):
+                    temperature.write_text(raw)
+                    self.assertEqual(
+                        charging._read_battery_temperature(temperature), expected)
+            temperature.unlink()
+            self.assertIsNone(charging._read_battery_temperature(temperature))
+            temperature.write_bytes(b"\xff")
+            self.assertIsNone(charging._read_battery_temperature(temperature))
 
 
 class ChargingControllerTests(unittest.TestCase):
@@ -277,6 +377,22 @@ exit 0
             self.assertTrue(result["pump"]["valid"])
             self.assertTrue(result["coherent"])
             self.assertEqual(environment_log.read_text().strip(), "unset|unset|unset|unset|unset|unset|unset|unset")
+
+    def test_status_serializes_one_current_battery_temperature_sample(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            battery, pump, _, _, _ = self.helpers(root)
+            temperature = root / "battery-temp"
+            temperature.write_text("360\n")
+            controller = charging.ChargingController(
+                root, battery, pump, temperature)
+
+            status = controller.get_status()
+
+            self.assertEqual(status["battery_temperature_deci_c"], 360)
+            temperature.write_text("malformed\n")
+            self.assertIsNone(
+                controller.get_status()["battery_temperature_deci_c"])
 
     def test_failed_mutation_is_not_retried_and_status_still_refreshes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -354,6 +470,74 @@ exit 0
             self.assertFalse(second["coherent"])
             self.assertIn("missing or empty", second["battery"]["refresh_error"])
             self.assertEqual(second["battery"]["captured_at"], first["battery"]["captured_at"])
+
+    def test_stale_status_never_retains_previous_usb_input_wattage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            battery, pump, _, _, _ = self.helpers(root)
+            executable(
+                pump,
+                f"printf '%s' '{PUMP_OFF + input_power('qcom', '1', '39681000')}'\n",
+            )
+            controller = charging.ChargingController(root, battery, pump)
+
+            first = controller.get_status()
+            self.assertTrue(first["coherent"])
+            self.assertEqual(
+                first["pump"]["input_power"]["microwatts"], "39681000")
+            executable(pump, "printf 'enabled=\\n'\n")
+
+            second = controller.get_status()
+
+            self.assertFalse(second["coherent"])
+            self.assertTrue(second["pump"]["stale"])
+            self.assertTrue(second["pump"]["input_power"]["stale"])
+            self.assertFalse(second["pump"]["input_power"]["valid"])
+            self.assertIsNone(second["pump"]["input_power"]["microwatts"])
+
+    def test_optional_telemetry_failure_does_not_disable_coherent_controls(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            battery, pump, _, _, _ = self.helpers(root)
+            executable(
+                pump,
+                f"printf '%s' '{PUMP_OFF}input_power_path=qcom\\n'\n",
+            )
+            controller = charging.ChargingController(root, battery, pump)
+
+            status = controller.get_status()
+
+            self.assertTrue(status["coherent"])
+            self.assertTrue(status["pump"]["valid"])
+            self.assertFalse(status["pump"]["input_power"]["available"])
+            self.assertIn("partial", status["pump"]["input_power"]["error"])
+
+    def test_incoherent_pair_discards_fresh_usb_input_wattage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            battery, pump, _, _, _ = self.helpers(root)
+            executable(
+                pump,
+                f"printf '%s' '{PUMP_OFF.replace('charge_behaviour=[auto] inhibit-charge', 'charge_behaviour=auto [inhibit-charge]') + input_power('qcom', '1', '39681000')}'\n",
+            )
+            controller = charging.ChargingController(root, battery, pump)
+
+            status = controller.get_status()
+
+            self.assertFalse(status["coherent"])
+            self.assertFalse(status["pump"]["input_power"]["available"])
+            self.assertFalse(status["pump"]["input_power"]["valid"])
+            self.assertIsNone(status["pump"]["input_power"]["microwatts"])
+
+    def test_unavailable_helpers_never_fabricate_usb_input_wattage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status = charging.ChargingController(temporary).get_status()
+
+            self.assertFalse(status["coherent"])
+            self.assertFalse(status["pump"]["available"])
+            self.assertFalse(status["pump"]["input_power"]["available"])
+            self.assertFalse(status["pump"]["input_power"]["valid"])
+            self.assertIsNone(status["pump"]["input_power"]["microwatts"])
 
     def test_timeout_terminates_and_reaps_the_helper(self):
         with tempfile.TemporaryDirectory() as temporary:
