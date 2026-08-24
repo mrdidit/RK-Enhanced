@@ -200,7 +200,7 @@ cannot restore obsolete Steam lifecycle behaviour.
 Downgrades are intended for recovery only. Releases predating the public
 charging-helper boundary may directly write, capture, or restore charging state.
 Before downgrading, use the current Experimental tab to select Battery policy
-Normal and Pump profile Qualcomm/Normal, confirm both fresh statuses, then hide
+Normal and Pump profile Qcom Normal, confirm both fresh statuses, then hide
 the experimental controls. Reboot immediately after the downgrade before using
 charging controls. Preserving the current updater makes it possible to return
 to a newer release, but does not make an older plugin's charging behaviour safe.
@@ -208,11 +208,13 @@ to a newer release, but does not make an older plugin's charging behaviour safe.
 ### Experimental charging controls
 
 Charging controls are currently hidden behind the experimental unlock in Utils.
-On supported KPFE builds, the Experimental tab provides two independent control
-families:
+They are intended only for compatible devices whose ROCKNIX build provides the
+canonical native charging helpers and required runtime capabilities. Unlocking
+the Experimental tab does not add charging support to incompatible hardware.
+On supported KPFE builds, the tab provides two independent control families:
 
 - Battery policy: Normal, Bypass, or Limit 50–100%
-- Pump profile: Qualcomm/Normal, Slow 25 W, or Fast 36 W
+- Pump profile: Qcom Normal, Slow 25 W, or Fast 36 W
 
 **Limit 100%** stops charging at 100% and resumes at 95%. The five-point gap is
 intentional hysteresis, preventing repeated stop/start cycling at the endpoint.
@@ -389,7 +391,8 @@ curve is still recovered when necessary.
   testing across devices.
 - Touch, controller navigation, and compact-screen layouts still need
   refinement.
-- Experimental charging controls are not ready for general exposure.
+- Experimental charging controls are compatible-device-only and are not ready
+  for general exposure.
 - Preset import, export, and sharing are not yet available.
 - TDP control is not currently implemented.
 

@@ -1,9 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.2.0-beta.4 — 2026-08-24
 
 ### Experimental charging safety review
 
+- Makes Experimental charging controls available only as an explicitly
+  unlocked, compatible-device feature. They require the canonical native
+  ROCKNIX charging helpers and supported runtime capabilities; unlocking the UI
+  does not add support to other devices.
 - Labels the existing battery-derived charging wattage as **Battery charge power**, without changing its calculation.
 - Shortens the Normal pump-profile label to **Qcom Normal** in the Experimental UI.
 - Parses the optional atomic USB input-power group from the existing public
