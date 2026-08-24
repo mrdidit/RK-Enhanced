@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Experimental charging safety review
+
+- Labels the existing battery-derived charging wattage as **Battery charge power**, without changing its calculation.
+- Shortens the Normal pump-profile label to **Qcom Normal** in the Experimental UI.
+- Parses the optional atomic USB input-power group from the existing public
+  pump-helper status and reports Offline, Transitioning, or measured wattage in
+  Experimental Status without a path suffix, another poll, or direct hardware
+  read.
+- Adds one signed-tenths battery-temperature read to the existing serialized
+  charging-status refresh, with Unavailable handling and conservative severity
+  colours.
+- Polishes Experimental Status with clearer Battery charging wording, semantic
+  colours for battery, pump, and USB states, compact pump health, and a Limit
+  100 hysteresis explanation shown only when that policy is selected.
+- Uses only the canonical `charging_mode` and `kpfe_fast_charge` public helpers;
+  RK-Enhanced no longer owns or restores charging sysfs state.
+- Requires every displayed Active pump state to have USB online, selected
+  PD-PPS, auto charging behaviour, no coordinator error, and both pumps
+  online/Good—even when battery status is invalid.
+- Gives every Monitor activation one atomic generation/revision lifecycle shared
+  by policy status, telemetry, the Bypass cache, and EMA samples. Delayed older
+  activations are rejected, status invalidation discards telemetry started under
+  the earlier revision, and frontend polling is serialized and response-tagged.
+- Stops Monitor and Experimental polling whenever Quick Access is closed, even
+  though Decky keeps RK-Enhanced mounted, and restarts with a higher Monitor
+  generation when the panel reopens.
+- Keeps Battery policy visible when its helper is unsupported or a status RPC
+  fails, including while raw telemetry is being reacquired.
+- Locks both Experimental selectors until the current session has a successful,
+  fresh, valid, non-transitional, coherent battery-and-pump status pair.
+- Places request refusals beside the affected selector and documents that
+  Limit 100% stops at 100% and resumes at 95%.
+
 ## v0.2.0-beta.3 — 2026-08-21
 
 ### UI improvements and cleanup

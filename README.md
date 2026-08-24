@@ -12,9 +12,9 @@ Detailed changes for each published build are recorded in
 [CHANGELOG.md](CHANGELOG.md).
 
 The project later evolved through
-[Rocknix-Control-Enhanced](https://github.com/thefiqs/Rocknix-Control-Enhanced/tree/preset-delete-button),
+[Rocknix-Control-Enhanced](https://github.com/mrdidit/Rocknix-Control-Enhanced/tree/preset-delete-button),
 with additional interface concepts and improvements inspired by
-[NDC-Enhanced](https://github.com/thefiqs/NDC-Enhanced).
+[NDC-Enhanced](https://github.com/mrdidit/NDC-Enhanced).
 
 ROCKNIX and NovaDeck expose different services, settings, and hardware
 interfaces. RK-Enhanced therefore uses a ROCKNIX-specific backend rather than
@@ -32,7 +32,7 @@ directly copying NDC-Enhanced.
 The Monitor tab provides an at-a-glance view of:
 
 - Battery level and estimated remaining or charging time
-- Charging power, battery draw, and bypass state
+- Battery charge power, battery draw, and bypass state
 - CPU and GPU load
 - Representative CPU temperature
 - CPU hotspot temperature
@@ -197,26 +197,63 @@ Updates are installed by a detached updater that:
 Downgrading preserves the safer current updater so reinstalling a newer release
 cannot restore obsolete Steam lifecycle behaviour.
 
-### Experimental bypass charging
+Downgrades are intended for recovery only. Releases predating the public
+charging-helper boundary may directly write, capture, or restore charging state.
+Before downgrading, use the current Experimental tab to select Battery policy
+Normal and Pump profile Qualcomm/Normal, confirm both fresh statuses, then hide
+the experimental controls. Reboot immediately after the downgrade before using
+charging controls. Preserving the current updater makes it possible to return
+to a newer release, but does not make an older plugin's charging behaviour safe.
 
-Bypass charging is currently hidden behind the experimental controls section in
-Utils.
+### Experimental charging controls
 
-On supported kernels, RK-Enhanced writes `inhibit-charge` or `auto` to:
+Charging controls are currently hidden behind the experimental unlock in Utils.
+On supported KPFE builds, the Experimental tab provides two independent control
+families:
 
-```text
-/sys/class/power_supply/battery/charge_behaviour
-```
+- Battery policy: Normal, Bypass, or Limit 50–100%
+- Pump profile: Qualcomm/Normal, Slow 25 W, or Fast 36 W
 
-The written mode is read back and verified. Bypass behaviour depends on the
-device and power supply:
+**Limit 100%** stops charging at 100% and resumes at 95%. The five-point gap is
+intentional hysteresis, preventing repeated stop/start cycling at the endpoint.
 
-- Sufficient external power may hold the battery level.
-- A weak charger may still allow partial battery discharge.
-- Some combinations may continue charging slowly.
-- Unsupported kernels may not expose the required control.
+RK-Enhanced never writes charging sysfs controls directly. Battery policy is
+owned exclusively through `/usr/bin/charging_mode`, and the dual-pump profile is
+owned exclusively through `/usr/bin/kpfe_fast_charge`. Slow and Fast require a
+new risk confirmation for every enable request.
 
-Hiding experimental controls safely disables bypass first.
+On newer compatible helpers, Experimental Status also reports **USB input
+power** from the optional atomic status fields returned by
+`/usr/bin/kpfe_fast_charge status`. Qualcomm and dual-pump measurements are
+shown as wattage only; Offline and Transitioning are shown
+without a fabricated zero. Missing, malformed, stale, unavailable, or
+incoherent telemetry shows Unavailable or Stale and never retains an earlier
+wattage. This is charging-path input power, distinct from Monitor's
+battery-derived **Battery charge power**. RK-Enhanced does not probe USB or pump
+sysfs as a fallback.
+
+The same serialized status refresh reads the generic
+`/sys/class/power_supply/battery/temp` attribute once and shows **Battery
+temperature** in degrees Celsius. Missing or malformed samples show Unavailable.
+Temperature colours are green below 35°C, yellow from 35°C, orange from 45°C,
+and red from 50°C; sub-zero readings are also red. These conservative bands are
+informational and do not replace the helper or coordinator safety limits.
+
+Experimental Status uses semantic colours for quick recognition: healthy or
+active states are green, inactive states are blue, transitions and unknown
+states are yellow or orange, and errors are red. **Battery charging** reports
+whether charging is Allowed or Paused; it does not claim that current is flowing.
+
+The Limit 100 hysteresis explanation is shown only while Limit 100 is selected.
+Both selectors remain locked until a current, coherent status refresh succeeds.
+Either selector is disabled when either helper status is invalid, stale, or
+transitional. Hiding the tab, unloading RK-Enhanced, or crashing Decky does not
+issue a charging command or restore an earlier charging mode; the canonical
+ROCKNIX helpers and coordinator own that lifecycle.
+
+Bypass behaviour still depends on the device and power supply. Sufficient power
+may hold the battery level, while a weaker source can allow partial discharge or
+continued slow charging.
 
 ## Hardware support
 
@@ -316,8 +353,12 @@ across real hardware.
 ### Monitoring must remain lightweight
 
 Telemetry polling can itself affect performance if implemented carelessly.
-RK-Enhanced caches expensive discovery, avoids duplicate pollers, and starts
-Monitor polling only while the Monitor tab is visible.
+RK-Enhanced caches expensive discovery, avoids duplicate pollers, starts
+Monitor polling only while Quick Access is open on the Monitor tab, and
+serializes those requests. Experimental status polling likewise stops when its
+tab or Quick Access is hidden. Each response is bound to the current Monitor
+activation and charging revision, so late results are discarded after a panel
+close, tab change, or status failure.
 
 The automatic game watcher reads only Steam's small process cgroup rather than
 repeatedly scanning the whole system.
@@ -325,7 +366,7 @@ repeatedly scanning the whole system.
 ### Runtime restoration
 
 Before the first preset is applied in a Steam session, RK-Enhanced captures the
-native CPU, GPU, scheduler, and charging state. It records only controls RKE
+native CPU, GPU, and scheduler state. It records only controls RKE
 actually changes and restores their native values when Steam exits, the plugin
 unloads, or Decky/plugin workers terminate unexpectedly.
 
@@ -348,7 +389,7 @@ curve is still recovered when necessary.
   testing across devices.
 - Touch, controller navigation, and compact-screen layouts still need
   refinement.
-- Experimental bypass charging is not ready for general exposure.
+- Experimental charging controls are not ready for general exposure.
 - Preset import, export, and sharing are not yet available.
 - TDP control is not currently implemented.
 
@@ -417,6 +458,7 @@ Manual layout:
 ```text
 /storage/homebrew/plugins/RK-Enhanced/
 ├── dist/index.js
+├── charging.py
 ├── main.py
 ├── runtime-restore.py
 ├── runtime-restore-guard.sh
@@ -436,7 +478,7 @@ Validation and build:
 
 ```sh
 pnpm install
-python3 -m py_compile main.py runtime-restore.py
+python3 -m py_compile main.py charging.py runtime-restore.py
 python3 -m unittest discover -s tests -v
 pnpm typecheck
 pnpm build
@@ -473,9 +515,9 @@ Further development draws from:
 
 - [ROCKNIX Control](https://github.com/seilent/rocknix-control) by Seilent — the
   original foundation
-- [Rocknix-Control-Enhanced](https://github.com/thefiqs/Rocknix-Control-Enhanced/tree/preset-delete-button)
+- [Rocknix-Control-Enhanced](https://github.com/mrdidit/Rocknix-Control-Enhanced/tree/preset-delete-button)
   — the earlier enhanced fork
-- [NDC-Enhanced](https://github.com/thefiqs/NDC-Enhanced) — interface and
+- [NDC-Enhanced](https://github.com/mrdidit/NDC-Enhanced) — interface and
   workflow inspiration
 - The ROCKNIX project and its device-specific services, quirks, and hardware
   support

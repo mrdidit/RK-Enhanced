@@ -79,6 +79,7 @@ fi
 unzip -q "${work_dir}/RK-Enhanced.zip" -d "${work_dir}/plugin"
 if [ ! -f "${work_dir}/plugin/RK-Enhanced/plugin.json" ] || \
    [ ! -f "${work_dir}/plugin/RK-Enhanced/main.py" ] || \
+   [ ! -f "${work_dir}/plugin/RK-Enhanced/charging.py" ] || \
    [ ! -f "${work_dir}/plugin/RK-Enhanced/runtime-restore.py" ] || \
    [ ! -f "${work_dir}/plugin/RK-Enhanced/runtime-restore-guard.sh" ] || \
    [ ! -f "${work_dir}/plugin/RK-Enhanced/dist/index.js" ]; then

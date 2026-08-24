@@ -91,6 +91,9 @@ fi
 unzip -q "${work_dir}/RK-Enhanced.zip" -d "${work_dir}/release"
 staged="${work_dir}/release/RK-Enhanced"
 if [ ! -f "${staged}/plugin.json" ] || [ ! -f "${staged}/main.py" ] || \
+   [ ! -f "${staged}/charging.py" ] || \
+   [ ! -f "${staged}/runtime-restore.py" ] || \
+   [ ! -f "${staged}/runtime-restore-guard.sh" ] || \
    [ ! -f "${staged}/dist/index.js" ] || [ ! -f "${staged}/updater.sh" ]; then
     write_status "Update failed: invalid release layout"
     exit 1
@@ -110,7 +113,9 @@ if [ -d "${PLUGIN_DIR}" ]; then
     plugin_moved=1
 fi
 mv "${staged}" "${PLUGIN_DIR}"
-chmod 755 "${PLUGIN_DIR}/updater.sh"
+chmod 755 "${PLUGIN_DIR}/updater.sh" \
+    "${PLUGIN_DIR}/runtime-restore.py" \
+    "${PLUGIN_DIR}/runtime-restore-guard.sh"
 
 systemctl start plugin_loader.service
 printf '%s\n' "${version}" > "${INSTALLED_VERSION_FILE}"
