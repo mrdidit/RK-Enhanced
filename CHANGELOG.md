@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.0-beta.5 — 2026-08-24
+
+### Incompatible-hardware hotfix
+
+- Keeps Monitor telemetry mounted after the first unsupported or incoherent
+  charging-status result instead of rebuilding the page after every status
+  refresh.
+- Hides native helper paths and raw command diagnostics from unsupported
+  Battery policy and Pump profile messages while preserving actionable errors
+  on supported devices.
+
 ## v0.2.0-beta.4 — 2026-08-24
 
 ### Experimental charging safety review
