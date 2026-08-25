@@ -1,11 +1,11 @@
 {
   "name": "RK-Enhanced",
-  "version": "0.2.0-beta.5",
+  "version": "0.2.0-beta.6",
   "author": "mrdidit",
   "flags": ["root"],
   "api_version": 1,
   "publish": {
     "tags": ["hardware", "performance", "power"],
-    "description": "ROCKNIX Kontrol Enhanced performance and fan controls"
+    "description": "ROCKNIX performance, fan, RGB, presets, and hardware monitoring"
   }
 }

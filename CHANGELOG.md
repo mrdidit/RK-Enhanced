@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.2.0-beta.6 — 2026-08-25
+
+### Monitor telemetry
+
+- Distinguishes a valid `0.0 W` battery-power sample from missing telemetry.
+- Separates the selected charging policy from instantaneous battery flow, so
+  Bypass and Limit remain visible while the battery independently shows watts
+  flowing in, flowing out, at zero, or unavailable.
+- Shows a valid near-zero sample as **0.0 W**, avoiding the previous
+  ambiguous Holding charge and Unavailable presentation.
+- Keeps Battery level, Time estimate, and Battery flow as stable rows, with
+  compact `W in` / `W out` direction text that fits the Quick Access panel.
+- Moves Power & Battery below Clocks and directly above Runtime.
+
+### Utilities
+
+- Shows the current preferred device IPv4 address and interface when Utils is
+  visible, without adding a network poller.
+- Shows the exact `ssh-keygen -R <Device IP>` command for clearing a stale host
+  record on the connecting PC. RK-Enhanced does not delete or regenerate SSH
+  keys on the handheld.
+
+### RGB control
+
+- Adds an RGB tab with an internal RGB Control section on devices where the
+  required native ROCKNIX lighting interface is discovered at runtime.
+- Exposes the native Off, Battery, and RGB LED Color modes while leaving
+  ROCKNIX `ledcontrol` in authority.
+- Adds Static, Breath, and Rainbow controls only when the known stick-ring
+  effect interface is available. Both rings are treated as one shared zone.
+- Persists Static through the native `analogsticks.led` setting. RK-Enhanced
+  stores its source colour, brightness, optional correction, and animated effect,
+  and may reapply an animation at startup only while the native mode remains RGB.
+- Adds optional, default-off colour correction for Static and Breath: red is
+  unchanged, while green and blue are scaled to 80% only when red is present.
+  Rainbow is never corrected.
+- Adds no RGB poller, background ownership, unload restoration, or device-name
+  gate. Unsupported devices do not show the RGB tab, and partial support exposes
+  only controls backed by the detected runtime interface.
+- Packages and validates the new `rgb.py` backend in installer, updater, and
+  release archives.
+
 ## v0.2.0-beta.5 — 2026-08-24
 
 ### Incompatible-hardware hotfix
