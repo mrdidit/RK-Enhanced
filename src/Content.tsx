@@ -5,13 +5,14 @@ import {
 import { useQuickAccessVisible } from "@decky/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
-import { activateGame, assignGame, deletePreset, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
+import { activateGame, assignGame, deletePreset, getDeviceNetworkInfo, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
 import { Experimental } from "./Experimental";
 import { currentGame } from "./game";
 import { Monitor } from "./Monitor";
+import { RGB } from "./RGB";
 import { Logs } from "./Logs";
 import { styles } from "./styles";
-import type { GameRef, HardwareProfile, State, Telemetry, UpdateInfo } from "./types";
+import type { DeviceNetworkInfo, GameRef, HardwareProfile, State, Telemetry, UpdateInfo } from "./types";
 
 const DEFAULT = "RK-E Default";
 const option = (data: string | number, label?: string) => ({ data, label: label ?? String(data) });
@@ -79,6 +80,8 @@ export function Content() {
   const [live, setLive] = useState<Telemetry | null>(null);
   const [systemCurve, setSystemCurve] = useState<HardwareProfile["fan_curve"]>([]);
   const [utility, setUtility] = useState<"Fan" | null>(null);
+  const [deviceNetwork, setDeviceNetwork] = useState<DeviceNetworkInfo | null>(null);
+  const [deviceNetworkError, setDeviceNetworkError] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateError, setUpdateError] = useState("");
   const [experimentalCode, setExperimentalCode] = useState("");
@@ -141,6 +144,10 @@ export function Content() {
       setTab("Utils");
   }, [tab, state?.experimental_unlocked]);
   useEffect(() => {
+    if (tab === "RGB" && state && !state.capabilities.rgb?.available)
+      setTab("Utils");
+  }, [tab, state?.capabilities.rgb?.available]);
+  useEffect(() => {
     if (tab !== "Utils") return;
     setUpdateError("");
     void getUpdateInfo().then(info => {
@@ -148,6 +155,18 @@ export function Content() {
       setUpdateError(info.error);
     }).catch(reason => setUpdateError(String(reason)));
   }, [tab]);
+  useEffect(() => {
+    if (!panelVisible || tab !== "Utils") return;
+    let cancelled = false;
+    setDeviceNetwork(null);
+    setDeviceNetworkError(false);
+    void getDeviceNetworkInfo().then(info => {
+      if (!cancelled) setDeviceNetwork(info);
+    }).catch(() => {
+      if (!cancelled) setDeviceNetworkError(true);
+    });
+    return () => { cancelled = true; };
+  }, [panelVisible, tab]);
 
   const update = (change: (profile: HardwareProfile) => void) => setDraft(current => {
     if (!current) return current;
@@ -430,6 +449,16 @@ export function Content() {
 
   const utils = <div className="rke-utils">
     <PanelSection>
+      <PanelSectionRow><Field label="Device IP"
+        description={deviceNetwork?.interface ? `Interface: ${deviceNetwork.interface}` : undefined}>
+        <span style={{ display: "block", width: "100%", textAlign: "right", fontWeight: 600 }}>
+          {deviceNetworkError ? "Unavailable" : deviceNetwork?.ip || "Checking…"}
+        </span>
+      </Field></PanelSectionRow>
+      {deviceNetwork?.ip && deviceNetwork.ip !== "Offline" &&
+        <PanelSectionRow><Field label="Reset SSH trust on your PC"
+          description={`Run this on the PC you connect from: ssh-keygen -R ${deviceNetwork.ip}`} />
+        </PanelSectionRow>}
       <PanelSectionRow><ButtonItem layout="below" onClick={() => { showModal(<Logs />); }}>
         Logs
       </ButtonItem></PanelSectionRow>
@@ -498,6 +527,10 @@ export function Content() {
     { id: "Monitor", title: "Monitor", content: tabContent(<Monitor active={panelVisible && tab === "Monitor"} />) },
     { id: "Performance", title: "Performance", content: tabContent(performance) },
     { id: "Fan", title: "Fan Curves", content: tabContent(fan) },
+    ...(state.capabilities.rgb?.available ? [{
+      id: "RGB", title: "RGB",
+      content: tabContent(<RGB active={panelVisible && tab === "RGB"} />),
+    }] : []),
     { id: "Presets", title: "Presets", content: tabContent(presets) },
     { id: "Utils", title: "Utils", content: tabContent(utils) },
     ...(state.experimental_unlocked ? [{

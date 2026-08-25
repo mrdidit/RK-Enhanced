@@ -1,7 +1,8 @@
 import { call } from "@decky/api";
-import type { BatteryLimit, ChargingStatus, HardwareProfile, MonitorEpoch, State, Telemetry, UpdateInfo } from "./types";
+import type { BatteryLimit, ChargingStatus, DeviceNetworkInfo, HardwareProfile, MonitorEpoch, RgbRequest, RgbState, State, Telemetry, UpdateInfo } from "./types";
 
 export const getState = () => call<[], State>("get_state");
+export const getDeviceNetworkInfo = () => call<[], DeviceNetworkInfo>("get_device_network_info");
 export const beginMonitorSession = (session: string, generation: number) =>
   call<[string, number], MonitorEpoch>("begin_monitor_session", session, generation);
 export const endMonitorSession = (session: string, generation: number) =>
@@ -14,6 +15,9 @@ export const getTelemetry = (monitorSession?: string, monitorGeneration?: number
 export const getChargingStatus = (monitorSession?: string, monitorGeneration?: number) => monitorSession === undefined
   ? call<[], ChargingStatus>("get_charging_status")
   : call<[string, number], ChargingStatus>("get_charging_status", monitorSession, monitorGeneration!);
+export const getRgbState = () => call<[], RgbState>("get_rgb_state");
+export const setRgbState = (request: RgbRequest) =>
+  call<[RgbRequest], RgbState>("set_rgb_state", request);
 type BatteryPolicyRequest = ["normal" | "bypass"] | ["limit", BatteryLimit];
 export const setBatteryPolicy = (...request: BatteryPolicyRequest) =>
   call<BatteryPolicyRequest, ChargingStatus>("set_battery_policy", ...request);

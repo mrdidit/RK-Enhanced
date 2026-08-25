@@ -174,6 +174,142 @@ class CpuBoostDiscoveryTests(unittest.TestCase):
             self.assertEqual(policies[1]["maximum_frequencies"], [150, 350, 400])
 
 
+class BatteryPowerTelemetryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.modules.setdefault("decky", types.SimpleNamespace(
+            logger=types.SimpleNamespace(info=lambda *_: None, error=lambda *_: None)))
+        import main
+        cls.main = main
+
+    def test_exact_zero_current_is_a_valid_power_sample(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            battery = Path(temporary)
+            (battery / "voltage_now").write_text("4050000\n")
+            (battery / "current_now").write_text("0\n")
+
+            available, watts, current = self.main._battery_power(battery)
+
+        self.assertTrue(available)
+        self.assertEqual(watts, 0.0)
+        self.assertEqual(current, 0)
+
+    def test_signed_battery_flow_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            battery = Path(temporary)
+            (battery / "voltage_now").write_text("4050000\n")
+            (battery / "current_now").write_text("-1200000\n")
+
+            available, watts, current = self.main._battery_power(battery)
+
+        self.assertTrue(available)
+        self.assertAlmostEqual(watts, -4.86)
+        self.assertEqual(current, -1200000)
+
+    def test_missing_or_malformed_power_attributes_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            battery = Path(temporary)
+            (battery / "voltage_now").write_text("not-a-number\n")
+            (battery / "current_now").write_text("0\n")
+            self.assertEqual(
+                self.main._battery_power(battery), (False, 0.0, 0))
+            (battery / "voltage_now").write_text("4050000\n")
+            (battery / "current_now").unlink()
+            self.assertEqual(
+                self.main._battery_power(battery), (False, 0.0, 0))
+            (battery / "voltage_now").write_text("0\n")
+            (battery / "current_now").write_text("0\n")
+            self.assertEqual(
+                self.main._battery_power(battery), (False, 0.0, 0))
+
+
+class DeviceNetworkInfoTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.modules.setdefault("decky", types.SimpleNamespace(
+            logger=types.SimpleNamespace(info=lambda *_: None, error=lambda *_: None)))
+        import main
+        cls.main = main
+
+    def test_prefers_eth0_then_wlan_then_another_active_interface(self):
+        output = "\n".join([
+            "5: tailscale0 inet 100.64.0.2/32 scope global tailscale0",
+            "3: wlan1 inet 192.168.1.117/24 brd 192.168.1.255 scope global wlan1",
+            "2: eth0 inet 10.0.0.8/24 brd 10.0.0.255 scope global eth0",
+        ])
+
+        self.assertEqual(
+            self.main._parse_device_network_info(output),
+            {"ip": "10.0.0.8", "interface": "eth0"},
+        )
+        self.assertEqual(
+            self.main._parse_device_network_info("\n".join(output.splitlines()[:2])),
+            {"ip": "192.168.1.117", "interface": "wlan1"},
+        )
+        self.assertEqual(
+            self.main._parse_device_network_info(output.splitlines()[0]),
+            {"ip": "100.64.0.2", "interface": "tailscale0"},
+        )
+
+    def test_ignores_invalid_and_non_connectable_addresses(self):
+        output = "\n".join([
+            "1: lo inet 127.0.0.1/8 scope global lo",
+            "2: eth0 inet not-an-address scope global eth0",
+            "3: wlan0 inet 169.254.3.4/16 scope global wlan0",
+        ])
+
+        self.assertEqual(
+            self.main._parse_device_network_info(output),
+            {"ip": "Offline", "interface": ""},
+        )
+
+    def test_rpc_source_is_a_bounded_one_shot_active_ipv4_read(self):
+        output = "2: wlan0 inet 192.168.0.74/24 scope global wlan0"
+        with mock.patch.object(self.main, "_run", return_value=output) as run:
+            result = self.main._device_network_info()
+
+        self.assertEqual(result, {"ip": "192.168.0.74", "interface": "wlan0"})
+        run.assert_called_once_with(
+            ["ip", "-o", "-4", "address", "show", "up", "scope", "global"],
+            check=False, timeout=3,
+        )
+
+    def test_missing_ip_tool_reports_offline(self):
+        with mock.patch.object(self.main, "_run", side_effect=FileNotFoundError):
+            self.assertEqual(
+                self.main._device_network_info(),
+                {"ip": "Offline", "interface": ""},
+            )
+
+
+class RocknixSettingHelperTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.modules.setdefault("decky", types.SimpleNamespace(
+            logger=types.SimpleNamespace(info=lambda *_: None, error=lambda *_: None)))
+        import main
+        cls.main = main
+
+    def test_native_profile_setter_receives_setting_as_positional_arguments(self):
+        calls = []
+
+        def fake_run(command, check=True, timeout=15):
+            calls.append((command, check))
+            return "yes" if "declare -F" in command[2] else ""
+
+        with mock.patch.object(self.main.shutil, "which", return_value=None), \
+                mock.patch.object(self.main, "_run", side_effect=fake_run):
+            self.main._set_setting(
+                "analogsticks.led", "127 255 204 204 255 204 204")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0][-3:], [
+            "rke-set-setting", "analogsticks.led",
+            "127 255 204 204 255 204 204",
+        ])
+        self.assertIn('set_setting "$1" "$2"', calls[1][0][2])
+
+
 class MonitorBypassFreshnessTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -457,7 +593,73 @@ class MonitorBypassFreshnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin.battery_discharge_last_sample, 99.0)
 
 
+class RgbPackagingContractTests(unittest.TestCase):
+    def test_release_build_compiles_and_packages_rgb_backend(self):
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+
+        self.assertIn(
+            "python3 -m py_compile main.py charging.py rgb.py runtime-restore.py",
+            workflow,
+        )
+        self.assertIn(
+            "dist docs main.py charging.py rgb.py runtime-restore.py",
+            workflow,
+        )
+
+    def test_installers_require_rgb_only_for_rgb_aware_releases(self):
+        installer = (ROOT / "install.sh").read_text()
+        updater = (ROOT / "updater.sh").read_text()
+
+        self.assertIn(
+            "grep -q 'rgb\\.py' \"${work_dir}/plugin/RK-Enhanced/main.py\"",
+            installer,
+        )
+        self.assertIn(
+            '[ ! -f "${work_dir}/plugin/RK-Enhanced/rgb.py" ]', installer)
+        self.assertNotIn(
+            '[ ! -f "${work_dir}/plugin/RK-Enhanced/rgb.py" ] ||', installer)
+        self.assertIn("grep -q 'rgb\\.py' \"${staged}/main.py\"", updater)
+        self.assertIn('[ ! -f "${staged}/rgb.py" ]', updater)
+        self.assertNotIn('[ ! -f "${staged}/rgb.py" ] ||', updater)
+
+
 class FrontendLifecycleContractTests(unittest.TestCase):
+    def test_device_ip_is_read_once_per_visible_utils_activation(self):
+        content = (ROOT / "src" / "Content.tsx").read_text()
+        backend = (ROOT / "src" / "backend.ts").read_text()
+
+        self.assertIn(
+            'if (!panelVisible || tab !== "Utils") return;', content)
+        self.assertEqual(content.count("getDeviceNetworkInfo()"), 1)
+        self.assertIn("return () => { cancelled = true; };", content)
+        self.assertIn(
+            'call<[], DeviceNetworkInfo>("get_device_network_info")', backend)
+        self.assertIn("Run this on the PC you connect from: ssh-keygen -R", content)
+        self.assertNotIn("clear_ssh", backend)
+
+    def test_rgb_tab_is_capability_and_quick_access_gated_without_polling(self):
+        content = (ROOT / "src" / "Content.tsx").read_text()
+        rgb = (ROOT / "src" / "RGB.tsx").read_text()
+
+        self.assertRegex(
+            content,
+            r'state\.capabilities\.rgb\?\.available\s*\?\s*\[\{',
+        )
+        self.assertRegex(
+            content,
+            r'active=\{panelVisible\s*&&\s*tab\s*===\s*"RGB"\}',
+        )
+        self.assertIn("if (!active)", rgb)
+        self.assertIn("requestGeneration !== generation.current", rgb)
+        self.assertIn(
+            "if (dirtyRef.current && !forceRefresh) return;", rgb)
+        self.assertIn("needsRefreshAfterStaleApply.current = true;", rgb)
+        self.assertIn("activeRef.current", rgb)
+        self.assertIn("[active, refreshRequest]", rgb)
+        self.assertEqual(rgb.count("getRgbState()"), 1)
+        self.assertNotIn("setInterval", rgb)
+        self.assertNotIn("setTimeout", rgb)
+
     def test_quick_access_visibility_gates_both_charging_pollers(self):
         content = (ROOT / "src" / "Content.tsx").read_text()
         index = (ROOT / "src" / "index.tsx").read_text()
@@ -496,18 +698,50 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertIn(
             "chargingError || (batteryPolicy?.available", monitor)
 
-    def test_monitor_labels_existing_battery_side_charging_power(self):
+    def test_monitor_separates_policy_level_and_signed_battery_flow(self):
         monitor = (ROOT / "src" / "Monitor.tsx").read_text()
+        typescript = (ROOT / "src" / "types.ts").read_text()
 
-        self.assertIn(
-            'data.battery_status === "Charging" ? "Battery charge power" : "Power draw"',
-            monitor,
+        self.assertIn('label="Battery flow"', monitor)
+        self.assertIn('data.battery_flow_watts >= 0.2 ? "Charging"', monitor)
+        self.assertIn('data.battery_flow_watts <= -0.2 ? "Discharging" : "Idle"', monitor)
+        self.assertIn('batteryFlowState === "Idle" ? 0 : data.battery_watts', monitor)
+        self.assertIn('label="Battery level"', monitor)
+        self.assertIn('label="Time estimate"', monitor)
+        self.assertIn('`${batteryFlowWatts.toFixed(1)} W in`', monitor)
+        self.assertIn('`${batteryFlowWatts.toFixed(1)} W out`', monitor)
+        self.assertIn(': "0.0 W"', monitor)
+        self.assertIn('const batteryEstimateDirection = batteryFilling ? "to full"', monitor)
+        self.assertIn(': batteryDraining ? "left" : ""', monitor)
+        self.assertIn('? `${duration(data.battery_seconds)} ${batteryEstimateDirection}`', monitor)
+        self.assertIn('batteryStatus === "charging"', monitor)
+        self.assertIn('batteryStatus === "discharging"', monitor)
+        self.assertIn("batteryFlowWatts.toFixed(1)", monitor)
+        self.assertIn("battery_power_available: boolean;", typescript)
+        self.assertIn("data.battery_power_available", monitor)
+        self.assertIn('batteryPolicy?.mode === "limit"', monitor)
+        self.assertIn('batteryPolicy.charge_behaviour === "inhibit-charge"', monitor)
+        self.assertIn('charging?.pump.usb_online === true ? "Active" : "Selected"', monitor)
+        self.assertIn('charging?.pump.usb_online !== true ? "Selected"', monitor)
+        self.assertIn('? "Paused"', monitor)
+        self.assertIn('? "Charging" : "Active"', monitor)
+        self.assertNotIn('"Holding charge"', monitor)
+        self.assertNotIn('"Power draw"', monitor)
+        self.assertNotIn('"Battery until full"', monitor)
+        self.assertNotIn('"Battery remaining"', monitor)
+        self.assertLess(
+            monitor.rfind('<Heading headingRef={monitorTopRef}>Live Performance</Heading>'),
+            monitor.rfind('<Heading>Clocks</Heading>'),
         )
-        self.assertNotIn(
-            'data.battery_status === "Charging" ? "Charging power" : "Power draw"',
-            monitor,
+        self.assertLess(
+            monitor.rfind('<Heading>Clocks</Heading>'),
+            monitor.rfind('<Heading>Power &amp; Battery</Heading>'),
         )
-        self.assertIn("data.battery_watts.toFixed(1)", monitor)
+        self.assertLess(
+            monitor.rfind('<Heading>Power &amp; Battery</Heading>'),
+            monitor.rfind('<Heading>Runtime</Heading>'),
+        )
+        self.assertIn("monitorTopRef.current?.focus()", monitor)
 
     def test_experimental_uses_compact_qcom_normal_label(self):
         experimental = (ROOT / "src" / "Experimental.tsx").read_text()

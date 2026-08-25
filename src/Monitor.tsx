@@ -82,7 +82,7 @@ export function Monitor({ active }: { active: boolean }) {
   const telemetryRequestGeneration = useRef(0);
   const chargingRequestGeneration = useRef(0);
   const chargingRefreshActive = useRef(false);
-  const powerHeadingRef = useRef<HTMLDivElement>(null);
+  const monitorTopRef = useRef<HTMLDivElement>(null);
   if (active !== previouslyActive.current) {
     previouslyActive.current = active;
     if (active) {
@@ -251,47 +251,63 @@ export function Monitor({ active }: { active: boolean }) {
   const batteryPolicyDetail = chargingError || (batteryPolicy?.available
     ? batteryPolicy.refresh_error || batteryPolicy.error || batteryPolicy.transition_reason
     : undefined);
+  const batteryPolicyCurrent = Boolean(
+    charging?.coherent && batteryPolicy?.available && batteryPolicy.valid &&
+    !batteryPolicy.stale && !batteryPolicy.transitional);
+  const batteryPolicyState = !batteryPolicyCurrent ? ""
+    : batteryPolicy?.mode === "bypass"
+      ? charging?.pump.usb_online === true ? "Active" : "Selected"
+      : batteryPolicy?.mode === "limit"
+        ? charging?.pump.usb_online !== true ? "Selected"
+          : batteryPolicy.charge_behaviour === "inhibit-charge" ? "Paused"
+            : batteryPolicy.battery_status?.toLowerCase() === "charging" ? "Charging" : "Active"
+        : "";
   const batteryPolicyRow = <Metric label="Battery policy"
-    value={`${batteryPolicyLabel}${batteryPolicy?.stale ? " · Stale" : ""}`}
+    value={`${batteryPolicyLabel}${batteryPolicyState ? ` · ${batteryPolicyState}` : ""}${batteryPolicy?.stale ? " · Stale" : ""}`}
     detail={batteryPolicyDetail} valueColor={chargingError ? "#fc5c65" : undefined} />;
-  if (!data) return <div className="rke-monitor"><PanelSection>
-    <Heading headingRef={powerHeadingRef}>Power &amp; Battery</Heading>
-    {batteryPolicyRow}
-    <PanelSectionRow><Field label={error || "Reading sensors…"} bottomSeparator="none" /></PanelSectionRow>
-  </PanelSection></div>;
+  if (!data) return <div className="rke-monitor">
+    <PanelSection>
+      <Heading headingRef={monitorTopRef}>Live Performance</Heading>
+      <PanelSectionRow><Field label={error || "Reading sensors…"} bottomSeparator="none" /></PanelSectionRow>
+    </PanelSection>
+    <PanelSection>
+      <Heading>Power &amp; Battery</Heading>
+      {batteryPolicyRow}
+    </PanelSection>
+  </div>;
   const logicalCpus = data.cpu_clocks.reduce((total, clock) => total + clock.cpus.length, 0);
   const oneMinuteLoad = data.load_average[0] || 0;
   const queueStatus = logicalCpus && oneMinuteLoad > logicalCpus ? "Overloaded"
     : logicalCpus && oneMinuteLoad >= logicalCpus * 0.75 ? "Busy" : "Normal";
-  const bypassCharging = Boolean(
-    charging?.coherent && batteryPolicy?.available && batteryPolicy.valid && !batteryPolicy.stale &&
-    !batteryPolicy.transitional && batteryPolicy.mode === "bypass");
-  const bypassHolding = bypassCharging && Math.abs(data.battery_flow_watts) < 0.2;
-  const bypassDischarging = bypassCharging && data.battery_flow_watts <= -0.2;
-  const bypassFilling = bypassCharging && data.battery_flow_watts >= 0.2;
+  const bypassSelected = batteryPolicyCurrent && batteryPolicy?.mode === "bypass";
+  const batteryFlowState = !data.battery_power_available ? "Unavailable"
+    : data.battery_flow_watts >= 0.2 ? "Charging"
+      : data.battery_flow_watts <= -0.2 ? "Discharging" : "Idle";
+  const batteryFlowWatts = batteryFlowState === "Idle" ? 0 : data.battery_watts;
+  const batteryFlowValue = batteryFlowState === "Unavailable" ? "Unavailable"
+    : batteryFlowState === "Charging" ? `${batteryFlowWatts.toFixed(1)} W in`
+      : batteryFlowState === "Discharging" ? `${batteryFlowWatts.toFixed(1)} W out`
+        : "0.0 W";
+  const batteryStatus = data.battery_status.toLowerCase();
+  const batteryFilling = batteryFlowState === "Charging" ||
+    (batteryFlowState === "Unavailable" && batteryStatus === "charging");
+  const batteryDraining = batteryFlowState === "Discharging" ||
+    (batteryFlowState === "Unavailable" && batteryStatus === "discharging");
+  const batteryEstimateDirection = batteryFilling ? "to full"
+    : batteryDraining ? "left" : "";
+  const batteryEstimateValue = !batteryEstimateDirection ? "—"
+    : data.battery_estimate_ready && data.battery_seconds > 0
+      ? `${duration(data.battery_seconds)} ${batteryEstimateDirection}`
+      : "Calculating…";
+  const batteryFlowColor = batteryFlowState === "Charging" ? "#26de81"
+    : batteryFlowState === "Idle" ? "#45aaf2" : undefined;
   const backToTop = () => {
-    powerHeadingRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-    powerHeadingRef.current?.focus();
+    monitorTopRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    monitorTopRef.current?.focus();
   };
   return <div className="rke-monitor">
     <PanelSection>
-      <Heading headingRef={powerHeadingRef}>Power &amp; Battery</Heading>
-      {batteryPolicyRow}
-      <Metric label={bypassHolding ? "Bypass charging" : bypassDischarging ? "Battery remaining" : bypassFilling ? "Battery until full" : data.battery_status === "Charging" ? "Battery until full" : "Battery remaining"}
-        value={bypassHolding
-          ? `${data.battery_percent}%`
-          : data.battery_estimate_ready && data.battery_seconds > 0
-            ? `${duration(data.battery_seconds)} · ${data.battery_percent}%`
-            : "Calculating…"}
-        percent={data.battery_percent} color={bypassCharging ? "#45aaf2" : batteryColor(data.battery_percent)} />
-      <Metric label={bypassCharging ? "Battery flow" : data.battery_status === "Charging" ? "Battery charge power" : "Power draw"}
-        value={bypassHolding ? "Holding charge" : data.battery_watts > 0
-          ? `${bypassFilling ? "Charging · " : bypassDischarging ? "Drawing · " : ""}${data.battery_watts.toFixed(1)} W`
-          : "Unavailable"}
-        valueColor={bypassHolding ? "#45aaf2" : undefined} />
-      <Metric label="Thermal limit" value={data.thermal_limit}
-        valueColor={data.thermal_limit === "Clear" ? "#26de81" : data.thermal_limit === "CPU + GPU" ? "#fc5c65" : "#fed330"} />
-      <Heading>Live Performance</Heading>
+      <Heading headingRef={monitorTopRef}>Live Performance</Heading>
       <Metric label="CPU load" value={`${data.cpu_percent.toFixed(1)}%`} percent={data.cpu_percent} color={severity(data.cpu_percent, 70, 90)} />
       <Metric label="GPU load" value={`${data.gpu_percent.toFixed(1)}%`} percent={data.gpu_percent} color={severity(data.gpu_percent, 70, 90)} />
       <Metric label="CPU temperature" value={data.cpu_temperature ? `${data.cpu_temperature.toFixed(1)}°C` : "Unavailable"} percent={data.cpu_temperature || undefined} color={temperatureColor(data.cpu_temperature)} />
@@ -313,6 +329,16 @@ export function Monitor({ active }: { active: boolean }) {
         <Metric label="GPU clock" value={gpuMhz(data.gpu_frequency)}
           percent={data.gpu_frequency * 100 / data.gpu_frequency_max} color="#45aaf2" />
       </>}
+    </PanelSection>
+    <PanelSection>
+      <Heading>Power &amp; Battery</Heading>
+      {batteryPolicyRow}
+      <Metric label="Battery level" value={`${data.battery_percent}%`}
+        percent={data.battery_percent} color={bypassSelected ? "#45aaf2" : batteryColor(data.battery_percent)} />
+      <Metric label="Time estimate" value={batteryEstimateValue} />
+      <Metric label="Battery flow" value={batteryFlowValue} valueColor={batteryFlowColor} />
+      <Metric label="Thermal limit" value={data.thermal_limit}
+        valueColor={data.thermal_limit === "Clear" ? "#26de81" : data.thermal_limit === "CPU + GPU" ? "#fc5c65" : "#fed330"} />
     </PanelSection>
     <PanelSection>
       <Heading>Runtime</Heading>

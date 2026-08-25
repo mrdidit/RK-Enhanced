@@ -98,6 +98,10 @@ if [ ! -f "${staged}/plugin.json" ] || [ ! -f "${staged}/main.py" ] || \
     write_status "Update failed: invalid release layout"
     exit 1
 fi
+if grep -q 'rgb\.py' "${staged}/main.py" && [ ! -f "${staged}/rgb.py" ]; then
+    write_status "Update failed: release is missing its RGB backend"
+    exit 1
+fi
 if [ "${preserve_updater}" -eq 1 ]; then
     cp "$0" "${staged}/updater.sh"
     chmod 755 "${staged}/updater.sh"

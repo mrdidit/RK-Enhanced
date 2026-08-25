@@ -35,12 +35,48 @@ export interface GpuCapability {
   maximum: number;
 }
 
+export type RgbMode = "off" | "battery" | "rgb";
+export type RgbEffect = "static" | "breath" | "rainbow";
+export type RgbColor = [number, number, number];
+
+export interface RgbCapability {
+  available: boolean;
+  modes: RgbMode[];
+  effects: RgbEffect[];
+  shared_zone: boolean;
+  max_brightness: number;
+}
+
+export interface RgbRequest {
+  mode: RgbMode;
+  effect: RgbEffect;
+  color: RgbColor;
+  brightness: number;
+  correction: boolean;
+}
+
+export interface RgbState {
+  supported: boolean;
+  valid: boolean;
+  modes: RgbMode[];
+  effects: RgbEffect[];
+  shared_zone: boolean;
+  max_brightness: number;
+  mode: RgbMode | "unknown";
+  effect: RgbEffect;
+  color: RgbColor;
+  brightness: number;
+  correction: boolean;
+  error: string;
+}
+
 export interface Capabilities {
   cpu: CpuPolicy[];
   cpu_governors: string[];
   gpu: GpuCapability;
   schedulers: string[];
   fan_available: boolean;
+  rgb: RgbCapability;
 }
 
 export interface State {
@@ -64,6 +100,7 @@ export interface Telemetry {
   battery_status: string;
   battery_seconds: number;
   battery_estimate_ready: boolean;
+  battery_power_available: boolean;
   battery_watts: number;
   battery_flow_watts: number;
   cpu_temperature: number;
@@ -170,6 +207,11 @@ export interface MonitorEpoch {
 export type BatteryLimit = 50 | 60 | 70 | 80 | 90 | 100;
 
 export interface GameRef { appid: string; name: string }
+
+export interface DeviceNetworkInfo {
+  ip: string;
+  interface: string;
+}
 
 export interface UpdateInfo {
   installed: string;

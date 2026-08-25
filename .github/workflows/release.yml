@@ -22,13 +22,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm build
-      - run: python3 -m py_compile main.py charging.py runtime-restore.py
+      - run: python3 -m py_compile main.py charging.py rgb.py runtime-restore.py
       - run: python3 -m unittest discover -s tests -v
       - run: sh -n runtime-restore-guard.sh install.sh updater.sh
       - name: Assemble plugin
         run: |
           mkdir -p release/RK-Enhanced
-          cp -r dist docs main.py charging.py runtime-restore.py runtime-restore-guard.sh plugin.json install.sh updater.sh README.md CHANGELOG.md LICENSE release/RK-Enhanced/
+          cp -r dist docs main.py charging.py rgb.py runtime-restore.py runtime-restore-guard.sh plugin.json install.sh updater.sh README.md CHANGELOG.md LICENSE release/RK-Enhanced/
           printf '%s\n' "${GITHUB_REF_NAME}" > release/RK-Enhanced/VERSION
           chmod 755 release/RK-Enhanced/runtime-restore.py release/RK-Enhanced/runtime-restore-guard.sh release/RK-Enhanced/install.sh release/RK-Enhanced/updater.sh
           cd release

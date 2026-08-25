@@ -4,6 +4,7 @@ import asyncio
 from contextlib import contextmanager
 import fcntl
 import importlib.util
+import ipaddress
 import json
 import os
 import signal
@@ -28,7 +29,19 @@ def _charging_controller_class():
     return module.ChargingController
 
 
+def _rgb_controller_class():
+    """Load the sibling RGB boundary when Decky omits the plugin path."""
+    module_path = Path(__file__).with_name("rgb.py")
+    spec = importlib.util.spec_from_file_location("rke_rgb", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load RGB integration from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.RGBController
+
+
 ChargingController = _charging_controller_class()
+RGBController = _rgb_controller_class()
 
 DEFAULT_PRESET = "RK-E Default"
 LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default", "Steam Default")
@@ -63,6 +76,23 @@ def _read_ints(path):
         return []
 
 
+def _battery_power(battery):
+    """Return whether battery power is measurable and its signed wattage.
+
+    A current of exactly zero is a valid sample. It must remain distinct from
+    a missing or malformed power-supply attribute.
+    """
+    battery = Path(battery)
+    try:
+        voltage_uv = int((battery / "voltage_now").read_text().strip())
+        current_ua = int((battery / "current_now").read_text().strip())
+    except (OSError, TypeError, ValueError):
+        return False, 0.0, 0
+    if voltage_uv <= 0:
+        return False, 0.0, current_ua
+    return True, voltage_uv * current_ua / 1_000_000_000_000, current_ua
+
+
 def _run(command, check=True, timeout=15):
     environment = os.environ.copy()
     # PyInstaller-based Decky builds prepend their private libraries to child
@@ -79,6 +109,46 @@ def _run(command, check=True, timeout=15):
     if check and process.returncode:
         raise RuntimeError(process.stderr.strip() or f"command failed: {command[0]}")
     return process.stdout.strip()
+
+
+def _parse_device_network_info(output):
+    """Select the preferred active IPv4 address from ``ip -o`` output.
+
+    Match ROCKNIX's own information screen by preferring wired ``eth0``, then
+    Wi-Fi, while still supporting devices whose interfaces use other names.
+    Linux's ``global`` scope includes private LAN addresses, so do not use
+    ``IPv4Address.is_global`` (which means publicly routable in Python).
+    """
+    addresses = []
+    for position, line in enumerate(str(output or "").splitlines()):
+        fields = line.split()
+        if len(fields) < 4 or fields[2] != "inet":
+            continue
+        interface = fields[1].split("@", 1)[0]
+        try:
+            address = ipaddress.ip_interface(fields[3]).ip
+        except ValueError:
+            continue
+        if (address.version != 4 or address.is_loopback or
+                address.is_link_local or address.is_multicast or
+                address.is_unspecified):
+            continue
+        priority = 0 if interface == "eth0" else 1 if interface.startswith("wlan") else 2
+        addresses.append((priority, position, str(address), interface))
+    if not addresses:
+        return {"ip": "Offline", "interface": ""}
+    _, _, address, interface = min(addresses)
+    return {"ip": address, "interface": interface}
+
+
+def _device_network_info():
+    try:
+        output = _run([
+            "ip", "-o", "-4", "address", "show", "up", "scope", "global",
+        ], check=False, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        output = ""
+    return _parse_device_network_info(output)
 
 
 def _rocknix_env(name):
@@ -101,6 +171,25 @@ def _get_setting(name, default=""):
 def _set_setting(name, value):
     if shutil.which("set_setting"):
         _run(["set_setting", name, value])
+        return
+    # ROCKNIX normally exposes set_setting as a profile function rather than
+    # an executable. Use that native implementation so its shared config lock
+    # protects concurrent changes from the system UI and services. Values are
+    # passed positionally, never interpolated into the shell program.
+    try:
+        native = _run([
+            "/bin/bash", "-c",
+            '. /etc/profile >/dev/null 2>&1; '
+            'declare -F set_setting >/dev/null && printf yes',
+        ], check=False)
+    except OSError:
+        native = ""
+    if native == "yes":
+        _run([
+            "/bin/bash", "-c",
+            '. /etc/profile >/dev/null 2>&1; set_setting "$1" "$2"',
+            "rke-set-setting", str(name), str(value),
+        ])
         return
     config = Path("/storage/.config/system/configs/system.cfg")
     config.parent.mkdir(parents=True, exist_ok=True)
@@ -460,8 +549,12 @@ class Plugin:
         self.latest_release_cache = (0.0, [])
         self.session_lock = threading.RLock()
         self.charging = ChargingController(self.settings_dir)
+        self.rgb = RGBController(
+            self.settings_dir, run=_run, get_setting=_get_setting,
+            set_setting=_set_setting)
         self.charging_status_warning = ""
         self.lock = None
+        self.rgb_lock = None
         self.game_watch_task = None
 
     def _load(self):
@@ -697,7 +790,9 @@ class Plugin:
     def _state(self):
         data = self._load()
         effective = _get_setting("cooling.profile", "")
-        return {"capabilities": _capabilities(), **data,
+        capabilities = _capabilities()
+        capabilities["rgb"] = self.rgb.capabilities()
+        return {"capabilities": capabilities, **data,
                 "active_preset": self.active_preset, "active_appid": self.active_appid,
                 "effective_cooling_profile": effective,
                 "fan_curve_active": effective == "custom" and self._fan_session_active()}
@@ -735,6 +830,22 @@ class Plugin:
 
     async def get_state(self):
         return await asyncio.to_thread(self._state)
+
+    async def get_device_network_info(self):
+        return await asyncio.to_thread(_device_network_info)
+
+    async def get_rgb_state(self):
+        return await asyncio.to_thread(self.rgb.get_state)
+
+    async def set_rgb_state(self, request):
+        if self.rgb_lock is None:
+            self.rgb_lock = asyncio.Lock()
+        async with self.rgb_lock:
+            state = await asyncio.to_thread(self.rgb.set_state, request)
+        decky.logger.info(
+            f"Applied native RGB state: mode={state.get('mode')} "
+            f"effect={state.get('effect')}")
+        return state
 
     async def apply_profile(self, profile):
         if self.lock is None:
@@ -1204,9 +1315,8 @@ class Plugin:
         fan_pwm = _read_int(pwm_path) if pwm_path else 0
         battery = Path("/sys/class/power_supply/battery")
         battery_status = _read(battery / "status")
-        voltage_uv = _read_int(battery / "voltage_now")
-        current_ua = _read_int(battery / "current_now")
-        battery_flow_watts = voltage_uv * current_ua / 1_000_000_000_000
+        battery_power_available, battery_flow_watts, current_ua = (
+            _battery_power(battery))
         battery_watts = abs(battery_flow_watts)
         battery_filling = (battery_status.lower() == "charging" or
                            (bypass_charging and battery_flow_watts >= 0.2))
@@ -1240,6 +1350,7 @@ class Plugin:
             "battery_status": battery_status,
             "battery_seconds": max(0, battery_seconds),
             "battery_estimate_ready": battery_estimate_ready,
+            "battery_power_available": battery_power_available,
             "battery_watts": round(battery_watts, 1),
             "battery_flow_watts": round(battery_flow_watts, 2),
             "cpu_temperature": round(
@@ -1547,6 +1658,14 @@ class Plugin:
                 self._restore_runtime_session()
             if self.legacy_fan_guard_marker.exists():
                 self._restore_legacy_system_fan_curve()
+            try:
+                if self.rgb.reapply_startup():
+                    decky.logger.info("Reapplied the saved native RGB animation")
+            except Exception as reason:
+                # RGB support is optional and must never prevent the plugin
+                # from loading on unsupported or partially configured devices.
+                decky.logger.warning(
+                    f"Unable to reapply the saved RGB animation: {reason}")
         await asyncio.to_thread(initialise)
         self.game_watch_task = asyncio.create_task(self._game_watch_loop())
 

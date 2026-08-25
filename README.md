@@ -1,8 +1,8 @@
 # RK-Enhanced
 
 **RK-Enhanced — ROCKNIX Kontrol Enhanced** is a Decky Loader plugin providing
-performance controls, automatic per-game presets, fan-curve management, and
-live hardware monitoring for ROCKNIX-based ARM handhelds.
+performance controls, automatic per-game presets, fan-curve management, RGB
+lighting controls, and live hardware monitoring for ROCKNIX-based ARM handhelds.
 
 RK-Enhanced is built on the foundation established by Seilent's original
 [ROCKNIX Control](https://github.com/seilent/rocknix-control). Its ROCKNIX
@@ -31,8 +31,8 @@ directly copying NDC-Enhanced.
 
 The Monitor tab provides an at-a-glance view of:
 
-- Battery level and estimated remaining or charging time
-- Battery charge power, battery draw, and bypass state
+- Stable battery policy, level, and time-estimate rows
+- Compact battery flow shown as watts in, watts out, or zero
 - CPU and GPU load
 - Representative CPU temperature
 - CPU hotspot temperature
@@ -133,6 +133,44 @@ After that initial copy, both curves are completely independent:
 Editing ROCKNIX Custom does not silently overwrite RK-E Default or other
 presets.
 
+### RGB control
+
+On compatible devices, the RGB tab provides graphical control of ROCKNIX's
+native stick-ring lighting. Support is discovered from the running system, not
+from a device-name list, and the tab is omitted when the required native
+interfaces are absent.
+
+The native **LED Color** modes remain:
+
+- Off
+- Battery
+- RGB
+
+ROCKNIX `ledcontrol` remains the authority for that mode selection. RK-Enhanced
+does not replace it, take background ownership of the LEDs, or restore an older
+mode when the plugin unloads.
+
+On the Pocket FIT Elite, Battery is ROCKNIX's software battery indication on
+the stick rings. The device's separate charging LED remains firmware-controlled.
+
+Where the running kernel exposes the known stick-ring effect interface,
+RK-Enhanced also offers:
+
+- Static
+- Breath
+- Rainbow
+
+Both stick rings are one shared lighting zone on the currently supported
+interface. Static mode persists through ROCKNIX's native `analogsticks.led`
+setting. RK-Enhanced stores the chosen source colour, brightness, optional colour
+correction, and animated effect so the draft remains coherent across modes. It
+may reapply a saved animation at startup only while the native LED Color mode is
+still RGB. It never silently switches another native mode to RGB.
+
+Colour correction is off by default and applies only to Static and Breath. When
+enabled for a colour containing red, the red channel is unchanged while green
+and blue are scaled to 80%. Rainbow is always passed through unchanged.
+
 ### Presets and automatic game switching
 
 The preset system contains:
@@ -176,6 +214,8 @@ continues while the RK-Enhanced panel is closed.
 
 The Utils tab contains:
 
+- Current device IPv4 address and network interface
+- The matching PC-side command for removing a stale SSH host-key record
 - Runtime logs
 - ROCKNIX Custom fan-curve editor
 - Installed and latest release discovery
@@ -265,8 +305,8 @@ handhelds, including:
 - Snapdragon SM8650
 - Snapdragon SM8750
 
-RK-Enhanced discovers CPU policies, GPU interfaces, thermal zones, fan
-controls, and battery features at runtime. Controls unavailable on a device
+RK-Enhanced discovers CPU policies, GPU interfaces, thermal zones, fan controls,
+RGB lighting, and battery features at runtime. Controls unavailable on a device
 should be omitted or reported as unavailable.
 
 Broader hardware validation is still required.
@@ -362,6 +402,9 @@ tab or Quick Access is hidden. Each response is bound to the current Monitor
 activation and charging revision, so late results are discarded after a panel
 close, tab change, or status failure.
 
+RGB does not add a polling loop. Its current state is read on visible tab
+activation and after an explicit change; it performs no recurring read or write.
+
 The automatic game watcher reads only Steam's small process cgroup rather than
 repeatedly scanning the whole system.
 
@@ -393,6 +436,8 @@ curve is still recovered when necessary.
   refinement.
 - Experimental charging controls are compatible-device-only and are not ready
   for general exposure.
+- RGB controls are hidden unless the required native mode interface is present;
+  animated effects additionally require the known stick-ring effect interface.
 - Preset import, export, and sharing are not yet available.
 - TDP control is not currently implemented.
 
@@ -463,6 +508,7 @@ Manual layout:
 ├── dist/index.js
 ├── charging.py
 ├── main.py
+├── rgb.py
 ├── runtime-restore.py
 ├── runtime-restore-guard.sh
 ├── updater.sh
@@ -481,7 +527,7 @@ Validation and build:
 
 ```sh
 pnpm install
-python3 -m py_compile main.py charging.py runtime-restore.py
+python3 -m py_compile main.py charging.py rgb.py runtime-restore.py
 python3 -m unittest discover -s tests -v
 pnpm typecheck
 pnpm build

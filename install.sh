@@ -87,6 +87,12 @@ if [ ! -f "${work_dir}/plugin/RK-Enhanced/plugin.json" ] || \
     exit 1
 fi
 
+if grep -q 'rgb\.py' "${work_dir}/plugin/RK-Enhanced/main.py" && \
+   [ ! -f "${work_dir}/plugin/RK-Enhanced/rgb.py" ]; then
+    echo "RK-Enhanced release is missing its RGB backend." >&2
+    exit 1
+fi
+
 mkdir -p "${SERVICES_DIR}" "${PLUGINS_DIR}" "${BACKUP_ROOT}" "$(dirname "${SERVICE_FILE}")"
 touch "${STORAGE_ROOT}/.steam/steam/.cef-enable-remote-debugging" 2>/dev/null || true
 
