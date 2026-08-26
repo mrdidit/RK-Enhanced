@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.2.0-beta.7 — 2026-08-26
+
+### Interface
+
+- Moves Thermal limit to the top of Live Performance, directly above CPU load.
+- Orders tabs as Monitor, Performance, Fan Curves, Presets, RGB, Utils, and
+  Experimental. Capability-gated tabs remain hidden when unavailable.
+
+### RGB compatibility
+
+- Adds a generic static stick-lighting provider discovered from ROCKNIX's
+  runtime analogue-stick capability, public helper, and valid persisted state;
+  no product or SoC allowlist is used.
+- Keeps generic stick lighting independent of `led.color` and the system battery
+  indicator, and exposes no animation unless a verified effect interface exists.
+- Rejects stale or wrong-provider writes, preserves newer external settings
+  during rollback, and clearly warns before a shared-colour save replaces
+  unequal right/left ring values.
+
+### PluginLoader lifecycle recovery
+
+- Adds an out-of-cgroup runtime watchdog for each exact RK-Enhanced backend and
+  PluginLoader generation; it is deliberately separate from updater failures.
+- Binds generation identity to both PID and `/proc` start-time ticks, validates
+  same-boot leases and the fixed PluginLoader unit/binary, and revalidates every
+  captured identity before a bounded signal.
+- Treats active-marker removal as a clean unload and yields to a verified newer
+  ready generation instead of restarting an intentional Decky replacement.
+- Uses same-boot monotonic heartbeats and a readiness/current handoff so wall
+  clock changes and partially started replacement guards cannot trigger a
+  false recovery.
+- Defers automatic recovery until Steam Big Picture is active and enforces a
+  120-second same-boot cooldown to prevent restart loops.
+- Captures the running AppID only for automatic recovery and, after the new
+  frontend and Steam UI are ready, selects that same still-running game and
+  invokes Steam's non-launching gamescope Resume navigation. Manual Decky
+  restarts and maintenance never request focus.
+- Uses only the captured PluginLoader/RK-Enhanced process trees; it never issues
+  a global process-name kill for PluginLoader, FEX, or Python.
+- Makes clean-unload runtime restoration an explicit request to the independent
+  session guard, with the immediate detached restore retained as a fast path.
+
+### Packaging and maintenance safety
+
+- Compiles, packages, validates, and installs the executable
+  `plugin_loader_recovery.py` helper whenever the staged backend references it.
+- Replaces unbounded or global installer cleanup with a non-blocking,
+  unit-scoped Decky stop and bounded `SIGTERM`/`SIGKILL` escalation.
+- Holds the lifecycle recovery lock and maintenance marker across intentional
+  Decky stop, file replacement, and bounded startup verification so the runtime
+  watchdog cannot restart PluginLoader midway through maintenance.
+
 ## v0.2.0-beta.6 — 2026-08-25
 
 ### Monitor telemetry

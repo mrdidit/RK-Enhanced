@@ -1,6 +1,6 @@
 {
   "name": "rk-enhanced",
-  "version": "0.2.0-beta.6",
+  "version": "0.2.0-beta.7",
   "packageManager": "pnpm@10.28.2",
   "description": "ROCKNIX Kontrol Enhanced Decky performance controls",
   "type": "module",
