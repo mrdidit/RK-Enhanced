@@ -623,7 +623,163 @@ class RgbPackagingContractTests(unittest.TestCase):
         self.assertNotIn('[ ! -f "${staged}/rgb.py" ] ||', updater)
 
 
+class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
+    def test_release_build_compiles_packages_and_marks_recovery_executable(self):
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+
+        self.assertIn(
+            "python3 -m py_compile main.py charging.py rgb.py runtime-restore.py plugin_loader_recovery.py",
+            workflow,
+        )
+        self.assertIn(
+            "main.py charging.py rgb.py runtime-restore.py plugin_loader_recovery.py",
+            workflow,
+        )
+        self.assertIn(
+            "chmod 755 release/RK-Enhanced/runtime-restore.py release/RK-Enhanced/plugin_loader_recovery.py",
+            workflow,
+        )
+
+    def test_staged_helper_is_required_only_when_backend_references_it(self):
+        installer = (ROOT / "install.sh").read_text()
+        updater = (ROOT / "updater.sh").read_text()
+
+        self.assertIn(
+            "grep -q 'plugin_loader_recovery\\.py' \\", installer)
+        self.assertIn(
+            '"${work_dir}/plugin/RK-Enhanced/main.py" &&', installer)
+        self.assertIn(
+            '[ ! -f "${work_dir}/plugin/RK-Enhanced/plugin_loader_recovery.py" ]',
+            installer,
+        )
+        self.assertNotIn(
+            '[ ! -f "${work_dir}/plugin/RK-Enhanced/plugin_loader_recovery.py" ] ||',
+            installer,
+        )
+        self.assertIn(
+            "grep -q 'plugin_loader_recovery\\.py' \"${staged}/main.py\" &&",
+            updater,
+        )
+        self.assertIn(
+            '[ ! -f "${staged}/plugin_loader_recovery.py" ]', updater)
+        self.assertNotIn(
+            '[ ! -f "${staged}/plugin_loader_recovery.py" ] ||', updater)
+        self.assertIn(
+            'chmod 755 "${PLUGINS_DIR}/RK-Enhanced/plugin_loader_recovery.py"',
+            installer,
+        )
+        self.assertIn(
+            'chmod 755 "${PLUGIN_DIR}/plugin_loader_recovery.py"', updater)
+
+    def test_installer_and_updater_use_only_bounded_unit_scoped_cleanup(self):
+        for name in ("install.sh", "updater.sh"):
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                self.assertIn("stop_plugin_loader_bounded()", source)
+                self.assertIn(
+                    'systemctl_bounded stop --no-block \\', source)
+                self.assertIn("wait_for_plugin_loader_stop 15", source)
+                self.assertIn("wait_for_plugin_loader_stop 3", source)
+                self.assertIn("wait_for_plugin_loader_start 15", source)
+                self.assertIn(
+                    "systemctl_bounded kill --kill-who=all --signal=SIGTERM", source)
+                self.assertIn(
+                    "systemctl_bounded kill --kill-who=all --signal=SIGKILL", source)
+                self.assertIn('timeout 5 systemctl "$@"', source)
+                self.assertIn(
+                    "for command in curl flock jq timeout unzip sha256sum systemctl; do",
+                    source,
+                )
+                self.assertNotIn('""|inactive|failed)', source)
+                self.assertNotIn("pkill", source)
+                self.assertNotIn("killall", source)
+                self.assertNotIn("pgrep", source)
+                self.assertNotRegex(source, r"(?i)(kill|pkill|killall).*\b(FEX|Python)\b")
+
+    def test_maintenance_inhibitor_is_held_across_stop_replace_and_start(self):
+        for name in ("install.sh", "updater.sh"):
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                self.assertIn(
+                    'RECOVERY_LOCK_PATH="/run/lock/rk-enhanced-plugin-loader-recovery.lock"',
+                    source,
+                )
+                self.assertIn(
+                    'RECOVERY_MARKER_PATH="/run/rk-enhanced-plugin-loader-recovery.active"',
+                    source,
+                )
+                self.assertIn("flock -n 9", source)
+                self.assertIn("flock -u 9", source)
+                self.assertIn('rm -f "${RECOVERY_MARKER_PATH}"', source)
+                self.assertGreaterEqual(
+                    source.count("end_plugin_loader_maintenance"), 3)
+                begin = source.index(
+                    "if ! begin_plugin_loader_maintenance; then")
+                stop = source.index(
+                    "if ! stop_plugin_loader_bounded; then", begin)
+                start = source.index(
+                    'systemctl_bounded start "${PLUGIN_LOADER_UNIT}"', stop)
+                end = source.index("end_plugin_loader_maintenance", start)
+                self.assertLess(begin, stop)
+                self.assertLess(stop, start)
+                self.assertLess(start, end)
+
+    def test_documentation_describes_runtime_guard_not_update_recovery(self):
+        readme = (ROOT / "README.md").read_text()
+        changelog = (ROOT / "CHANGELOG.md").read_text()
+
+        for phrase in (
+            "general runtime watchdog",
+            "PID plus its `/proc` start-time ticks",
+            "Clean unload removes the active marker",
+            "Steam Big Picture is active",
+            "same-boot 120-second cooldown",
+            "short-lived, same-boot AppID request",
+            "Manual Decky restarts, installs, updates, and Utils actions never create",
+            "not an updater retry mechanism",
+            "plugin_loader_recovery.py",
+            "maintenance takes the lifecycle helper's exact",
+            "/run/lock/rk-enhanced-plugin-loader-recovery.lock",
+            "/run/rk-enhanced-plugin-loader-recovery.active",
+            "held across file replacement and bounded startup verification",
+        ):
+            self.assertIn(phrase, readme)
+        self.assertIn("out-of-cgroup runtime watchdog", changelog)
+        self.assertIn("separate from updater failures", changelog)
+        self.assertIn("Manual Decky", changelog)
+        self.assertIn("restarts and maintenance never request focus", changelog)
+
+
 class FrontendLifecycleContractTests(unittest.TestCase):
+    def test_automatic_recovery_focus_is_one_shot_and_non_launching(self):
+        index = (ROOT / "src" / "index.tsx").read_text()
+        backend = (ROOT / "src" / "backend.ts").read_text()
+        focus = (ROOT / "src" / "recoveryFocus.ts").read_text()
+
+        self.assertIn("restoreAutomaticRecoveryGameFocus()", index)
+        self.assertIn(
+            'call<[], string | null>("consume_automatic_recovery_focus_request")',
+            backend,
+        )
+        self.assertEqual(focus.count("consumeAutomaticRecoveryFocusRequest()"), 1)
+        self.assertIn("SteamUIStore", focus)
+        self.assertIn("store.SetRunningApp!(appid)", focus)
+        self.assertIn("store.NavigateToRunningApp()", focus)
+        self.assertIn('Navigation.Navigate("/apprunning")', focus)
+        self.assertLess(
+            focus.index("store.SetRunningApp!(appid)"),
+            focus.index("store.NavigateToRunningApp()"),
+        )
+        self.assertIn("RegisterForFocusChangeEvents", focus)
+        self.assertIn("STEAM_UI_SETTLE_MS = 3000", focus)
+        self.assertIn("STEAM_UI_READY_TIMEOUT_MS = 15000", focus)
+        self.assertIn("MAX_NAVIGATION_ATTEMPTS = 3", focus)
+        self.assertNotIn("RaiseWindowForGame", focus)
+        self.assertNotIn("RunGame", focus)
+        self.assertNotIn("currentGame", focus)
+        self.assertNotIn("setInterval", focus)
+        self.assertIn("report_automatic_recovery_focus_result", backend)
+
     def test_device_ip_is_read_once_per_visible_utils_activation(self):
         content = (ROOT / "src" / "Content.tsx").read_text()
         backend = (ROOT / "src" / "backend.ts").read_text()
@@ -640,6 +796,8 @@ class FrontendLifecycleContractTests(unittest.TestCase):
     def test_rgb_tab_is_capability_and_quick_access_gated_without_polling(self):
         content = (ROOT / "src" / "Content.tsx").read_text()
         rgb = (ROOT / "src" / "RGB.tsx").read_text()
+        typescript = (ROOT / "src" / "types.ts").read_text()
+        main = (ROOT / "main.py").read_text()
 
         self.assertRegex(
             content,
@@ -659,6 +817,35 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertEqual(rgb.count("getRgbState()"), 1)
         self.assertNotIn("setInterval", rgb)
         self.assertNotIn("setTimeout", rgb)
+        self.assertIn(
+            '"none" | "sysfs-effects" | "analog-static"', typescript)
+        self.assertIn('status?.provider === "analog-static"', rgb)
+        self.assertIn('provider: state.provider', rgb)
+        self.assertIn('revision: state.revision', rgb)
+        self.assertIn('left.provider === right.provider', rgb)
+        self.assertIn('left.revision === right.revision', rgb)
+        self.assertIn('state.provider !== "none"', rgb)
+        self.assertIn('const busyRef = useRef(false)', rgb)
+        self.assertIn('busyRef.current = true', rgb)
+        self.assertIn('busyRef.current = false', rgb)
+        self.assertIn('<ToggleField label="Stick lighting"', rgb)
+        self.assertIn('checked={draft.mode === "rgb"}', rgb)
+        self.assertIn('request.mode = checked ? "rgb" : "off";', rgb)
+        self.assertIn('effects.length > 1', rgb)
+        self.assertIn('min={analogStatic ? 1 : 0}', rgb)
+        self.assertIn('status?.zones_differ', rgb)
+        self.assertIn('Saved ring colours differ', rgb)
+        self.assertIn('needsRefreshAfterStaleApply.current = true;', rgb)
+        self.assertIn('Reload current RGB state', rgb)
+        self.assertIn('get_runtime_capability=_rocknix_env', main)
+        tabs = content.split("const tabs = [", 1)[1].split("];", 1)[0]
+        expected = [
+            'id: "Monitor"', 'id: "Performance"', 'id: "Fan"',
+            'id: "Presets"', 'id: "RGB"', 'id: "Utils"',
+            'id: "Experimental"',
+        ]
+        positions = [tabs.index(marker) for marker in expected]
+        self.assertEqual(positions, sorted(positions))
 
     def test_quick_access_visibility_gates_both_charging_pollers(self):
         content = (ROOT / "src" / "Content.tsx").read_text()
@@ -742,6 +929,10 @@ class FrontendLifecycleContractTests(unittest.TestCase):
             monitor.rfind('<Heading>Runtime</Heading>'),
         )
         self.assertIn("monitorTopRef.current?.focus()", monitor)
+        self.assertLess(
+            monitor.rfind('<Metric label="Thermal limit"'),
+            monitor.rfind('<Metric label="CPU load"'),
+        )
 
     def test_experimental_uses_compact_qcom_normal_label(self):
         experimental = (ROOT / "src" / "Experimental.tsx").read_text()

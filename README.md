@@ -136,11 +136,12 @@ presets.
 ### RGB control
 
 On compatible devices, the RGB tab provides graphical control of ROCKNIX's
-native stick-ring lighting. Support is discovered from the running system, not
-from a device-name list, and the tab is omitted when the required native
-interfaces are absent.
+native stick-ring lighting. Support is discovered from runtime capabilities,
+not from a device, product, or SoC allowlist. The tab is omitted when no verified
+native interface is available.
 
-The native **LED Color** modes remain:
+Two interface families are supported. Devices with the known native LED-mode
+and effect interface retain ROCKNIX's **LED Color** modes:
 
 - Off
 - Battery
@@ -153,6 +154,18 @@ mode when the plugin unloads.
 On the Pocket FIT Elite, Battery is ROCKNIX's software battery indication on
 the stick rings. The device's separate charging LED remains firmware-controlled.
 
+Devices exposing ROCKNIX's standard analogue-stick capability, executable
+public `analog_sticks_ledcontrol` helper, and valid seven-field
+`analogsticks.led` state receive an independent static stick-lighting UI. It
+provides Stick lighting On/Off, one shared colour, brightness, and optional
+colour correction. It does not change `led.color`, so a separate system battery
+indicator can continue operating.
+
+If an existing seven-field setting contains different right- and left-ring
+colours, RK-Enhanced shows the right-ring colour and warns before saving. An
+explicit Save & Apply then makes both rings match. Native-state revisions stop
+an older open draft from overwriting a newer ROCKNIX-side edit.
+
 Where the running kernel exposes the known stick-ring effect interface,
 RK-Enhanced also offers:
 
@@ -160,12 +173,13 @@ RK-Enhanced also offers:
 - Breath
 - Rainbow
 
-Both stick rings are one shared lighting zone on the currently supported
-interface. Static mode persists through ROCKNIX's native `analogsticks.led`
-setting. RK-Enhanced stores the chosen source colour, brightness, optional colour
-correction, and animated effect so the draft remains coherent across modes. It
-may reapply a saved animation at startup only while the native LED Color mode is
-still RGB. It never silently switches another native mode to RGB.
+Both providers present the stick rings as one shared lighting zone. Static mode
+persists through ROCKNIX's native `analogsticks.led` setting. RK-Enhanced stores
+the chosen source colour, brightness, optional colour correction, and animated
+effect so the draft remains coherent across modes. It may reapply a saved
+animation at startup only for the verified effect provider while native LED
+Color remains RGB. The generic static provider adds no startup write, polling,
+restoration, or unadvertised animation command.
 
 Colour correction is off by default and applies only to Static and Breath. When
 enabled for a colour containing red, the red channel is unchanged while green
@@ -232,7 +246,24 @@ Updates are installed by a detached updater that:
 2. Creates a rollback copy.
 3. Replaces the plugin.
 4. Reloads Decky.
-5. Leaves Steam and running games untouched.
+5. Does not terminate Steam or running game processes. After an intentional
+   maintenance reload, Steam may still leave a running game waiting on its
+   Resume screen; automatic foreground restoration is reserved for automatic
+   crash recovery.
+
+Installer and updater shutdown is bounded and scoped to
+`plugin_loader.service`: they request a non-blocking stop, wait up to 15
+seconds, then allow at most three seconds each for unit-cgroup `SIGTERM` and
+`SIGKILL` escalation. They never kill processes globally by the names
+PluginLoader, FEX, or Python.
+
+Before that intentional stop, maintenance takes the lifecycle helper's exact
+fixed lock (`/run/lock/rk-enhanced-plugin-loader-recovery.lock`) and creates its
+fixed marker (`/run/rk-enhanced-plugin-loader-recovery.active`). The lock is
+held across file replacement and bounded startup verification, then the marker
+is removed on both success and failure. This pauses the runtime watchdog so it
+cannot mistake an in-progress install for a crash and restart Decky midway
+through the replacement.
 
 Downgrading preserves the safer current updater so reinstalling a newer release
 cannot restore obsolete Steam lifecycle behaviour.
@@ -415,11 +446,55 @@ native CPU, GPU, and scheduler state. It records only controls RKE
 actually changes and restores their native values when Steam exits, the plugin
 unloads, or Decky/plugin workers terminate unexpectedly.
 
+Clean unload writes a one-shot restore request for the already-independent
+session guard before attempting an immediate detached restore. The request
+remains authoritative if that faster launch fails, so restoration does not
+depend on Decky terminating the old backend process promptly.
+
 Restoration is ownership-aware: a value is restored only while it still equals
 the last value written by RK-Enhanced. If ROCKNIX or another tool changes that
 control afterward, RK-Enhanced leaves the newer value intact. Runtime values
 are not carried across a reboot; the protected persistent ROCKNIX Custom fan
 curve is still recovered when necessary.
+
+### PluginLoader lifecycle recovery
+
+RK-Enhanced also starts `plugin_loader_recovery.py` as a transient systemd
+guard outside `plugin_loader.service`. This is a general runtime watchdog for
+the active Decky/RK-Enhanced generation. It is not an updater retry mechanism
+and does not reinterpret a download, installation, or rollback failure as a
+runtime crash.
+
+Each guard receives an immutable same-boot lease with a random token and exact
+identities for both the RK-Enhanced backend and PluginLoader. An identity is the
+numeric PID plus its `/proc` start-time ticks; the start time prevents a reused
+PID from being mistaken for the generation that was originally observed. The
+guard additionally verifies the fixed PluginLoader binary, systemd unit, and
+control group before recovery.
+
+The backend maintains an active marker and a same-boot monotonic heartbeat. A
+new guard must validate its immutable lease and publish a readiness marker
+before the backend makes that generation current; an older guard accepts the
+handoff only while the new owner, Loader, readiness, and heartbeat all remain
+valid. Clean unload removes the active marker before other cleanup, so an
+intentional Decky stop exits without recovery. For a genuine failure, cleanup
+is limited to the captured old owner tree and every PID/start-time identity is
+revalidated immediately before a bounded signal; there is no global FEX or
+Python kill.
+
+Automatic PluginLoader restart is deferred unless Steam Big Picture is active.
+A same-boot 120-second cooldown permits at most one automatic recovery attempt
+inside that window, preventing a persistent failure from becoming a restart
+loop.
+
+If an automatic recovery occurs while a game is running, the guard records a
+short-lived, same-boot AppID request before Decky reloads. The replacement
+RK-Enhanced frontend consumes that request once, verifies that the same AppID
+is still running, waits for Steam's rebuilt UI to recognise it, then selects
+that AppID and navigates through Steam's gamescope Resume path. This does not
+launch or relaunch a game. Missing, expired, changed, or malformed requests do
+nothing. Manual Decky restarts, installs, updates, and Utils actions never create
+the request.
 
 ## Current limitations
 
@@ -436,8 +511,9 @@ curve is still recovered when necessary.
   refinement.
 - Experimental charging controls are compatible-device-only and are not ready
   for general exposure.
-- RGB controls are hidden unless the required native mode interface is present;
-  animated effects additionally require the known stick-ring effect interface.
+- RGB controls are hidden unless either a verified native mode/effect interface
+  or the complete generic analogue-stick interface is present. Animated effects
+  still require the known stick-ring effect interface.
 - Preset import, export, and sharing are not yet available.
 - TDP control is not currently implemented.
 
@@ -508,6 +584,7 @@ Manual layout:
 ├── dist/index.js
 ├── charging.py
 ├── main.py
+├── plugin_loader_recovery.py
 ├── rgb.py
 ├── runtime-restore.py
 ├── runtime-restore-guard.sh
@@ -527,7 +604,7 @@ Validation and build:
 
 ```sh
 pnpm install
-python3 -m py_compile main.py charging.py rgb.py runtime-restore.py
+python3 -m py_compile main.py charging.py rgb.py runtime-restore.py plugin_loader_recovery.py
 python3 -m unittest discover -s tests -v
 pnpm typecheck
 pnpm build

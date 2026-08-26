@@ -6,9 +6,12 @@ import fcntl
 import importlib.util
 import ipaddress
 import json
+import math
 import os
+import secrets
 import signal
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -53,6 +56,14 @@ FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
 KGSL_GPU_ROOT = Path("/sys/class/kgsl/kgsl-3d0")
+LIFECYCLE_RUN_ROOT = Path("/run/rk-enhanced")
+LIFECYCLE_CURRENT = LIFECYCLE_RUN_ROOT / "plugin-lifecycle-current.json"
+AUTO_RECOVERY_FOCUS_REQUEST = (
+    LIFECYCLE_RUN_ROOT / "automatic-recovery-focus.json")
+AUTO_RECOVERY_FOCUS_MAX_AGE_SECONDS = 90.0
+LIFECYCLE_LOCK = Path(
+    "/run/lock/rk-enhanced-plugin-loader-recovery.lock")
+PLUGIN_LOADER_SERVICE = "plugin_loader.service"
 
 
 def _read(path, default=""):
@@ -74,6 +85,24 @@ def _read_ints(path):
         return sorted({int(value) for value in _read(path).split() if int(value) > 0})
     except ValueError:
         return []
+
+
+def _process_identity(pid):
+    """Return the PID-reuse-safe identity used by the external lifecycle guard."""
+    try:
+        pid = int(pid)
+        raw = (Path("/proc") / str(pid) / "stat").read_text()
+        close = raw.rfind(")")
+        if pid <= 0 or close < 0:
+            return None
+        fields = raw[close + 2:].split()
+        return {
+            "pid": pid,
+            "start_time_ticks": int(fields[19]),
+            "parent_pid": int(fields[1]),
+        }
+    except (OSError, IndexError, TypeError, ValueError):
+        return None
 
 
 def _battery_power(battery):
@@ -211,15 +240,49 @@ def _atomic_text(path, content):
 
 
 @contextmanager
-def _exclusive_file_lock(path):
+def _exclusive_file_lock(path, timeout=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"timed out acquiring lifecycle lock {path}")
+                    time.sleep(min(0.05, max(
+                        0.0, deadline - time.monotonic())))
         try:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _publish_lifecycle_current(payload):
+    """Atomically publish a generation under the shared maintenance lock."""
+    with _exclusive_file_lock(LIFECYCLE_LOCK, timeout=4):
+        _atomic_text(LIFECYCLE_CURRENT, payload)
+        LIFECYCLE_CURRENT.chmod(0o600)
+
+
+def _remove_lifecycle_current(token):
+    """Remove CURRENT only if it still names the caller's generation."""
+    with _exclusive_file_lock(LIFECYCLE_LOCK, timeout=0.5):
+        try:
+            current = json.loads(LIFECYCLE_CURRENT.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            current = {}
+        if current.get("token") != token:
+            return False
+        LIFECYCLE_CURRENT.unlink(missing_ok=True)
+        return True
 
 
 def _cpu_capabilities():
@@ -524,10 +587,14 @@ class Plugin:
         self.settings_path = self.settings_dir / SETTINGS_FILE
         self.legacy_fan_guard_marker = self.settings_dir / "fan-curve-session.active"
         self.runtime_marker = self.settings_dir / "runtime-session.active"
+        self.runtime_restore_request = (
+            self.settings_dir / "runtime-session.active.restore-request")
         self.runtime_state_path = self.settings_dir / "runtime-session.json"
         self.runtime_lock_path = self.settings_dir / "runtime-session.lock"
         self.runtime_restore_path = self.settings_dir / "runtime-restore.py"
         self.runtime_guard_path = self.settings_dir / "runtime-restore-guard.sh"
+        self.plugin_loader_recovery_path = (
+            self.settings_dir / "plugin_loader_recovery.py")
         self.canonical_fan_config = self.settings_dir / "rocknix-custom-fancontrol.conf"
         self.active_preset = DEFAULT_PRESET
         self.active_appid = ""
@@ -551,11 +618,17 @@ class Plugin:
         self.charging = ChargingController(self.settings_dir)
         self.rgb = RGBController(
             self.settings_dir, run=_run, get_setting=_get_setting,
-            set_setting=_set_setting)
+            set_setting=_set_setting, get_runtime_capability=_rocknix_env)
         self.charging_status_warning = ""
         self.lock = None
         self.rgb_lock = None
         self.game_watch_task = None
+        self.lifecycle_heartbeat_task = None
+        self.lifecycle_token = ""
+        self.lifecycle_lease_path = None
+        self.lifecycle_active_path = None
+        self.lifecycle_heartbeat_path = None
+        self.lifecycle_ready_path = None
 
     def _load(self):
         try:
@@ -705,9 +778,183 @@ class Plugin:
         self.runtime_guard_path.chmod(0o755)
         self.runtime_restore_path.chmod(0o755)
 
+    def _install_plugin_loader_recovery_tool(self):
+        source = Path(__file__).resolve().with_name(
+            "plugin_loader_recovery.py")
+        if not source.is_file():
+            raise RuntimeError("PluginLoader recovery helper is missing")
+        self.settings_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, self.plugin_loader_recovery_path)
+        self.plugin_loader_recovery_path.chmod(0o755)
+
+    def _start_plugin_lifecycle_guard(self):
+        """Start an out-of-cgroup guard for this exact backend generation."""
+        self._install_plugin_loader_recovery_tool()
+        owner = _process_identity(os.getpid())
+        try:
+            loader_pid = int(_run([
+                "systemctl", "show", "--property=MainPID", "--value",
+                PLUGIN_LOADER_SERVICE,
+            ], timeout=3) or "0")
+        except (TypeError, ValueError):
+            loader_pid = 0
+        loader = _process_identity(loader_pid)
+        boot_id = _read("/proc/sys/kernel/random/boot_id")
+        if owner is None or loader is None or not boot_id:
+            raise RuntimeError("could not identify the PluginLoader generation")
+
+        token = secrets.token_hex(16)
+        LIFECYCLE_RUN_ROOT.mkdir(parents=True, exist_ok=True)
+        lease_path = LIFECYCLE_RUN_ROOT / f"plugin-lifecycle-{token}.json"
+        active_path = LIFECYCLE_RUN_ROOT / f"plugin-lifecycle-{token}.active"
+        heartbeat_path = (
+            LIFECYCLE_RUN_ROOT / f"plugin-lifecycle-{token}.heartbeat")
+        ready_path = (
+            LIFECYCLE_RUN_ROOT / f"plugin-lifecycle-{token}.ready")
+        lease = {
+            "version": 1,
+            "token": token,
+            "boot_id": boot_id,
+            "owner": owner,
+            "loader": loader,
+        }
+        payload = json.dumps(lease, indent=2, sort_keys=True) + "\n"
+        unit = f"rke-plugin-lifecycle-guard-{owner['pid']}-{token[:8]}"
+        try:
+            LIFECYCLE_RUN_ROOT.chmod(0o700)
+            _atomic_text(lease_path, payload)
+            lease_path.chmod(0o600)
+            _atomic_text(active_path, token + "\n")
+            active_path.chmod(0o600)
+            _atomic_text(heartbeat_path, f"{time.monotonic_ns()}\n")
+            heartbeat_path.chmod(0o600)
+            _run([
+                "systemd-run", f"--unit={unit}", "--collect",
+                str(self.plugin_loader_recovery_path), "guard",
+                str(lease_path),
+            ], timeout=3)
+
+            # The helper writes readiness only after validating the immutable
+            # lease, exact owner/Loader identities, active marker and initial
+            # monotonic heartbeat. Keep the old CURRENT lease published until
+            # that independent process is ready to receive the handoff.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if _read(ready_path) == token:
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError(
+                    "PluginLoader lifecycle guard did not become ready")
+
+            _publish_lifecycle_current(payload)
+        except Exception:
+            try:
+                active_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            for artifact in (heartbeat_path, ready_path, lease_path):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                _remove_lifecycle_current(token)
+            except OSError:
+                pass
+            raise
+
+        self.lifecycle_token = token
+        self.lifecycle_lease_path = lease_path
+        self.lifecycle_active_path = active_path
+        self.lifecycle_heartbeat_path = heartbeat_path
+        self.lifecycle_ready_path = ready_path
+        decky.logger.info(
+            f"Started PluginLoader lifecycle guard for backend PID {owner['pid']}")
+
+    async def _lifecycle_heartbeat_loop(self):
+        while self.lifecycle_active_path is not None:
+            try:
+                if not self.lifecycle_active_path.exists():
+                    return
+                _atomic_text(
+                    self.lifecycle_heartbeat_path,
+                    f"{time.monotonic_ns()}\n",
+                )
+            except OSError as reason:
+                decky.logger.error(
+                    f"PluginLoader lifecycle heartbeat failed: {reason}")
+                return
+            await asyncio.sleep(5)
+
+    def _mark_lifecycle_guard_clean(self):
+        token = self.lifecycle_token
+        if not token:
+            return False
+        errors = []
+        # Tombstone first. The independent guard treats a missing active file
+        # as authoritative clean unload even if later artifact cleanup fails.
+        for artifact in (
+                self.lifecycle_active_path,
+                self.lifecycle_heartbeat_path,
+                self.lifecycle_ready_path,
+                self.lifecycle_lease_path):
+            if artifact is None:
+                continue
+            try:
+                artifact.unlink(missing_ok=True)
+            except OSError as reason:
+                errors.append(f"{artifact.name}: {reason}")
+        try:
+            _remove_lifecycle_current(token)
+        except OSError as reason:
+            errors.append(f"current lease: {reason}")
+        finally:
+            self.lifecycle_token = ""
+            self.lifecycle_lease_path = None
+            self.lifecycle_active_path = None
+            self.lifecycle_heartbeat_path = None
+            self.lifecycle_ready_path = None
+        if errors:
+            decky.logger.warning(
+                "PluginLoader lifecycle cleanup was incomplete: " +
+                "; ".join(errors))
+        return True
+
+    def _request_detached_runtime_restore(self):
+        """Hand clean-unload restoration to a unit outside PluginLoader."""
+        if not self.runtime_marker.exists():
+            self.runtime_restore_request.unlink(missing_ok=True)
+            return ""
+        # The existing per-session guard observes this request independently
+        # of the Decky/FEX owner PID. Write it before attempting the faster
+        # detached unit or refreshing its installed tools, so either failure
+        # cannot strand applied state in an owner process which Decky happens
+        # to keep alive.
+        _atomic_text(
+            self.runtime_restore_request,
+            f"restore requested by {os.getpid()}\n",
+        )
+        self._install_runtime_restore_tools()
+        unit = f"rke-runtime-restore-clean-{os.getpid()}-{time.monotonic_ns()}"
+        try:
+            _run([
+                "systemd-run", f"--unit={unit}", "--collect",
+                str(self.runtime_restore_path), str(self.runtime_marker),
+                str(self.runtime_state_path), str(self.canonical_fan_config),
+                str(FAN_CONFIG),
+            ], timeout=1.5)
+        except Exception as reason:
+            decky.logger.warning(
+                "Immediate detached runtime restoration could not start; "
+                f"the existing session guard has the request: {reason}")
+            return "guard"
+        return "detached"
+
     def _ensure_runtime_session_locked(self, capabilities):
         if self.runtime_marker.exists():
             return self._runtime_state()
+        self.runtime_restore_request.unlink(missing_ok=True)
         self._install_runtime_restore_tools()
         state = self._capture_runtime_state(capabilities)
         _atomic_text(self.runtime_state_path,
@@ -1056,6 +1303,90 @@ class Plugin:
         # The newest qualifying game process wins if Steam is briefly
         # transitioning between two applications.
         return max(candidates, key=candidates.get)
+
+    async def consume_automatic_recovery_focus_request(self):
+        """Consume one fresh automatic-recovery request for the same live game."""
+        def work():
+            candidate = None
+            try:
+                with _exclusive_file_lock(LIFECYCLE_LOCK, timeout=1):
+                    try:
+                        mode = AUTO_RECOVERY_FOCUS_REQUEST.lstat().st_mode
+                    except FileNotFoundError:
+                        return None
+                    except OSError:
+                        return None
+                    if not stat.S_ISREG(mode):
+                        return None
+                    try:
+                        candidate = json.loads(
+                            AUTO_RECOVERY_FOCUS_REQUEST.read_text())
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        candidate = None
+                    try:
+                        AUTO_RECOVERY_FOCUS_REQUEST.unlink()
+                    except OSError:
+                        return None
+            except TimeoutError:
+                return None
+
+            valid = (
+                isinstance(candidate, dict) and
+                set(candidate) == {
+                    "version", "boot_id", "appid",
+                    "requested_monotonic", "reason"} and
+                not isinstance(candidate["version"], bool) and
+                candidate["version"] == 1 and
+                isinstance(candidate["boot_id"], str) and
+                candidate["boot_id"] == _read(
+                    "/proc/sys/kernel/random/boot_id") and
+                isinstance(candidate["appid"], str) and
+                candidate["appid"].isdigit() and
+                candidate["appid"] != "0" and
+                len(candidate["appid"]) <= 20 and
+                not isinstance(candidate["requested_monotonic"], bool) and
+                isinstance(candidate["requested_monotonic"], (int, float)) and
+                math.isfinite(float(candidate["requested_monotonic"])) and
+                candidate["reason"] in {
+                    "stale-heartbeat", "owner-dead", "loader-unavailable",
+                    "replacement-not-ready"}
+            )
+            if not valid:
+                return None
+            age = time.monotonic() - float(
+                candidate["requested_monotonic"])
+            if age < 0 or age > AUTO_RECOVERY_FOCUS_MAX_AGE_SECONDS:
+                return None
+            appid = candidate["appid"]
+            if self._detect_steam_app() != appid:
+                return None
+            decky.logger.info(
+                f"Automatic recovery requested foreground restore for app {appid}")
+            return appid
+
+        return await asyncio.to_thread(work)
+
+    async def report_automatic_recovery_focus_result(self, appid, result):
+        """Record the bounded frontend navigation outcome for live diagnosis."""
+        allowed = {
+            "confirmed",
+            "navigation-dispatched",
+            "steam-ui-unavailable",
+            "selection-failed",
+            "navigation-failed",
+        }
+        if (
+            not isinstance(appid, str) or
+            not appid.isdigit() or
+            appid == "0" or
+            len(appid) > 20 or
+            not isinstance(result, str) or
+            result not in allowed
+        ):
+            return False
+        decky.logger.info(
+            f"Automatic recovery game navigation for app {appid}: {result}")
+        return True
 
     async def _game_watch_loop(self):
         pending, confirmations = None, 0
@@ -1652,6 +1983,20 @@ class Plugin:
 
     async def _main(self):
         decky.logger.info("RK-Enhanced loaded; native ROCKNIX fancontrol remains in ownership")
+        # Establish independent lifecycle protection before settings migration
+        # or runtime restoration. Those operations can legitimately take
+        # longer than a replacement handoff window, but the new backend can
+        # identify itself immediately.
+        try:
+            await asyncio.to_thread(self._start_plugin_lifecycle_guard)
+            self.lifecycle_heartbeat_task = asyncio.create_task(
+                self._lifecycle_heartbeat_loop())
+        except Exception as reason:
+            # Recovery protection must be visible in the log, but an optional
+            # guard setup failure must not make Decky reject the whole plugin.
+            decky.logger.error(
+                f"Unable to start PluginLoader lifecycle guard: {reason}")
+
         def initialise():
             self._load()
             if self.runtime_marker.exists():
@@ -1666,10 +2011,34 @@ class Plugin:
                 # from loading on unsupported or partially configured devices.
                 decky.logger.warning(
                     f"Unable to reapply the saved RGB animation: {reason}")
-        await asyncio.to_thread(initialise)
+        try:
+            await asyncio.to_thread(initialise)
+        except Exception:
+            # Do not keep advertising a healthy backend if plugin
+            # initialisation itself failed. Leaving the active lease in place
+            # lets the independent guard perform one cooldown-bounded recovery.
+            if self.lifecycle_heartbeat_task is not None:
+                self.lifecycle_heartbeat_task.cancel()
+                try:
+                    await self.lifecycle_heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                self.lifecycle_heartbeat_task = None
+            raise
         self.game_watch_task = asyncio.create_task(self._game_watch_loop())
 
     async def _unload(self):
+        # Mark this generation clean before doing any other unload work. The
+        # independent guard must never turn an intentional Decky stop into an
+        # automatic restart, even if a later cleanup step is slow.
+        self._mark_lifecycle_guard_clean()
+        if self.lifecycle_heartbeat_task is not None:
+            self.lifecycle_heartbeat_task.cancel()
+            try:
+                await self.lifecycle_heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self.lifecycle_heartbeat_task = None
         if self.game_watch_task is not None:
             self.game_watch_task.cancel()
             try:
@@ -1677,9 +2046,19 @@ class Plugin:
             except asyncio.CancelledError:
                 pass
             self.game_watch_task = None
-        restored = await asyncio.to_thread(self._restore_runtime_session)
-        legacy_restored = await asyncio.to_thread(self._restore_legacy_system_fan_curve)
+        restore_handoff = ""
+        try:
+            restore_handoff = await asyncio.to_thread(
+                self._request_detached_runtime_restore)
+        except Exception as reason:
+            # A runtime guard already exists for every active session. If the
+            # faster clean-unload handoff fails, owner death still triggers
+            # that guard without keeping this Decky worker alive.
+            decky.logger.warning(
+                f"Detached runtime restoration handoff failed: {reason}")
         decky.logger.info(
-            "RK-Enhanced unloaded; native runtime baseline restored"
-            if restored or legacy_restored
+            "RK-Enhanced unloaded; runtime restoration handed to a detached unit"
+            if restore_handoff == "detached"
+            else "RK-Enhanced unloaded; runtime restoration requested from the session guard"
+            if restore_handoff == "guard"
             else "RK-Enhanced unloaded; no runtime session required restoration")

@@ -20,7 +20,9 @@ const EFFECT_LABELS: Record<RgbEffect, string> = {
 const option = <T extends string>(data: T, label: string) => ({ data, label });
 
 const requestFromState = (state: RgbState): RgbRequest | null =>
-  state.supported && state.valid && state.mode !== "unknown" ? {
+  state.supported && state.valid && state.provider !== "none" && state.mode !== "unknown" ? {
+    provider: state.provider,
+    revision: state.revision,
     mode: state.mode,
     effect: state.effect,
     color: [...state.color],
@@ -29,7 +31,8 @@ const requestFromState = (state: RgbState): RgbRequest | null =>
   } : null;
 
 const sameRequest = (left: RgbRequest | null, right: RgbRequest | null) =>
-  left === right || Boolean(left && right && left.mode === right.mode && left.effect === right.effect &&
+  left === right || Boolean(left && right && left.provider === right.provider &&
+    left.revision === right.revision && left.mode === right.mode && left.effect === right.effect &&
     left.brightness === right.brightness && left.correction === right.correction &&
     left.color.every((value, index) => value === right.color[index]));
 
@@ -60,6 +63,7 @@ export function RGB({ active }: { active: boolean }) {
   const [error, setError] = useState("");
   const [refreshRequest, setRefreshRequest] = useState(0);
   const generation = useRef(0);
+  const busyRef = useRef(false);
   const activeRef = useRef(active);
   const needsRefreshAfterStaleApply = useRef(false);
   const topRef = useRef<HTMLDivElement>(null);
@@ -116,9 +120,15 @@ export function RGB({ active }: { active: boolean }) {
   const updateColor = (index: number, value: number) => update(request => {
     request.color[index] = value;
   });
+  const reload = () => {
+    if (!active || busyRef.current) return;
+    needsRefreshAfterStaleApply.current = true;
+    setRefreshRequest(current => current + 1);
+  };
   const apply = async () => {
-    if (!active || !draft) return;
+    if (!active || !draft || busyRef.current) return;
     const requestGeneration = generation.current;
+    busyRef.current = true;
     setBusy(true);
     setMessage("");
     setError("");
@@ -141,6 +151,7 @@ export function RGB({ active }: { active: boolean }) {
       if (requestGeneration === generation.current) setError(String(reason));
       else needsRefreshAfterStaleApply.current = true;
     } finally {
+      busyRef.current = false;
       setBusy(false);
       if (requestGeneration !== generation.current && activeRef.current)
         setRefreshRequest(current => current + 1);
@@ -149,6 +160,7 @@ export function RGB({ active }: { active: boolean }) {
 
   const modes = status?.modes || [];
   const effects = status?.effects || [];
+  const analogStatic = status?.provider === "analog-static";
   const maxBrightness = Math.max(1, status?.max_brightness || 255);
   const showColour = draft?.mode === "rgb" && draft.effect !== "rainbow";
   const backToTop = () => {
@@ -158,23 +170,38 @@ export function RGB({ active }: { active: boolean }) {
 
   return <div className="rke-rgb">
     <PanelSection>
-      <Heading title="RGB Control" headingRef={topRef} />
+      <Heading title={analogStatic ? "Stick RGB" : "RGB Control"} headingRef={topRef} />
       {loading && !draft && <PanelSectionRow><Field label="Reading RGB settings…"
         bottomSeparator="none" /></PanelSectionRow>}
       {draft && <>
-        <PanelSectionRow><DropdownItem label="LED Color" bottomSeparator="none"
-          disabled={busy || !active}
-          selectedOption={draft.mode}
-          rgOptions={modes.map(mode => option(mode, MODE_LABELS[mode]))}
-          onChange={(selected: any) => update(request => { request.mode = selected.data; })} />
-        </PanelSectionRow>
-        {draft.mode === "rgb" && <>
-          <PanelSectionRow><DropdownItem label="Effect" bottomSeparator="none"
-            disabled={busy || !active}
-            selectedOption={draft.effect}
-            rgOptions={effects.map(effect => option(effect, EFFECT_LABELS[effect]))}
-            onChange={(selected: any) => update(request => { request.effect = selected.data; })} />
+        {analogStatic
+          ? <PanelSectionRow><ToggleField label="Stick lighting"
+            description="Independent of the system battery indicator."
+            bottomSeparator="none" disabled={busy || !active}
+            checked={draft.mode === "rgb"}
+            onChange={checked => update(request => {
+              request.mode = checked ? "rgb" : "off";
+              request.effect = "static";
+            })} />
           </PanelSectionRow>
+          : <PanelSectionRow><DropdownItem label="LED Color" bottomSeparator="none"
+            disabled={busy || !active}
+            selectedOption={draft.mode}
+            rgOptions={modes.map(mode => option(mode, MODE_LABELS[mode]))}
+            onChange={(selected: any) => update(request => { request.mode = selected.data; })} />
+          </PanelSectionRow>}
+        {analogStatic && status?.zones_differ && <PanelSectionRow><Field
+          label="Saved ring colours differ"
+          description="Showing the right-stick colour. Save & Apply uses one colour for both rings."
+          bottomSeparator="none" />
+        </PanelSectionRow>}
+        {draft.mode === "rgb" && <>
+          {effects.length > 1 && <PanelSectionRow><DropdownItem label="Effect" bottomSeparator="none"
+              disabled={busy || !active}
+              selectedOption={draft.effect}
+              rgOptions={effects.map(effect => option(effect, EFFECT_LABELS[effect]))}
+              onChange={(selected: any) => update(request => { request.effect = selected.data; })} />
+            </PanelSectionRow>}
           {showColour && <>
             <PanelSectionRow><Field label="Colour" bottomSeparator="none">
               <span className="rke-rgb-colour-value">
@@ -194,7 +221,7 @@ export function RGB({ active }: { active: boolean }) {
               label={<ValueLabel name="Brightness"
                 value={`${Math.round(draft.brightness * 100 / maxBrightness)}%`} />}
               bottomSeparator="none" disabled={busy || !active}
-              value={draft.brightness} min={0} max={maxBrightness} step={1}
+              value={draft.brightness} min={analogStatic ? 1 : 0} max={maxBrightness} step={1}
               minimumDpadGranularity={1}
               onChange={value => update(request => { request.brightness = value; })} />
             </PanelSectionRow>}
@@ -220,7 +247,11 @@ export function RGB({ active }: { active: boolean }) {
         label={message} bottomSeparator="none" /></PanelSectionRow></div>}
       {error && <div className="rke-rgb-error"><PanelSectionRow><Field
         label="RGB control unavailable" description={error}
-        bottomSeparator="none" /></PanelSectionRow></div>}
+        bottomSeparator="none" /></PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" bottomSeparator="none"
+          disabled={busy || loading || !active}
+          onClick={reload}>Reload current RGB state</ButtonItem></PanelSectionRow>
+      </div>}
     </PanelSection>
     <Heading title="Back to top" onActivate={backToTop} />
   </div>;

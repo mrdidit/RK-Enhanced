@@ -9,7 +9,11 @@ PLUGIN_DIR="${PLUGINS_DIR}/RK-Enhanced"
 BACKUP_ROOT="/storage/homebrew/plugin-backups"
 STATUS_FILE="/storage/homebrew/settings/RK-Enhanced/update-status.txt"
 INSTALLED_VERSION_FILE="/storage/homebrew/settings/RK-Enhanced/installed-version.txt"
+PLUGIN_LOADER_UNIT="plugin_loader.service"
+RECOVERY_LOCK_PATH="/run/lock/rk-enhanced-plugin-loader-recovery.lock"
+RECOVERY_MARKER_PATH="/run/rk-enhanced-plugin-loader-recovery.active"
 requested_version="${1:-}"
+maintenance_active=0
 
 mkdir -p "$(dirname "${STATUS_FILE}")" "${BACKUP_ROOT}"
 
@@ -17,7 +21,96 @@ write_status() {
     printf '%s\n' "$1" > "${STATUS_FILE}"
 }
 
-for command in curl jq unzip sha256sum systemctl; do
+systemctl_bounded() {
+    timeout 5 systemctl "$@"
+}
+
+wait_for_plugin_loader_stop() {
+    rke_stop_deadline=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "${rke_stop_deadline}" ]; do
+        rke_stop_state="$(systemctl_bounded show --property=ActiveState --value \
+            "${PLUGIN_LOADER_UNIT}" 2>/dev/null || true)"
+        case "${rke_stop_state}" in
+            inactive|failed)
+                return 0
+                ;;
+        esac
+        sleep 1
+    done
+    return 1
+}
+
+stop_plugin_loader_bounded() {
+    systemctl_bounded stop --no-block \
+        "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
+    if wait_for_plugin_loader_stop 15; then
+        return 0
+    fi
+    systemctl_bounded kill --kill-who=all --signal=SIGTERM \
+        "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
+    if wait_for_plugin_loader_stop 3; then
+        return 0
+    fi
+    systemctl_bounded kill --kill-who=all --signal=SIGKILL \
+        "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
+    wait_for_plugin_loader_stop 3
+}
+
+wait_for_plugin_loader_start() {
+    rke_start_deadline=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "${rke_start_deadline}" ]; do
+        if systemctl_bounded is-active --quiet "${PLUGIN_LOADER_UNIT}"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+begin_plugin_loader_maintenance() {
+    mkdir -p "$(dirname "${RECOVERY_LOCK_PATH}")"
+    exec 9>"${RECOVERY_LOCK_PATH}"
+    if ! chmod 600 "${RECOVERY_LOCK_PATH}"; then
+        exec 9>&-
+        return 1
+    fi
+    if ! flock -n 9; then
+        exec 9>&-
+        return 1
+    fi
+    rke_maintenance_tmp="$(mktemp \
+        /run/rk-enhanced-plugin-loader-recovery.active.XXXXXX)" || {
+        flock -u 9 || true
+        exec 9>&-
+        return 1
+    }
+    if ! chmod 600 "${rke_maintenance_tmp}"; then
+        rm -f "${rke_maintenance_tmp}"
+        flock -u 9 || true
+        exec 9>&-
+        return 1
+    fi
+    if ! printf '{"action":"update","pid":%s,"service":"%s","started_at":%s}\n' \
+        "$$" "${PLUGIN_LOADER_UNIT}" "$(date +%s)" > "${rke_maintenance_tmp}" || \
+       ! mv "${rke_maintenance_tmp}" "${RECOVERY_MARKER_PATH}"; then
+        rm -f "${rke_maintenance_tmp}"
+        flock -u 9 || true
+        exec 9>&-
+        return 1
+    fi
+    maintenance_active=1
+}
+
+end_plugin_loader_maintenance() {
+    if [ "${maintenance_active}" -eq 1 ]; then
+        rm -f "${RECOVERY_MARKER_PATH}"
+        flock -u 9 || true
+        exec 9>&-
+        maintenance_active=0
+    fi
+}
+
+for command in curl flock jq timeout unzip sha256sum systemctl; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         write_status "Update failed: missing ${command}"
         exit 1
@@ -37,8 +130,10 @@ cleanup_failure() {
             rm -rf "${PLUGIN_DIR}"
             mv "${backup_dir}" "${PLUGIN_DIR}"
         fi
-        systemctl start plugin_loader.service >/dev/null 2>&1 || true
+        systemctl_bounded start \
+            "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
     fi
+    end_plugin_loader_maintenance
     rm -rf "${work_dir}"
     exit "${result}"
 }
@@ -102,14 +197,25 @@ if grep -q 'rgb\.py' "${staged}/main.py" && [ ! -f "${staged}/rgb.py" ]; then
     write_status "Update failed: release is missing its RGB backend"
     exit 1
 fi
+if grep -q 'plugin_loader_recovery\.py' "${staged}/main.py" && \
+   [ ! -f "${staged}/plugin_loader_recovery.py" ]; then
+    write_status "Update failed: release is missing its PluginLoader recovery helper"
+    exit 1
+fi
 if [ "${preserve_updater}" -eq 1 ]; then
     cp "$0" "${staged}/updater.sh"
     chmod 755 "${staged}/updater.sh"
 fi
 
 write_status "Installing ${version}; Decky is reloading…"
-systemctl stop plugin_loader.service >/dev/null 2>&1 || true
-systemctl kill --kill-who=all --signal=SIGKILL plugin_loader.service >/dev/null 2>&1 || true
+if ! begin_plugin_loader_maintenance; then
+    write_status "Update failed: another PluginLoader maintenance action is running"
+    exit 1
+fi
+if ! stop_plugin_loader_bounded; then
+    write_status "Update failed: Decky did not stop within the bounded timeout"
+    exit 1
+fi
 
 backup_dir="${BACKUP_ROOT}/RK-Enhanced-before-${version}-$(date +%Y%m%d-%H%M%S)"
 if [ -d "${PLUGIN_DIR}" ]; then
@@ -120,10 +226,18 @@ mv "${staged}" "${PLUGIN_DIR}"
 chmod 755 "${PLUGIN_DIR}/updater.sh" \
     "${PLUGIN_DIR}/runtime-restore.py" \
     "${PLUGIN_DIR}/runtime-restore-guard.sh"
+if [ -f "${PLUGIN_DIR}/plugin_loader_recovery.py" ]; then
+    chmod 755 "${PLUGIN_DIR}/plugin_loader_recovery.py"
+fi
 
-systemctl start plugin_loader.service
+systemctl_bounded start "${PLUGIN_LOADER_UNIT}"
+if ! wait_for_plugin_loader_start 15; then
+    write_status "Update failed: Decky did not start within the bounded timeout"
+    exit 1
+fi
 printf '%s\n' "${version}" > "${INSTALLED_VERSION_FILE}"
 write_status "Installed ${version}"
+end_plugin_loader_maintenance
 
 trap - EXIT INT TERM
 rm -rf "${work_dir}"

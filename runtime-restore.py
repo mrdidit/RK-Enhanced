@@ -137,12 +137,14 @@ def main():
         raise SystemExit(
             "usage: runtime-restore.py MARKER STATE CANONICAL_FAN TARGET_FAN")
     marker, state_path, canonical_fan, target_fan = map(Path, sys.argv[1:])
+    restore_request = marker.with_name(marker.name + ".restore-request")
     lock_path = state_path.with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     changes, errors = [], []
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if not marker.exists():
+            restore_request.unlink(missing_ok=True)
             return 0
         try:
             state = json.loads(state_path.read_text())
@@ -208,6 +210,7 @@ def main():
             return 1
         marker.unlink(missing_ok=True)
         state_path.unlink(missing_ok=True)
+        restore_request.unlink(missing_ok=True)
         report = "Restored: " + (", ".join(changes) if changes else "no owned values changed")
         (state_path.parent / "runtime-restore-last.txt").write_text(report + "\n")
         print(report)

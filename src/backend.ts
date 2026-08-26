@@ -2,6 +2,10 @@ import { call } from "@decky/api";
 import type { BatteryLimit, ChargingStatus, DeviceNetworkInfo, HardwareProfile, MonitorEpoch, RgbRequest, RgbState, State, Telemetry, UpdateInfo } from "./types";
 
 export const getState = () => call<[], State>("get_state");
+export const consumeAutomaticRecoveryFocusRequest = () =>
+  call<[], string | null>("consume_automatic_recovery_focus_request");
+export const reportAutomaticRecoveryFocusResult = (appid: string, result: string) =>
+  call<[string, string], boolean>("report_automatic_recovery_focus_result", appid, result);
 export const getDeviceNetworkInfo = () => call<[], DeviceNetworkInfo>("get_device_network_info");
 export const beginMonitorSession = (session: string, generation: number) =>
   call<[string, number], MonitorEpoch>("begin_monitor_session", session, generation);

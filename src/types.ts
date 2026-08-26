@@ -38,9 +38,11 @@ export interface GpuCapability {
 export type RgbMode = "off" | "battery" | "rgb";
 export type RgbEffect = "static" | "breath" | "rainbow";
 export type RgbColor = [number, number, number];
+export type RgbProvider = "none" | "sysfs-effects" | "analog-static";
 
 export interface RgbCapability {
   available: boolean;
+  provider: RgbProvider;
   modes: RgbMode[];
   effects: RgbEffect[];
   shared_zone: boolean;
@@ -48,6 +50,8 @@ export interface RgbCapability {
 }
 
 export interface RgbRequest {
+  provider: Exclude<RgbProvider, "none">;
+  revision: string;
   mode: RgbMode;
   effect: RgbEffect;
   color: RgbColor;
@@ -58,6 +62,9 @@ export interface RgbRequest {
 export interface RgbState {
   supported: boolean;
   valid: boolean;
+  provider: RgbProvider;
+  revision: string;
+  zones_differ: boolean;
   modes: RgbMode[];
   effects: RgbEffect[];
   shared_zone: boolean;

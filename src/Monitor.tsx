@@ -308,6 +308,8 @@ export function Monitor({ active }: { active: boolean }) {
   return <div className="rke-monitor">
     <PanelSection>
       <Heading headingRef={monitorTopRef}>Live Performance</Heading>
+      <Metric label="Thermal limit" value={data.thermal_limit}
+        valueColor={data.thermal_limit === "Clear" ? "#26de81" : data.thermal_limit === "CPU + GPU" ? "#fc5c65" : "#fed330"} />
       <Metric label="CPU load" value={`${data.cpu_percent.toFixed(1)}%`} percent={data.cpu_percent} color={severity(data.cpu_percent, 70, 90)} />
       <Metric label="GPU load" value={`${data.gpu_percent.toFixed(1)}%`} percent={data.gpu_percent} color={severity(data.gpu_percent, 70, 90)} />
       <Metric label="CPU temperature" value={data.cpu_temperature ? `${data.cpu_temperature.toFixed(1)}°C` : "Unavailable"} percent={data.cpu_temperature || undefined} color={temperatureColor(data.cpu_temperature)} />
@@ -337,8 +339,6 @@ export function Monitor({ active }: { active: boolean }) {
         percent={data.battery_percent} color={bypassSelected ? "#45aaf2" : batteryColor(data.battery_percent)} />
       <Metric label="Time estimate" value={batteryEstimateValue} />
       <Metric label="Battery flow" value={batteryFlowValue} valueColor={batteryFlowColor} />
-      <Metric label="Thermal limit" value={data.thermal_limit}
-        valueColor={data.thermal_limit === "Clear" ? "#26de81" : data.thermal_limit === "CPU + GPU" ? "#fc5c65" : "#fed330"} />
     </PanelSection>
     <PanelSection>
       <Heading>Runtime</Heading>

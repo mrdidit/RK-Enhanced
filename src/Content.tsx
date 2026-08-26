@@ -527,11 +527,11 @@ export function Content() {
     { id: "Monitor", title: "Monitor", content: tabContent(<Monitor active={panelVisible && tab === "Monitor"} />) },
     { id: "Performance", title: "Performance", content: tabContent(performance) },
     { id: "Fan", title: "Fan Curves", content: tabContent(fan) },
+    { id: "Presets", title: "Presets", content: tabContent(presets) },
     ...(state.capabilities.rgb?.available ? [{
       id: "RGB", title: "RGB",
       content: tabContent(<RGB active={panelVisible && tab === "RGB"} />),
     }] : []),
-    { id: "Presets", title: "Presets", content: tabContent(presets) },
     { id: "Utils", title: "Utils", content: tabContent(utils) },
     ...(state.experimental_unlocked ? [{
       id: "Experimental", title: "Experimental",

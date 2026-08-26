@@ -12,21 +12,121 @@ SERVICES_DIR="${HOMEBREW_DIR}/services"
 PLUGINS_DIR="${HOMEBREW_DIR}/plugins"
 BACKUP_ROOT="${HOMEBREW_DIR}/plugin-backups"
 SERVICE_FILE="${STORAGE_ROOT}/.config/system.d/plugin_loader.service"
+PLUGIN_LOADER_UNIT="plugin_loader.service"
+RECOVERY_LOCK_PATH="/run/lock/rk-enhanced-plugin-loader-recovery.lock"
+RECOVERY_MARKER_PATH="/run/rk-enhanced-plugin-loader-recovery.active"
+maintenance_active=0
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "RK-Enhanced installer must run as root." >&2
     exit 1
 fi
 
-for command in curl jq unzip sha256sum systemctl; do
+for command in curl flock jq timeout unzip sha256sum systemctl; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         echo "Required command is missing: ${command}" >&2
         exit 1
     fi
 done
 
+wait_for_plugin_loader_stop() {
+    rke_stop_deadline=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "${rke_stop_deadline}" ]; do
+        rke_stop_state="$(systemctl_bounded show --property=ActiveState --value \
+            "${PLUGIN_LOADER_UNIT}" 2>/dev/null || true)"
+        case "${rke_stop_state}" in
+            inactive|failed)
+                return 0
+                ;;
+        esac
+        sleep 1
+    done
+    return 1
+}
+
+systemctl_bounded() {
+    timeout 5 systemctl "$@"
+}
+
+stop_plugin_loader_bounded() {
+    systemctl_bounded stop --no-block \
+        "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
+    if wait_for_plugin_loader_stop 15; then
+        return 0
+    fi
+    systemctl_bounded kill --kill-who=all --signal=SIGTERM \
+        "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
+    if wait_for_plugin_loader_stop 3; then
+        return 0
+    fi
+    systemctl_bounded kill --kill-who=all --signal=SIGKILL \
+        "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
+    wait_for_plugin_loader_stop 3
+}
+
+wait_for_plugin_loader_start() {
+    rke_start_deadline=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "${rke_start_deadline}" ]; do
+        if systemctl_bounded is-active --quiet "${PLUGIN_LOADER_UNIT}"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+begin_plugin_loader_maintenance() {
+    mkdir -p "$(dirname "${RECOVERY_LOCK_PATH}")"
+    exec 9>"${RECOVERY_LOCK_PATH}"
+    if ! chmod 600 "${RECOVERY_LOCK_PATH}"; then
+        exec 9>&-
+        return 1
+    fi
+    if ! flock -n 9; then
+        exec 9>&-
+        return 1
+    fi
+    rke_maintenance_tmp="$(mktemp \
+        /run/rk-enhanced-plugin-loader-recovery.active.XXXXXX)" || {
+        flock -u 9 || true
+        exec 9>&-
+        return 1
+    }
+    if ! chmod 600 "${rke_maintenance_tmp}"; then
+        rm -f "${rke_maintenance_tmp}"
+        flock -u 9 || true
+        exec 9>&-
+        return 1
+    fi
+    if ! printf '{"action":"install","pid":%s,"service":"%s","started_at":%s}\n' \
+        "$$" "${PLUGIN_LOADER_UNIT}" "$(date +%s)" > "${rke_maintenance_tmp}" || \
+       ! mv "${rke_maintenance_tmp}" "${RECOVERY_MARKER_PATH}"; then
+        rm -f "${rke_maintenance_tmp}"
+        flock -u 9 || true
+        exec 9>&-
+        return 1
+    fi
+    maintenance_active=1
+}
+
+end_plugin_loader_maintenance() {
+    if [ "${maintenance_active}" -eq 1 ]; then
+        rm -f "${RECOVERY_MARKER_PATH}"
+        flock -u 9 || true
+        exec 9>&-
+        maintenance_active=0
+    fi
+}
+
 work_dir="$(mktemp -d /tmp/rk-enhanced-install.XXXXXX)"
-trap 'rm -rf "${work_dir}"' EXIT INT TERM
+cleanup_install() {
+    result=$?
+    trap - EXIT INT TERM
+    end_plugin_loader_maintenance
+    rm -rf "${work_dir}"
+    exit "${result}"
+}
+trap cleanup_install EXIT INT TERM
 
 echo "Reading stable Decky release metadata..."
 decky_metadata="${work_dir}/decky.json"
@@ -92,15 +192,24 @@ if grep -q 'rgb\.py' "${work_dir}/plugin/RK-Enhanced/main.py" && \
     echo "RK-Enhanced release is missing its RGB backend." >&2
     exit 1
 fi
+if grep -q 'plugin_loader_recovery\.py' \
+   "${work_dir}/plugin/RK-Enhanced/main.py" && \
+   [ ! -f "${work_dir}/plugin/RK-Enhanced/plugin_loader_recovery.py" ]; then
+    echo "RK-Enhanced release is missing its PluginLoader recovery helper." >&2
+    exit 1
+fi
 
 mkdir -p "${SERVICES_DIR}" "${PLUGINS_DIR}" "${BACKUP_ROOT}" "$(dirname "${SERVICE_FILE}")"
 touch "${STORAGE_ROOT}/.steam/steam/.cef-enable-remote-debugging" 2>/dev/null || true
 
 echo "Stopping Decky cleanly..."
-systemctl stop plugin_loader.service 2>/dev/null || true
-# Old ROCKNIX/Decky combinations have occasionally left PluginLoader workers.
-if pgrep PluginLoader >/dev/null 2>&1; then
-    pkill -9 PluginLoader || true
+if ! begin_plugin_loader_maintenance; then
+    echo "Another PluginLoader maintenance action is running." >&2
+    exit 1
+fi
+if ! stop_plugin_loader_bounded; then
+    echo "Decky did not stop within the bounded timeout." >&2
+    exit 1
 fi
 
 if [ -f "${SERVICES_DIR}/PluginLoader" ]; then
@@ -115,6 +224,12 @@ cp "${work_dir}/PluginLoader" "${SERVICES_DIR}/PluginLoader"
 chmod 755 "${SERVICES_DIR}/PluginLoader"
 printf '%s\n' "${decky_version}" > "${SERVICES_DIR}/.loader.version"
 mv "${work_dir}/plugin/RK-Enhanced" "${PLUGINS_DIR}/RK-Enhanced"
+chmod 755 "${PLUGINS_DIR}/RK-Enhanced/updater.sh" \
+    "${PLUGINS_DIR}/RK-Enhanced/runtime-restore.py" \
+    "${PLUGINS_DIR}/RK-Enhanced/runtime-restore-guard.sh"
+if [ -f "${PLUGINS_DIR}/RK-Enhanced/plugin_loader_recovery.py" ]; then
+    chmod 755 "${PLUGINS_DIR}/RK-Enhanced/plugin_loader_recovery.py"
+fi
 
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
@@ -139,16 +254,17 @@ Environment=LOG_LEVEL=INFO
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable plugin_loader.service >/dev/null
-systemctl start plugin_loader.service
+systemctl_bounded daemon-reload
+systemctl_bounded enable "${PLUGIN_LOADER_UNIT}" >/dev/null
+systemctl_bounded start "${PLUGIN_LOADER_UNIT}"
 
-if ! systemctl is-active --quiet plugin_loader.service; then
+if ! wait_for_plugin_loader_start 15; then
     echo "Decky failed to start. Rollback files were preserved in ${SERVICES_DIR} and ${PLUGINS_DIR}." >&2
     exit 1
 fi
 
 mkdir -p "${HOMEBREW_DIR}/settings/RK-Enhanced"
 printf '%s\n' "${rke_version}" > "${HOMEBREW_DIR}/settings/RK-Enhanced/installed-version.txt"
+end_plugin_loader_maintenance
 
 echo "Installed Decky ${decky_version} and RK-Enhanced ${rke_version}."
