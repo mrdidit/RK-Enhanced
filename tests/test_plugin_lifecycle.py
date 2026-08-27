@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -204,6 +205,383 @@ class PluginLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await plugin._unload()
 
             plugin._request_detached_runtime_restore.assert_called_once_with()
+
+
+class InstallHealthProtocolTests(unittest.IsolatedAsyncioTestCase):
+    NONCE = "0123456789abcdef0123456789abcdef"
+    BOOT_ID = "11111111-2222-3333-4444-555555555555"
+    VERSION = "v9.8.7-test"
+    LIFECYCLE_TOKEN = "abcdef0123456789abcdef0123456789"
+    MAIN_CONTENT = b"test backend release\n"
+    FRONTEND_PREFIX = "rke-frontend-sha256-v1:"
+    FRONTEND_PLACEHOLDER = FRONTEND_PREFIX + ("0" * 64)
+    DIST_TEMPLATE = (
+        f'const frontendBundleId = "{FRONTEND_PLACEHOLDER}";\n'
+    ).encode()
+    FRONTEND_DIGEST = hashlib.sha256(DIST_TEMPLATE).hexdigest()
+    FRONTEND_BUNDLE_ID = FRONTEND_PREFIX + FRONTEND_DIGEST
+    DIST_CONTENT = DIST_TEMPLATE.replace(
+        FRONTEND_PLACEHOLDER.encode(), FRONTEND_BUNDLE_ID.encode())
+
+    @classmethod
+    def health_plugin(cls, settings):
+        plugin = main.Plugin.__new__(main.Plugin)
+        plugin.settings_dir = settings
+        plugin.install_health_request_path = (
+            settings / main.INSTALL_HEALTH_REQUEST_FILE)
+        plugin.install_backend_ready_path = (
+            settings / main.INSTALL_BACKEND_READY_FILE)
+        plugin.install_frontend_ready_path = (
+            settings / main.INSTALL_FRONTEND_READY_FILE)
+        plugin.install_health_response = None
+        plugin.lifecycle_token = cls.LIFECYCLE_TOKEN
+        return plugin
+
+    def release_fixture(self, root):
+        plugin_dir = root / "plugin"
+        (plugin_dir / "dist").mkdir(parents=True)
+        (plugin_dir / "main.py").write_bytes(self.MAIN_CONTENT)
+        (plugin_dir / "dist" / "index.js").write_bytes(self.DIST_CONTENT)
+        (plugin_dir / "dist" / "frontend-integrity.json").write_text(
+            json.dumps({
+                "protocol": 1,
+                "algorithm": "sha256-normalized-v1",
+                "bundle_id": self.FRONTEND_BUNDLE_ID,
+                "index_sha256": hashlib.sha256(
+                    self.DIST_CONTENT).hexdigest(),
+            }) + "\n")
+        (plugin_dir / "VERSION").write_text(self.VERSION + "\n")
+        return plugin_dir
+
+    def request_payload(self, **changes):
+        payload = {
+            "protocol": main.INSTALL_HEALTH_PROTOCOL,
+            "nonce": self.NONCE,
+            "version": self.VERSION,
+            "boot_id": self.BOOT_ID,
+            "main_sha256": hashlib.sha256(self.MAIN_CONTENT).hexdigest(),
+            "dist_sha256": hashlib.sha256(self.DIST_CONTENT).hexdigest(),
+            "frontend_bundle_id": self.FRONTEND_BUNDLE_ID,
+            "require_frontend": True,
+        }
+        payload.update(changes)
+        return payload
+
+    @staticmethod
+    def identities():
+        return {
+            111: {
+                "pid": 111,
+                "start_time_ticks": 1111,
+                "parent_pid": 222,
+            },
+            222: {
+                "pid": 222,
+                "start_time_ticks": 2222,
+                "parent_pid": 1,
+            },
+        }
+
+    def publish_backend(self, plugin, plugin_dir, *, identities=None):
+        real_read = main._read
+
+        def fake_read(path, default=""):
+            if str(path) == "/proc/sys/kernel/random/boot_id":
+                return self.BOOT_ID
+            return real_read(path, default)
+
+        process_identities = self.identities() if identities is None else identities
+        with mock.patch.object(main, "__file__", str(plugin_dir / "main.py")), \
+                mock.patch.object(main, "_read", side_effect=fake_read), \
+                mock.patch.object(main, "_run", return_value="222") as run, \
+                mock.patch.object(main.os, "getpid", return_value=111), \
+                mock.patch.object(
+                    main, "_process_identity",
+                    side_effect=lambda pid: process_identities.get(pid)), \
+                mock.patch.object(main.time, "time", return_value=1700000000):
+            result = plugin._publish_backend_install_health()
+        return result, run
+
+    def test_backend_response_binds_nonce_hashes_and_loader_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings"
+            settings.mkdir()
+            plugin_dir = self.release_fixture(root)
+            plugin = self.health_plugin(settings)
+            plugin.install_health_request_path.write_text(
+                json.dumps(self.request_payload()) + "\n")
+
+            result, run = self.publish_backend(plugin, plugin_dir)
+
+            self.assertTrue(result)
+            run.assert_called_once_with([
+                "systemctl", "show", "--property=MainPID", "--value",
+                main.PLUGIN_LOADER_SERVICE,
+            ], timeout=3)
+            response = json.loads(
+                plugin.install_backend_ready_path.read_text())
+            self.assertEqual(response["protocol"], main.INSTALL_HEALTH_PROTOCOL)
+            self.assertEqual(response["nonce"], self.NONCE)
+            self.assertEqual(response["version"], self.VERSION)
+            self.assertEqual(response["boot_id"], self.BOOT_ID)
+            self.assertEqual(
+                response["main_sha256"],
+                hashlib.sha256(self.MAIN_CONTENT).hexdigest())
+            self.assertEqual(
+                response["dist_sha256"],
+                hashlib.sha256(self.DIST_CONTENT).hexdigest())
+            self.assertEqual(
+                response["frontend_bundle_id"], self.FRONTEND_BUNDLE_ID)
+            self.assertIs(response["require_frontend"], True)
+            self.assertEqual(response["backend"], self.identities()[111])
+            self.assertEqual(response["loader"], self.identities()[222])
+            self.assertEqual(
+                response["lifecycle_token"], self.LIFECYCLE_TOKEN)
+            self.assertEqual(response["ready_at"], 1700000000)
+            self.assertEqual(plugin.install_health_response, response)
+            self.assertEqual(
+                stat.S_IMODE(plugin.install_backend_ready_path.stat().st_mode),
+                0o600,
+            )
+
+    def test_backend_rejects_a_challenge_for_different_release_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings"
+            settings.mkdir()
+            plugin_dir = self.release_fixture(root)
+            plugin = self.health_plugin(settings)
+            plugin.install_health_request_path.write_text(json.dumps(
+                self.request_payload(dist_sha256="0" * 64)) + "\n")
+
+            result, run = self.publish_backend(plugin, plugin_dir)
+
+            self.assertFalse(result)
+            self.assertIsNone(plugin.install_health_response)
+            self.assertFalse(plugin.install_backend_ready_path.exists())
+            run.assert_not_called()
+
+    def test_backend_rejects_wrong_bundle_or_non_boolean_frontend_requirement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings"
+            settings.mkdir()
+            plugin_dir = self.release_fixture(root)
+            plugin = self.health_plugin(settings)
+            invalid_requests = (
+                {
+                    "frontend_bundle_id":
+                        self.FRONTEND_PREFIX + ("f" * 64),
+                },
+                {"require_frontend": "true"},
+            )
+
+            for changes in invalid_requests:
+                with self.subTest(changes=changes):
+                    plugin.install_health_request_path.write_text(
+                        json.dumps(self.request_payload(**changes)) + "\n")
+                    result, run = self.publish_backend(plugin, plugin_dir)
+                    self.assertFalse(result)
+                    self.assertIsNone(plugin.install_health_response)
+                    self.assertFalse(
+                        plugin.install_backend_ready_path.exists())
+                    run.assert_not_called()
+
+    def test_backend_rejects_an_unidentified_loader_pid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings"
+            settings.mkdir()
+            plugin_dir = self.release_fixture(root)
+            plugin = self.health_plugin(settings)
+            plugin.install_health_request_path.write_text(
+                json.dumps(self.request_payload()) + "\n")
+            identities = self.identities()
+            identities[222] = None
+
+            result, run = self.publish_backend(
+                plugin, plugin_dir, identities=identities)
+
+            self.assertFalse(result)
+            run.assert_called_once()
+            self.assertIsNone(plugin.install_health_response)
+            self.assertFalse(plugin.install_backend_ready_path.exists())
+
+    async def test_frontend_response_reuses_verified_backend_challenge(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings"
+            settings.mkdir()
+            plugin_dir = self.release_fixture(root)
+            plugin = self.health_plugin(settings)
+            request = self.request_payload()
+            plugin.install_health_request_path.write_text(
+                json.dumps(request) + "\n")
+            response = {
+                **request,
+                "backend": self.identities()[111],
+                "loader": self.identities()[222],
+                "lifecycle_token": self.LIFECYCLE_TOKEN,
+                "ready_at": 1700000000,
+            }
+            plugin.install_health_response = response
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            with mock.patch.object(
+                    main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        main, "__file__", str(plugin_dir / "main.py")), \
+                    mock.patch.object(
+                        main.time, "time", return_value=1700000001):
+                result = await plugin.report_frontend_ready(
+                    self.FRONTEND_BUNDLE_ID)
+
+            self.assertTrue(result)
+            frontend = json.loads(
+                plugin.install_frontend_ready_path.read_text())
+            self.assertEqual(
+                {key: frontend[key] for key in response}, response)
+            self.assertEqual(frontend["frontend_ready_at"], 1700000001)
+            self.assertEqual(
+                stat.S_IMODE(plugin.install_frontend_ready_path.stat().st_mode),
+                0o600,
+            )
+
+    async def test_frontend_rejects_wrong_bundle_id_for_same_version(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings"
+            settings.mkdir()
+            plugin_dir = self.release_fixture(root)
+            plugin = self.health_plugin(settings)
+            request = self.request_payload()
+            plugin.install_health_request_path.write_text(
+                json.dumps(request) + "\n")
+            plugin.install_health_response = {
+                **request,
+                "backend": self.identities()[111],
+                "loader": self.identities()[222],
+            }
+            wrong_bundle = self.FRONTEND_PREFIX + ("f" * 64)
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            with mock.patch.object(
+                    main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        main, "__file__", str(plugin_dir / "main.py")):
+                result = await plugin.report_frontend_ready(wrong_bundle)
+
+            self.assertFalse(result)
+            self.assertFalse(plugin.install_frontend_ready_path.exists())
+
+    async def test_frontend_rejects_bundle_mutated_after_backend_response(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings"
+            settings.mkdir()
+            plugin_dir = self.release_fixture(root)
+            plugin = self.health_plugin(settings)
+            plugin.install_health_request_path.write_text(
+                json.dumps(self.request_payload()) + "\n")
+            published, _ = self.publish_backend(plugin, plugin_dir)
+            self.assertTrue(published)
+            (plugin_dir / "dist" / "index.js").write_bytes(
+                self.DIST_CONTENT + b"// post-init mutation\n")
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            with mock.patch.object(
+                    main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        main, "__file__", str(plugin_dir / "main.py")):
+                result = await plugin.report_frontend_ready(
+                    self.FRONTEND_BUNDLE_ID)
+
+            self.assertFalse(result)
+            self.assertFalse(plugin.install_frontend_ready_path.exists())
+
+    async def test_stale_install_challenge_does_not_reject_backend_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin = main.Plugin.__new__(main.Plugin)
+            plugin.lifecycle_heartbeat_task = None
+            plugin.game_watch_task = None
+            plugin.runtime_marker = root / "runtime-session.active"
+            plugin.legacy_fan_guard_marker = root / "legacy-fan.active"
+            plugin.rgb = types.SimpleNamespace(
+                reapply_startup=lambda: False)
+            plugin._start_plugin_lifecycle_guard = mock.Mock(
+                side_effect=RuntimeError("guard unavailable in fixture"))
+            plugin._load = mock.Mock()
+            plugin._restore_runtime_session = mock.Mock()
+            plugin._restore_legacy_system_fan_curve = mock.Mock()
+            plugin._publish_backend_install_health = mock.Mock(
+                return_value=False)
+
+            async def game_watch():
+                await asyncio.Event().wait()
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            plugin._game_watch_loop = game_watch
+            with mock.patch.object(
+                    main.asyncio, "to_thread", new=inline_to_thread):
+                await plugin._main()
+
+            plugin._publish_backend_install_health.assert_called_once_with()
+            self.assertIsNotNone(plugin.game_watch_task)
+            self.assertFalse(plugin.game_watch_task.done())
+            plugin.game_watch_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await plugin.game_watch_task
+
+    async def test_install_health_exception_is_logged_without_rejecting_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin = main.Plugin.__new__(main.Plugin)
+            plugin.lifecycle_heartbeat_task = None
+            plugin.game_watch_task = None
+            plugin.runtime_marker = root / "runtime-session.active"
+            plugin.legacy_fan_guard_marker = root / "legacy-fan.active"
+            plugin.rgb = types.SimpleNamespace(
+                reapply_startup=lambda: False)
+            plugin._start_plugin_lifecycle_guard = mock.Mock(
+                side_effect=RuntimeError("guard unavailable in fixture"))
+            plugin._load = mock.Mock()
+            plugin._restore_runtime_session = mock.Mock()
+            plugin._restore_legacy_system_fan_curve = mock.Mock()
+            plugin._publish_backend_install_health = mock.Mock(
+                side_effect=ValueError("corrupt install challenge"))
+
+            async def game_watch():
+                await asyncio.Event().wait()
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            plugin._game_watch_loop = game_watch
+            with mock.patch.object(
+                    main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        main.decky.logger, "exception", create=True,
+                    ) as log_exception:
+                await plugin._main()
+
+            plugin._publish_backend_install_health.assert_called_once_with()
+            log_exception.assert_called_once_with(
+                "Install health response was withheld; plugin startup continues")
+            self.assertIsNotNone(plugin.game_watch_task)
+            self.assertFalse(plugin.game_watch_task.done())
+            plugin.game_watch_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await plugin.game_watch_task
 
 
 class ProcessIdentityTests(unittest.TestCase):

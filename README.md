@@ -242,14 +242,27 @@ Release discovery includes GitHub pre-releases.
 
 Updates are installed by a detached updater that:
 
-1. Downloads and validates the selected release.
-2. Creates a rollback copy.
-3. Replaces the plugin.
-4. Reloads Decky.
-5. Does not terminate Steam or running game processes. After an intentional
+1. Downloads and validates the selected RK-Enhanced release and the latest
+   stable Decky Loader.
+2. Creates unique rollback copies of both installed components and their
+   version metadata.
+3. Replaces RK-Enhanced and Decky as one serialized transaction.
+4. Reloads Decky and verifies the exact backend and frontend generation before
+   recording success.
+5. Rolls both components back if validation fails.
+6. Does not terminate Steam or running game processes. After an intentional
    maintenance reload, Steam may still leave a running game waiting on its
    Resume screen; automatic foreground restoration is reserved for automatic
    crash recovery.
+
+UI-initiated installs require a nonce-bound response from the exact backend
+and from the exact frontend bundle after `getState()` succeeds and the hydrated
+UI commits. The check also
+binds release version, boot ID, live process start times, backend hash, bundle
+hash, and the bundle's independently verified self-integrity ID. A fresh SSH
+install requires backend readiness only because Steam may be closed. Neither
+path records the new installed version merely because the systemd unit became
+active.
 
 Installer and updater shutdown is bounded and scoped to
 `plugin_loader.service`: they request a non-blocking stop, wait up to 15
@@ -257,13 +270,21 @@ seconds, then allow at most three seconds each for unit-cgroup `SIGTERM` and
 `SIGKILL` escalation. They never kill processes globally by the names
 PluginLoader, FEX, or Python.
 
-Before that intentional stop, maintenance takes the lifecycle helper's exact
+Before an intentional stop, maintenance takes the lifecycle helper's exact
 fixed lock (`/run/lock/rk-enhanced-plugin-loader-recovery.lock`) and creates its
 fixed marker (`/run/rk-enhanced-plugin-loader-recovery.active`). The lock is
-held across file replacement and bounded startup verification, then the marker
-is removed on both success and failure. This pauses the runtime watchdog so it
-cannot mistake an in-progress install for a crash and restart Decky midway
-through the replacement.
+held across stop, file replacement, and the tentative service start. It is then
+released so the new backend can publish its lifecycle generation. A separate
+install-transaction lock remains held throughout readiness verification and
+rollback, preventing overlapping installs while allowing normal lifecycle
+publication. The marker is removed on both success and failure.
+
+Rollback reacquires the lifecycle lock before stopping or changing anything.
+The previous plugin, Decky executable, service/version metadata, and active
+state are restored together. Protocol-aware releases must prove their restored
+backend generation; older releases are explicitly reported as legacy and
+unverified. If safe rollback cannot obtain the lock or finish, persistent
+recovery files are retained under `/storage/homebrew/plugin-backups`.
 
 Downgrading preserves the safer current updater so reinstalling a newer release
 cannot restore obsolete Steam lifecycle behaviour.
@@ -574,15 +595,23 @@ curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh |
 ```
 
 The installer retrieves the latest published RK-Enhanced release, including
-pre-releases, and installs Decky Loader when required. Review `install.sh`
-before piping it into a shell.
+pre-releases, and refreshes Decky Loader from its latest stable release every
+time. Review `install.sh` before piping it into a shell.
+
+The updater bundled with `v0.2.0-beta.7` predates coordinated Decky updates.
+When moving from beta.7 or older to beta.8, run the full installer above once;
+updates initiated by beta.8 and later then refresh Decky automatically. Beta.8
+also retains a legacy visibility-hook fallback so an older Loader does not
+prevent the plugin from rendering during that transition.
 
 Manual layout:
 
 ```text
 /storage/homebrew/plugins/RK-Enhanced/
 ├── dist/index.js
+├── dist/frontend-integrity.json
 ├── charging.py
+├── install-health.json
 ├── main.py
 ├── plugin_loader_recovery.py
 ├── rgb.py
@@ -608,6 +637,7 @@ python3 -m py_compile main.py charging.py rgb.py runtime-restore.py plugin_loade
 python3 -m unittest discover -s tests -v
 pnpm typecheck
 pnpm build
+pnpm verify:frontend
 ```
 
 The frontend is emitted as an IIFE because the tested Decky/FEX environment

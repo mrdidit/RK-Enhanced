@@ -1,4 +1,7 @@
+import hashlib
 import json
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -623,6 +626,80 @@ class RgbPackagingContractTests(unittest.TestCase):
         self.assertNotIn('[ ! -f "${staged}/rgb.py" ] ||', updater)
 
 
+class FrontendIntegrityPackagingTests(unittest.TestCase):
+    PREFIX = "rke-frontend-sha256-v1:"
+    PLACEHOLDER = PREFIX + ("0" * 64)
+
+    def run_integrity(self, root, action):
+        return subprocess.run(
+            ["node", str(ROOT / "scripts" / "frontend-integrity.mjs"), action],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def test_stamp_and_verify_bind_the_exact_built_bundle(self):
+        if shutil.which("node") is None:
+            self.skipTest("Node.js is required for the frontend integrity tool")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dist = root / "dist"
+            dist.mkdir()
+            original = (
+                f'const frontendBundleId = "{self.PLACEHOLDER}";\n'
+                "const release = 'same-version-build-a';\n"
+            ).encode()
+            index = dist / "index.js"
+            index.write_bytes(original)
+
+            stamped = self.run_integrity(root, "stamp")
+
+            self.assertEqual(stamped.returncode, 0, stamped.stderr)
+            bundle = index.read_bytes()
+            matches = re.findall(
+                rb"rke-frontend-sha256-v1:[0-9a-f]{64}", bundle)
+            self.assertEqual(len(matches), 1)
+            bundle_id = matches[0].decode()
+            normalized = bundle.replace(matches[0], self.PLACEHOLDER.encode())
+            self.assertEqual(normalized, original)
+            self.assertEqual(
+                bundle_id,
+                self.PREFIX + hashlib.sha256(normalized).hexdigest(),
+            )
+            manifest = json.loads(
+                (dist / "frontend-integrity.json").read_text())
+            self.assertEqual(manifest, {
+                "protocol": 1,
+                "algorithm": "sha256-normalized-v1",
+                "bundle_id": bundle_id,
+                "index_sha256": hashlib.sha256(bundle).hexdigest(),
+            })
+            verified = self.run_integrity(root, "verify")
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
+            index.write_bytes(bundle + b"// post-stamp mutation\n")
+            rejected = self.run_integrity(root, "verify")
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("frontend integrity verification failed", rejected.stderr)
+
+    def test_release_build_stamps_verifies_and_packages_health_metadata(self):
+        package = json.loads((ROOT / "package.json").read_text())
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+
+        self.assertEqual(
+            package["scripts"]["build"],
+            "rollup -c && node scripts/frontend-integrity.mjs stamp",
+        )
+        self.assertEqual(
+            package["scripts"]["verify:frontend"],
+            "node scripts/frontend-integrity.mjs verify",
+        )
+        self.assertIn("pnpm verify:frontend", workflow)
+        self.assertIn("install-health.json", workflow)
+
+
 class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
     def test_release_build_compiles_packages_and_marks_recovery_executable(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
@@ -687,7 +764,7 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
                     "systemctl_bounded kill --kill-who=all --signal=SIGKILL", source)
                 self.assertIn('timeout 5 systemctl "$@"', source)
                 self.assertIn(
-                    "for command in curl flock jq timeout unzip sha256sum systemctl; do",
+                    "for command in curl cut flock grep jq sed sha256sum systemctl timeout tr unzip wc; do",
                     source,
                 )
                 self.assertNotIn('""|inactive|failed)', source)
@@ -701,11 +778,15 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
             with self.subTest(name=name):
                 source = (ROOT / name).read_text()
                 self.assertIn(
-                    'RECOVERY_LOCK_PATH="/run/lock/rk-enhanced-plugin-loader-recovery.lock"',
+                    'RUN_ROOT="${RKE_RUN_ROOT:-/run}"',
                     source,
                 )
                 self.assertIn(
-                    'RECOVERY_MARKER_PATH="/run/rk-enhanced-plugin-loader-recovery.active"',
+                    'RECOVERY_LOCK_PATH="${RUN_ROOT}/lock/rk-enhanced-plugin-loader-recovery.lock"',
+                    source,
+                )
+                self.assertIn(
+                    'RECOVERY_MARKER_PATH="${RUN_ROOT}/rk-enhanced-plugin-loader-recovery.active"',
                     source,
                 )
                 self.assertIn("flock -n 9", source)
@@ -724,6 +805,322 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
                 self.assertLess(stop, start)
                 self.assertLess(start, end)
 
+    def test_install_health_is_nonce_hash_and_process_generation_bound(self):
+        for name in ("install.sh", "updater.sh"):
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                self.assertIn("write_install_health_request()", source)
+                self.assertIn(
+                    'rke_health_nonce="$(cat "${PROC_ROOT}/sys/kernel/random/uuid"',
+                    source,
+                )
+                self.assertIn(
+                    'rke_health_main_hash="$(sha256sum "', source)
+                self.assertIn(
+                    'rke_health_dist_hash="$(sha256sum "', source)
+                self.assertIn(".nonce == $nonce", source)
+                self.assertIn(".main_sha256 == $main_sha256", source)
+                self.assertIn(".dist_sha256 == $dist_sha256", source)
+                self.assertIn(
+                    ".frontend_bundle_id == $frontend_bundle_id", source)
+                self.assertIn(".require_frontend ==", source)
+                self.assertIn(".loader.pid == $loader_pid", source)
+                self.assertIn(
+                    ".loader.start_time_ticks == $loader_start", source)
+                self.assertIn("process_start_time()", source)
+                self.assertIn("wait_for_rke_health()", source)
+                self.assertIn("frontend_integrity_id()", source)
+                self.assertIn(
+                    '--arg frontend_bundle_id "${HEALTH_BUNDLE_ID}"', source)
+                self.assertIn(
+                    '"$(frontend_integrity_id ', source)
+                self.assertIn('"${HEALTH_BUNDLE_ID}" ] || return 1', source)
+
+    def test_shells_validate_declared_frontend_integrity_metadata(self):
+        placeholder = (
+            "rke-frontend-sha256-v1:" + ("0" * 64))
+        for name in ("install.sh", "updater.sh"):
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                self.assertIn("health_protocol_supported()", source)
+                self.assertIn(
+                    '.frontend_integrity == "sha256-normalized-v1"', source)
+                self.assertIn(
+                    'rke_integrity_manifest="${rke_integrity_root}/dist/frontend-integrity.json"',
+                    source,
+                )
+                self.assertIn(
+                    '.algorithm == "sha256-normalized-v1"', source)
+                self.assertIn(".index_sha256 // empty", source)
+                self.assertIn(
+                    'rke_integrity_count="$(grep -o "${rke_integrity_id}"',
+                    source,
+                )
+                self.assertIn(
+                    f'rke_integrity_placeholder="{placeholder}"', source)
+                self.assertIn("rke_integrity_normalized_hash", source)
+                self.assertIn(
+                    '[ "${rke_integrity_normalized_hash}" = "${rke_integrity_digest}" ]',
+                    source,
+                )
+                self.assertIn(
+                    'frontend_bundle_id: $frontend_bundle_id', source)
+
+        installer = (ROOT / "install.sh").read_text()
+        updater = (ROOT / "updater.sh").read_text()
+        self.assertIn(
+            '[ ! -f "${work_dir}/plugin/RK-Enhanced/install-health.json" ]',
+            installer,
+        )
+        self.assertIn(
+            '[ ! -f "${work_dir}/plugin/RK-Enhanced/dist/frontend-integrity.json" ]',
+            installer,
+        )
+        self.assertIn(
+            '[ -e "${staged}/install-health.json" ] ||', updater)
+        self.assertIn(
+            '[ -e "${staged}/dist/frontend-integrity.json" ]', updater)
+        self.assertIn("require_frontend: false", installer)
+        self.assertIn(
+            '--argjson require_frontend "${rke_health_frontend_json}"',
+            updater,
+        )
+        self.assertIn(
+            "elif health_response_matches \\", updater)
+        self.assertIn(
+            '"${FRONTEND_READY_FILE}" "${rke_health_loader_pid}"', updater)
+        self.assertIn(
+            'rke_health_backend_fingerprint="${HEALTH_RESPONSE_FINGERPRINT}"',
+            updater,
+        )
+        self.assertIn(
+            '[ "${HEALTH_RESPONSE_FINGERPRINT}" = \\', updater)
+        self.assertIn(
+            '"${rke_health_backend_fingerprint}" ]; then', updater)
+
+    def test_updater_limits_metadata_free_releases_to_explicit_legacy_tags(self):
+        source = (ROOT / "updater.sh").read_text()
+        helper = source.split("legacy_release_allowed() {", 1)[1].split(
+            "\n}\n", 1)[0]
+        selection = source.split("health_supported=0", 1)[1].split(
+            'if [ "${preserve_updater}" -eq 1 ]; then', 1)[0]
+
+        self.assertIn(
+            "v0.1.0-alpha.[1-6]|0.1.0-alpha.[1-6]|"
+            "v0.2.0-beta.[1-7]|0.2.0-beta.[1-7]",
+            helper,
+        )
+        self.assertIn("return 0", helper)
+        self.assertIn("return 1", helper)
+        self.assertNotIn("index", helper)
+        self.assertIn(
+            '[ -e "${staged}/install-health.json" ] || \\', selection)
+        self.assertIn(
+            '[ -e "${staged}/dist/frontend-integrity.json" ]; then',
+            selection,
+        )
+        self.assertIn(
+            'if ! health_protocol_supported "${staged}"; then', selection)
+        self.assertIn(
+            'elif [ -n "${requested_version}" ] && \\', selection)
+        self.assertIn(
+            'legacy_release_allowed "${version}"; then', selection)
+        self.assertIn(
+            "Never infer legacy status from release order.", selection)
+        self.assertNotIn("requested_index", selection)
+        self.assertIn(
+            'write_status "Update failed: release is missing required '
+            'install-health metadata"',
+            selection,
+        )
+
+    def test_health_wait_uses_a_separate_transaction_lock(self):
+        for name in ("install.sh", "updater.sh"):
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                self.assertIn(
+                    'TRANSACTION_LOCK_PATH="${RUN_ROOT}/lock/rk-enhanced-install-transaction.lock"',
+                    source,
+                )
+                self.assertIn("begin_install_transaction()", source)
+                self.assertIn("end_install_transaction()", source)
+                self.assertIn('exec 8>"${TRANSACTION_LOCK_PATH}"', source)
+                self.assertIn("flock -n 8", source)
+                self.assertIn('exec 9>"${RECOVERY_LOCK_PATH}"', source)
+                self.assertIn("flock -n 9", source)
+
+                health_wait_marker = (
+                    "if ! wait_for_rke_health; then"
+                    if name == "install.sh"
+                    else 'if ! wait_for_rke_health "${frontend_requirement}"; then'
+                )
+                health_wait = source.index(health_wait_marker)
+                release = source.rfind(
+                    "\nend_plugin_loader_maintenance\n", 0, health_wait)
+                loader_wait = source.rfind(
+                    "if ! wait_for_plugin_loader_start 15; then",
+                    0,
+                    release,
+                )
+                transaction_end = source.index(
+                    "\nend_install_transaction\n", health_wait)
+                self.assertGreaterEqual(release, 0)
+                self.assertGreaterEqual(loader_wait, 0)
+                self.assertLess(loader_wait, release)
+                self.assertLess(release, health_wait)
+                self.assertLess(health_wait, transaction_end)
+
+    def test_rollback_stops_tentative_loader_before_restoring_files(self):
+        cases = {
+            "install.sh": (
+                "cleanup_install() {",
+                "trap cleanup_install EXIT INT TERM",
+                'rm -rf "${PLUGINS_DIR}/RK-Enhanced"',
+            ),
+            "updater.sh": (
+                "cleanup_failure() {",
+                "trap cleanup_failure EXIT INT TERM",
+                'rm -rf "${PLUGIN_DIR}"',
+            ),
+        }
+        for name, (start_marker, end_marker, restore_marker) in cases.items():
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                cleanup = source.split(start_marker, 1)[1].split(
+                    end_marker, 1)[0]
+                lock = cleanup.index(
+                    "begin_plugin_loader_maintenance_bounded 10")
+                stop = cleanup.index("stop_plugin_loader_bounded")
+                restore = cleanup.index(restore_marker)
+                self.assertLess(lock, stop)
+                self.assertLess(stop, restore)
+
+    def test_rollback_restores_metadata_then_revalidates_old_backend(self):
+        cases = {
+            "install.sh": (
+                "cleanup_install() {",
+                "trap cleanup_install EXIT",
+                "wait_for_rke_health; then",
+            ),
+            "updater.sh": (
+                "cleanup_failure() {",
+                "trap cleanup_failure EXIT",
+                'wait_for_rke_health ""; then',
+            ),
+        }
+        for name, (start_marker, end_marker, wait_marker) in cases.items():
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                cleanup = source.split(start_marker, 1)[1].split(
+                    end_marker, 1)[0]
+                self.assertIn(
+                    'cp -p "${installed_version_backup}" \\', cleanup)
+                self.assertIn('"${INSTALLED_VERSION_FILE}"; then', cleanup)
+                challenge = cleanup.index("write_install_health_request")
+                self.assertIn(
+                    '"${rollback_version}"',
+                    cleanup[challenge:challenge + 120],
+                )
+                start = cleanup.index(
+                    'systemctl_bounded start "${PLUGIN_LOADER_UNIT}"',
+                    challenge,
+                )
+                release = cleanup.index(
+                    "end_plugin_loader_maintenance", start)
+                health = cleanup.index(wait_marker, release)
+                self.assertLess(challenge, start)
+                self.assertLess(start, release)
+                self.assertLess(release, health)
+
+    def test_invalid_declared_rollback_metadata_is_never_labeled_legacy(self):
+        cases = {
+            "install.sh": (
+                "cleanup_install() {",
+                "trap cleanup_install EXIT",
+                '${PLUGINS_DIR}/RK-Enhanced',
+            ),
+            "updater.sh": (
+                "cleanup_failure() {",
+                "trap cleanup_failure EXIT",
+                '${PLUGIN_DIR}',
+            ),
+        }
+        for name, (start_marker, end_marker, plugin_root) in cases.items():
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                cleanup = source.split(start_marker, 1)[1].split(
+                    end_marker, 1)[0]
+                declared = cleanup.index(
+                    f'{{ [ -e "{plugin_root}/install-health.json" ] ||')
+                self.assertIn(
+                    f'[ -e "{plugin_root}/dist/frontend-integrity.json" ]',
+                    cleanup[declared:declared + 220],
+                )
+                supported = cleanup.index(
+                    "if health_protocol_supported", declared)
+                legacy = cleanup.index(
+                    'elif [ "${rollback_ok}" -eq 1 ] && \\', supported)
+                declared_branch = cleanup[declared:legacy]
+                failure_else = declared_branch.index("else")
+                invalid = declared_branch.index(
+                    "rollback_ok=0", failure_else)
+
+                self.assertLess(supported - declared, failure_else)
+                self.assertGreater(invalid, failure_else)
+                self.assertNotIn("rollback_legacy=1", declared_branch)
+                self.assertIn(
+                    'legacy_release_allowed "${rollback_version}"',
+                    cleanup[legacy:legacy + 180],
+                )
+                self.assertIn(
+                    "rollback_legacy=1", cleanup[legacy:legacy + 220])
+
+    def test_signals_flow_through_exit_cleanup_before_transaction_commit(self):
+        cases = {
+            "install.sh": "cleanup_install",
+            "updater.sh": "cleanup_failure",
+        }
+        for name, cleanup_name in cases.items():
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                cleanup = source.split(f"{cleanup_name}() {{", 1)[1].split(
+                    f"trap {cleanup_name} EXIT", 1)[0]
+                self.assertIn("trap - EXIT HUP INT TERM", cleanup)
+                self.assertIn(
+                    '[ "${transaction_committed}" -ne 1 ]', cleanup)
+                self.assertIn(f"trap {cleanup_name} EXIT", source)
+                self.assertIn("trap 'exit 129' HUP", source)
+                self.assertIn("trap 'exit 130' INT", source)
+                self.assertIn("trap 'exit 143' TERM", source)
+                commit = source.rindex("transaction_committed=1")
+                transaction_end = source.rindex("end_install_transaction")
+                self.assertLess(commit, transaction_end)
+
+    def test_updater_fetches_replaces_and_rolls_back_decky(self):
+        source = (ROOT / "updater.sh").read_text()
+        cleanup = source.split("cleanup_failure() {", 1)[1].split(
+            "trap cleanup_failure EXIT INT TERM", 1)[0]
+
+        self.assertIn(
+            'DECKY_REPOSITORY="SteamDeckHomebrew/decky-loader"', source)
+        self.assertIn(
+            'https://api.github.com/repos/${DECKY_REPOSITORY}/releases/latest',
+            source,
+        )
+        self.assertIn(
+            'curl -fL "${decky_url}" -o "${work_dir}/PluginLoader"',
+            source,
+        )
+        self.assertIn(
+            'cp -p "${PLUGIN_LOADER_PATH}" "${loader_backup}"', source)
+        self.assertIn(
+            'cp "${work_dir}/PluginLoader" "${PLUGIN_LOADER_PATH}"', source)
+        self.assertIn(
+            'cp -p "${loader_backup}" "${PLUGIN_LOADER_PATH}"', cleanup)
+        self.assertIn(
+            'cp -p "${loader_version_backup}" \\', cleanup)
+        self.assertIn('"${PLUGIN_LOADER_VERSION_FILE}"; then', cleanup)
+
     def test_documentation_describes_runtime_guard_not_update_recovery(self):
         readme = (ROOT / "README.md").read_text()
         changelog = (ROOT / "CHANGELOG.md").read_text()
@@ -741,7 +1138,10 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
             "maintenance takes the lifecycle helper's exact",
             "/run/lock/rk-enhanced-plugin-loader-recovery.lock",
             "/run/rk-enhanced-plugin-loader-recovery.active",
-            "held across file replacement and bounded startup verification",
+            "held across stop, file replacement, and the tentative service start",
+            "released so the new backend can publish its lifecycle generation",
+            "install-transaction lock remains held throughout readiness verification",
+            "rollback, preventing overlapping installs",
         ):
             self.assertIn(phrase, readme)
         self.assertIn("out-of-cgroup runtime watchdog", changelog)
@@ -852,11 +1252,71 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         index = (ROOT / "src" / "index.tsx").read_text()
 
         self.assertIn("alwaysRender: true", index)
-        self.assertIn("const panelVisible = useQuickAccessVisible();", content)
+        self.assertIn(
+            "useQuickAccessVisible as useLegacyQuickAccessVisible", content)
+        self.assertIn(
+            "useQuickAccessVisible as useLoaderQuickAccessVisible", content)
+        self.assertIn(
+            'typeof useLoaderQuickAccessVisible === "function"', content)
+        self.assertIn(": useLegacyQuickAccessVisible;", content)
+        self.assertIn(
+            "const panelVisible = useQuickAccessVisibleCompat();", content)
         self.assertIn(
             'active={panelVisible && tab === "Monitor"}', content)
         self.assertIn(
             'active={panelVisible && tab === "Experimental"}', content)
+
+    def test_frontend_reports_readiness_after_committed_state_hydration(self):
+        content = (ROOT / "src" / "Content.tsx").read_text()
+        backend = (ROOT / "src" / "backend.ts").read_text()
+
+        hydrated = content.index(
+            "const frontendHydrated = state !== null && draft !== null;")
+        effect = content.index("useEffect(() => {", hydrated)
+        hydration_guard = content.index(
+            "if (!frontendHydrated) return;", effect)
+        report = content.index(
+            "reportFrontendReady(frontendBundleId)", effect)
+        self.assertLess(hydrated, effect)
+        self.assertLess(effect, hydration_guard)
+        self.assertLess(hydration_guard, report)
+        self.assertIn("}, [frontendHydrated]);", content[report:report + 500])
+        load = content.index("const load = useCallback(async () => {")
+        load_end = content.index("}, [selected]);", load)
+        load_source = content[load:load_end]
+        get_state = content.index("const next = await getState();", load)
+        set_state = content.index("setState(next);", get_state)
+        set_draft = content.index("setDraft(clone(next.presets[wanted]));", set_state)
+        self.assertLess(get_state, set_state)
+        self.assertLess(set_state, set_draft)
+        self.assertIn("return true;", load_source)
+        self.assertIn("return false;", load_source)
+
+        boot_effect = content.index("useEffect(() => {", load_end)
+        boot_end = content.index("}, []);", boot_effect)
+        boot_source = content[boot_effect:boot_end]
+        self.assertIn("let cancelled = false;", boot_source)
+        self.assertIn(
+            "for (let attempt = 0; attempt < 45 && !cancelled; attempt += 1)",
+            boot_source,
+        )
+        self.assertIn("if (await load()) return;", boot_source)
+        self.assertIn("if (attempt < 44)", boot_source)
+        self.assertIn(
+            "await new Promise(resolve => window.setTimeout(resolve, 1000));",
+            boot_source,
+        )
+        self.assertIn("return () => { cancelled = true; };", boot_source)
+        self.assertIn(
+            'import { frontendBundleId } from "./frontendIntegrity";', content)
+        self.assertIn(
+            "for (let attempt = 0; attempt < 240 && !cancelled;", content)
+        self.assertIn("if (ready !== false) return;", content)
+        self.assertIn("return () => { cancelled = true; };", content)
+        self.assertIn(
+            'call<[string], boolean | null>("report_frontend_ready", buildId)',
+            backend,
+        )
 
     def test_monitor_always_renders_policy_failure_or_unsupported_state(self):
         monitor = (ROOT / "src" / "Monitor.tsx").read_text()

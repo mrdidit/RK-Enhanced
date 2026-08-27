@@ -1,13 +1,15 @@
 import {
   ButtonItem, ConfirmModal, DropdownItem, Field, PanelSection, PanelSectionRow,
   showModal, SliderField, Tabs, TextField,
+  useQuickAccessVisible as useLegacyQuickAccessVisible,
 } from "@decky/ui";
-import { useQuickAccessVisible } from "@decky/api";
+import { useQuickAccessVisible as useLoaderQuickAccessVisible } from "@decky/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
-import { activateGame, assignGame, deletePreset, getDeviceNetworkInfo, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
+import { activateGame, assignGame, deletePreset, getDeviceNetworkInfo, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, reportFrontendReady, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
 import { Experimental } from "./Experimental";
 import { currentGame } from "./game";
+import { frontendBundleId } from "./frontendIntegrity";
 import { Monitor } from "./Monitor";
 import { RGB } from "./RGB";
 import { Logs } from "./Logs";
@@ -15,6 +17,10 @@ import { styles } from "./styles";
 import type { DeviceNetworkInfo, GameRef, HardwareProfile, State, Telemetry, UpdateInfo } from "./types";
 
 const DEFAULT = "RK-E Default";
+const useQuickAccessVisibleCompat =
+  typeof useLoaderQuickAccessVisible === "function"
+    ? useLoaderQuickAccessVisible
+    : useLegacyQuickAccessVisible;
 const option = (data: string | number, label?: string) => ({ data, label: label ?? String(data) });
 const cpuMhz = (khz: number) => `${Math.round(khz / 1000)} MHz`;
 const gpuMhz = (hz: number) => `${Math.round(hz / 1_000_000)} MHz`;
@@ -65,7 +71,7 @@ const FrequencyLabel = ({ name, value }: { name: string; value: string }) =>
   <span className="rke-frequency-label"><span>{name}</span><span>{value}</span></span>;
 
 export function Content() {
-  const panelVisible = useQuickAccessVisible();
+  const panelVisible = useQuickAccessVisibleCompat();
   const [tab, setTab] = useState("Monitor");
   const [tabBarFocused, setTabBarFocused] = useState(false);
   const [state, setState] = useState<State | null>(null);
@@ -88,6 +94,23 @@ export function Content() {
   const [showExperimentalUnlock, setShowExperimentalUnlock] = useState(false);
   const performanceTopRef = useRef<HTMLDivElement>(null);
   const fanTopRef = useRef<HTMLDivElement>(null);
+  const frontendHydrated = state !== null && draft !== null;
+
+  useEffect(() => {
+    if (!frontendHydrated) return;
+    let cancelled = false;
+    const report = async () => {
+      for (let attempt = 0; attempt < 240 && !cancelled; attempt += 1) {
+        try {
+          const ready = await reportFrontendReady(frontendBundleId);
+          if (ready !== false) return;
+        } catch (_) {}
+        await new Promise(resolve => window.setTimeout(resolve, 500));
+      }
+    };
+    void report();
+    return () => { cancelled = true; };
+  }, [frontendHydrated]);
 
   const installState = useCallback((next: State, preferred?: string) => {
     setState(next);
@@ -108,16 +131,26 @@ export function Content() {
       setSystemCurve(clone(next.system_fan_curve));
       setGame(currentGame());
       setMessage("");
-    } catch (error) { setMessage(String(error)); }
+      return true;
+    } catch (error) {
+      setMessage(String(error));
+      return false;
+    }
   }, [selected]);
 
   useEffect(() => {
+    let cancelled = false;
     const boot = async () => {
       const running = currentGame();
       try { await activateGame(running?.appid || ""); } catch (_) {}
-      await load();
+      for (let attempt = 0; attempt < 45 && !cancelled; attempt += 1) {
+        if (await load()) return;
+        if (attempt < 44)
+          await new Promise(resolve => window.setTimeout(resolve, 1000));
+      }
     };
     void boot();
+    return () => { cancelled = true; };
   }, []);
   useEffect(() => {
     let appid = game?.appid || "";

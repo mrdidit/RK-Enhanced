@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.2.0-beta.8 — 2026-08-27
+
+### Decky compatibility
+
+- Falls back to Decky's legacy UI visibility hook when Loader API v2 is not
+  available, so RK-Enhanced can render long enough to recover an older Decky
+  installation instead of failing on `useQuickAccessVisible`.
+- Makes every new full install and every update initiated by this release fetch
+  and validate the latest stable Decky Loader alongside the selected
+  RK-Enhanced release.
+
+### Verified installation and rollback
+
+- Treats Decky and RK-Enhanced replacement as one serialized transaction with
+  separate transaction and lifecycle-maintenance locks.
+- Replaces service-active-only success with a nonce-bound backend/frontend
+  handshake tied to release version, boot, exact backend and bundle hashes,
+  frontend self-integrity, a ready lifecycle guard, and live
+  PluginLoader/backend process generations.
+- Requires an update started from the plugin UI to reach the new frontend's
+  first hydrated React commit after `getState()` succeeds; a fresh SSH install
+  verifies the backend because Steam may not be running.
+- Retries initial state hydration for a bounded window so a brief RPC startup
+  race does not cause an otherwise healthy update to roll back.
+- Revalidates live artifacts and identical process identities across stable
+  samples before recording the installed version.
+- Restores both the previous plugin and Decky executable on failure, validates
+  a protocol-aware restored backend, labels legacy rollback as unverified, and
+  preserves unique recovery files if safe rollback cannot complete.
+- Handles interruption signals as failures, acquires the lifecycle lock before
+  every rollback mutation, and never performs unlocked cleanup of live files.
+
+### Packaging
+
+- Stamps the IIFE bundle with a normalized SHA-256 identity and packages an
+  independently verified frontend-integrity manifest.
+- Publishes explicit install-health protocol metadata and checks both files in
+  CI and on the handheld before replacement begins.
+
 ## v0.2.0-beta.7 — 2026-08-26
 
 ### Interface

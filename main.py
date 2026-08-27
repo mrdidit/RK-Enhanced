@@ -3,11 +3,13 @@
 import asyncio
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import importlib.util
 import ipaddress
 import json
 import math
 import os
+import re
 import secrets
 import signal
 import shutil
@@ -51,6 +53,10 @@ LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default", "Steam Default")
 SETTINGS_FILE = "settings.json"
 UPDATE_STATUS_FILE = "update-status.txt"
 INSTALLED_VERSION_FILE = "installed-version.txt"
+INSTALL_HEALTH_REQUEST_FILE = "install-health-request.json"
+INSTALL_BACKEND_READY_FILE = "install-backend-ready.json"
+INSTALL_FRONTEND_READY_FILE = "install-frontend-ready.json"
+INSTALL_HEALTH_PROTOCOL = 1
 UPDATE_REPOSITORY = "mrdidit/RK-Enhanced"
 FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
@@ -237,6 +243,42 @@ def _atomic_text(path, content):
         handle.write(content)
         temporary = Path(handle.name)
     temporary.replace(path)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _frontend_bundle_id(plugin_dir):
+    """Validate and identify the exact built frontend artifact."""
+    plugin_dir = Path(plugin_dir)
+    index_path = plugin_dir / "dist" / "index.js"
+    manifest_path = plugin_dir / "dist" / "frontend-integrity.json"
+    try:
+        bundle = index_path.read_bytes()
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+    pattern = re.compile(br"rke-frontend-sha256-v1:([0-9a-f]{64})")
+    matches = list(pattern.finditer(bundle))
+    if len(matches) != 1 or not isinstance(manifest, dict):
+        return ""
+    match = matches[0]
+    digest = match.group(1).decode("ascii")
+    normalized = (
+        bundle[:match.start(1)] + (b"0" * 64) + bundle[match.end(1):])
+    bundle_id = match.group(0).decode("ascii")
+    if (hashlib.sha256(normalized).hexdigest() != digest or
+            manifest.get("protocol") != 1 or
+            manifest.get("algorithm") != "sha256-normalized-v1" or
+            manifest.get("bundle_id") != bundle_id or
+            manifest.get("index_sha256") != hashlib.sha256(bundle).hexdigest()):
+        return ""
+    return bundle_id
 
 
 @contextmanager
@@ -585,6 +627,13 @@ class Plugin:
         settings = os.environ.get("DECKY_PLUGIN_SETTINGS_DIR")
         self.settings_dir = Path(settings) if settings else Path(__file__).resolve().parent / "settings"
         self.settings_path = self.settings_dir / SETTINGS_FILE
+        self.install_health_request_path = (
+            self.settings_dir / INSTALL_HEALTH_REQUEST_FILE)
+        self.install_backend_ready_path = (
+            self.settings_dir / INSTALL_BACKEND_READY_FILE)
+        self.install_frontend_ready_path = (
+            self.settings_dir / INSTALL_FRONTEND_READY_FILE)
+        self.install_health_response = None
         self.legacy_fan_guard_marker = self.settings_dir / "fan-curve-session.active"
         self.runtime_marker = self.settings_dir / "runtime-session.active"
         self.runtime_restore_request = (
@@ -629,6 +678,127 @@ class Plugin:
         self.lifecycle_active_path = None
         self.lifecycle_heartbeat_path = None
         self.lifecycle_ready_path = None
+
+    def _plugin_version(self):
+        plugin_dir = Path(__file__).resolve().parent
+        version = _read(plugin_dir / "VERSION")
+        if version:
+            return version
+        try:
+            metadata = json.loads((plugin_dir / "plugin.json").read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            return ""
+        return str(metadata.get("version", "")).strip()
+
+    def _install_health_request(self):
+        try:
+            request = json.loads(self.install_health_request_path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(request, dict):
+            return None
+        nonce = request.get("nonce")
+        if (request.get("protocol") != INSTALL_HEALTH_PROTOCOL or
+                not isinstance(nonce, str) or not 16 <= len(nonce) <= 128):
+            return None
+        return request
+
+    def _publish_backend_install_health(self):
+        """Answer only the exact, co-located installer health challenge."""
+        request = self._install_health_request()
+        if request is None:
+            self.install_health_response = None
+            return None
+
+        plugin_dir = Path(__file__).resolve().parent
+        version = self._plugin_version()
+        boot_id = _read("/proc/sys/kernel/random/boot_id")
+        main_hash = _sha256_file(plugin_dir / "main.py")
+        dist_hash = _sha256_file(plugin_dir / "dist" / "index.js")
+        frontend_bundle_id = _frontend_bundle_id(plugin_dir)
+        require_frontend = request.get("require_frontend")
+        expected = {
+            "version": version,
+            "boot_id": boot_id,
+            "main_sha256": main_hash,
+            "dist_sha256": dist_hash,
+            "frontend_bundle_id": frontend_bundle_id,
+            "require_frontend": require_frontend,
+        }
+        if (not re.fullmatch(
+                r"rke-frontend-sha256-v1:[0-9a-f]{64}",
+                frontend_bundle_id) or
+                not re.fullmatch(r"[0-9a-f]{32}", self.lifecycle_token) or
+                not isinstance(require_frontend, bool) or
+                any(request.get(key) != value for key, value in expected.items())):
+            decky.logger.error(
+                "Install health challenge does not match the running release")
+            self.install_health_response = None
+            return False
+
+        try:
+            loader_pid = int(_run([
+                "systemctl", "show", "--property=MainPID", "--value",
+                PLUGIN_LOADER_SERVICE,
+            ], timeout=3) or "0")
+        except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+            loader_pid = 0
+        backend = _process_identity(os.getpid())
+        loader = _process_identity(loader_pid)
+        if backend is None or loader is None:
+            decky.logger.error(
+                "Install health could not identify the backend and PluginLoader")
+            self.install_health_response = None
+            return False
+
+        response = {
+            "protocol": INSTALL_HEALTH_PROTOCOL,
+            "nonce": request["nonce"],
+            **expected,
+            "backend": backend,
+            "loader": loader,
+            "lifecycle_token": self.lifecycle_token,
+            "ready_at": int(time.time()),
+        }
+        _atomic_text(
+            self.install_backend_ready_path,
+            json.dumps(response, indent=2, sort_keys=True) + "\n",
+        )
+        self.install_backend_ready_path.chmod(0o600)
+        self.install_health_response = response
+        return True
+
+    async def report_frontend_ready(self, build_id):
+        """Confirm that the exact frontend committed hydrated plugin state."""
+        def work():
+            request = self._install_health_request()
+            if request is None:
+                return None
+            response = self.install_health_response
+            bound_fields = (
+                "protocol", "nonce", "version", "boot_id", "main_sha256",
+                "dist_sha256", "frontend_bundle_id", "require_frontend",
+            )
+            if (not isinstance(response, dict) or
+                    any(response.get(key) != request.get(key)
+                        for key in bound_fields) or
+                    not isinstance(build_id, str) or
+                    build_id != request.get("frontend_bundle_id") or
+                    build_id != response.get("frontend_bundle_id") or
+                    build_id != _frontend_bundle_id(
+                        Path(__file__).resolve().parent)):
+                return False
+            payload = {
+                **response,
+                "frontend_ready_at": int(time.time()),
+            }
+            _atomic_text(
+                self.install_frontend_ready_path,
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            )
+            self.install_frontend_ready_path.chmod(0o600)
+            return True
+        return await asyncio.to_thread(work)
 
     def _load(self):
         try:
@@ -1970,7 +2140,7 @@ class Plugin:
                          f"Starting installation of {requested}…\n")
             _run(["systemctl", "reset-failed", "rk-enhanced-update.service"], check=False)
             _run(["systemd-run", "--unit=rk-enhanced-update", "--collect",
-                  str(target), requested])
+                  str(target), requested, "require-frontend"])
             decky.logger.info(f"Detached release installation started: {requested}")
             return True
         return await asyncio.to_thread(work)
@@ -2026,6 +2196,15 @@ class Plugin:
                 self.lifecycle_heartbeat_task = None
             raise
         self.game_watch_task = asyncio.create_task(self._game_watch_loop())
+        decky.logger.info("RK-Enhanced backend ready")
+        # A stale request can survive an interrupted install or a reboot. It
+        # must withhold readiness from that installer, never prevent an
+        # otherwise valid plugin generation from starting normally.
+        try:
+            await asyncio.to_thread(self._publish_backend_install_health)
+        except Exception:
+            decky.logger.exception(
+                "Install health response was withheld; plugin startup continues")
 
     async def _unload(self):
         # Mark this generation clean before doing any other unload work. The
