@@ -699,6 +699,24 @@ class FrontendIntegrityPackagingTests(unittest.TestCase):
         self.assertIn("pnpm verify:frontend", workflow)
         self.assertIn("install-health.json", workflow)
 
+    def test_tag_release_uses_descriptive_title_and_visible_changelog(self):
+        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+        notes = (ROOT / "RELEASE_NOTES.md").read_text()
+
+        self.assertIn(
+            "name: RK-Enhanced ${{ github.ref_name }} — Reliable unattended updates",
+            workflow,
+        )
+        self.assertIn("body_path: RELEASE_NOTES.md", workflow)
+        self.assertNotIn("generate_release_notes: true", workflow)
+        self.assertIn("## Changelog", notes)
+        self.assertIn("**From beta.8:**", notes)
+        self.assertIn("**From beta.7 or older:**", notes)
+        self.assertIn(
+            "curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh",
+            notes,
+        )
+
 
 class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
     def test_release_build_compiles_packages_and_marks_recovery_executable(self):
@@ -1266,28 +1284,57 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertIn(
             'active={panelVisible && tab === "Experimental"}', content)
 
-    def test_frontend_reports_readiness_after_committed_state_hydration(self):
+    def test_frontend_reports_readiness_from_registered_bundle_after_state_rpc(self):
         content = (ROOT / "src" / "Content.tsx").read_text()
+        index = (ROOT / "src" / "index.tsx").read_text()
+        readiness = (ROOT / "src" / "installReadiness.ts").read_text()
         backend = (ROOT / "src" / "backend.ts").read_text()
 
-        hydrated = content.index(
-            "const frontendHydrated = state !== null && draft !== null;")
-        effect = content.index("useEffect(() => {", hydrated)
-        hydration_guard = content.index(
-            "if (!frontendHydrated) return;", effect)
-        report = content.index(
-            "reportFrontendReady(frontendBundleId)", effect)
-        self.assertLess(hydrated, effect)
-        self.assertLess(effect, hydration_guard)
-        self.assertLess(hydration_guard, report)
-        self.assertIn("}, [frontendHydrated]);", content[report:report + 500])
+        self.assertNotIn("reportFrontendReady", content)
+        self.assertNotIn("frontendBundleId", content)
+        self.assertNotIn("frontendHydrated", content)
+        self.assertIn(
+            'import { startInstallReadinessProbe } from "./installReadiness";',
+            index,
+        )
+        descriptor = index.index("const plugin = {")
+        start = index.index(
+            "cancelInstallReadiness = startInstallReadinessProbe();")
+        returned = index.index("return plugin;", start)
+        self.assertLess(descriptor, start)
+        self.assertLess(start, returned)
+        self.assertIn(
+            "onDismount: () => cancelInstallReadiness(),", index)
+
+        get_state = readiness.index("const state = await getState();")
+        validate_state = readiness.index(
+            'throw new Error("RK-Enhanced returned an invalid initial state")')
+        report = readiness.index(
+            "reportFrontendReady(frontendBundleId)", validate_state)
+        self.assertLess(get_state, validate_state)
+        self.assertLess(validate_state, report)
+        self.assertIn(
+            "for (let attempt = 0; attempt < 240 && !cancelled;",
+            readiness,
+        )
+        self.assertIn("if (cancelled) return;", readiness)
+        self.assertIn("if (cancelled || ready !== false) return;", readiness)
+        self.assertIn("cancelActiveProbe?.();", readiness)
+        self.assertIn("return cancel;", readiness)
+        self.assertIn(
+            "await new Promise(resolve => window.setTimeout(resolve, 500));",
+            readiness,
+        )
+
+        # The visible panel keeps its independent bounded hydration retry, but
+        # install success no longer depends on this React tree mounting.
         load = content.index("const load = useCallback(async () => {")
         load_end = content.index("}, [selected]);", load)
         load_source = content[load:load_end]
-        get_state = content.index("const next = await getState();", load)
-        set_state = content.index("setState(next);", get_state)
+        panel_get_state = content.index("const next = await getState();", load)
+        set_state = content.index("setState(next);", panel_get_state)
         set_draft = content.index("setDraft(clone(next.presets[wanted]));", set_state)
-        self.assertLess(get_state, set_state)
+        self.assertLess(panel_get_state, set_state)
         self.assertLess(set_state, set_draft)
         self.assertIn("return true;", load_source)
         self.assertIn("return false;", load_source)
@@ -1308,11 +1355,9 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         )
         self.assertIn("return () => { cancelled = true; };", boot_source)
         self.assertIn(
-            'import { frontendBundleId } from "./frontendIntegrity";', content)
-        self.assertIn(
-            "for (let attempt = 0; attempt < 240 && !cancelled;", content)
-        self.assertIn("if (ready !== false) return;", content)
-        self.assertIn("return () => { cancelled = true; };", content)
+            'import { frontendBundleId } from "./frontendIntegrity";',
+            readiness,
+        )
         self.assertIn(
             'call<[string], boolean | null>("report_frontend_ready", buildId)',
             backend,

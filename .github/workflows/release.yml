@@ -42,5 +42,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: release/RK-Enhanced.zip
-          generate_release_notes: true
+          name: RK-Enhanced ${{ github.ref_name }} — Reliable unattended updates
+          body_path: RELEASE_NOTES.md
           prerelease: ${{ contains(github.ref_name, '-') }}

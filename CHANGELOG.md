@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.0-beta.9 — 2026-08-27
+
+### Reliable unattended update verification
+
+- Moves the install-readiness probe from the Quick Access React panel to the
+  registered frontend bundle's startup lifecycle, so a Decky reload no longer
+  depends on reopening RK-Enhanced within the verification timeout.
+- Still requires the exact integrity-stamped frontend bundle to execute and
+  complete a successful `getState()` round trip before it can acknowledge the
+  nonce-bound candidate backend.
+- Cancels the bounded startup probe when Decky dismounts that plugin
+  generation, preventing a retired frontend from continuing readiness RPCs.
+- Keeps beta.8's install-health protocol and transactional rollback format so
+  the beta.8 updater can safely install beta.9.
+
+### Release presentation
+
+- Uses descriptive GitHub release titles and places a visible changelog in the
+  release body instead of relying on a buried compare link.
+
 ## v0.2.0-beta.8 — 2026-08-27
 
 ### Decky compatibility

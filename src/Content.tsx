@@ -6,10 +6,9 @@ import {
 import { useQuickAccessVisible as useLoaderQuickAccessVisible } from "@decky/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
-import { activateGame, assignGame, deletePreset, getDeviceNetworkInfo, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, reportFrontendReady, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
+import { activateGame, assignGame, deletePreset, getDeviceNetworkInfo, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
 import { Experimental } from "./Experimental";
 import { currentGame } from "./game";
-import { frontendBundleId } from "./frontendIntegrity";
 import { Monitor } from "./Monitor";
 import { RGB } from "./RGB";
 import { Logs } from "./Logs";
@@ -94,24 +93,6 @@ export function Content() {
   const [showExperimentalUnlock, setShowExperimentalUnlock] = useState(false);
   const performanceTopRef = useRef<HTMLDivElement>(null);
   const fanTopRef = useRef<HTMLDivElement>(null);
-  const frontendHydrated = state !== null && draft !== null;
-
-  useEffect(() => {
-    if (!frontendHydrated) return;
-    let cancelled = false;
-    const report = async () => {
-      for (let attempt = 0; attempt < 240 && !cancelled; attempt += 1) {
-        try {
-          const ready = await reportFrontendReady(frontendBundleId);
-          if (ready !== false) return;
-        } catch (_) {}
-        await new Promise(resolve => window.setTimeout(resolve, 500));
-      }
-    };
-    void report();
-    return () => { cancelled = true; };
-  }, [frontendHydrated]);
-
   const installState = useCallback((next: State, preferred?: string) => {
     setState(next);
     const wanted = preferred && next.presets[preferred] ? preferred

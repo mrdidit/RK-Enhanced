@@ -769,7 +769,7 @@ class Plugin:
         return True
 
     async def report_frontend_ready(self, build_id):
-        """Confirm that the exact frontend committed hydrated plugin state."""
+        """Confirm that the exact loaded frontend completed a state RPC."""
         def work():
             request = self._install_health_request()
             if request is None:
