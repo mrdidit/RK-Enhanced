@@ -1,42 +1,41 @@
-Beta.9 corrects the final user-interaction dependency in beta.8's verified
-update path. Decky can now reload, validate RK-Enhanced, and finish the update
-without Quick Access or the plugin panel being reopened.
+Beta.10 fixes installation failures caused by replacing a compatible Decky
+prerelease with an older stable Loader. It is a focused installer hotfix; the
+ongoing Pocket EVO RGB and runtime-diagnostics work is not included.
 
 ## Changelog
 
-- Moves install readiness from the Quick Access React panel to the registered
-  frontend bundle's startup lifecycle.
-- Requires the exact integrity-stamped bundle to execute and complete a real
-  `getState()` round trip before acknowledging the candidate backend.
-- Cancels the bounded readiness probe when Decky dismounts that frontend
-  generation.
-- Retains beta.8's nonce, bundle/backend hash, process-generation, lifecycle,
-  transaction, and rollback checks.
-- Continues to fetch and validate the latest stable Decky Loader during every
-  install, update, and reinstall started by beta.8 or later.
-- Uses descriptive GitHub release names and a visible release changelog.
+- Selects Decky's newest non-draft published release containing `PluginLoader`,
+  including compatibility prereleases.
+- Validates the Decky download, RK-Enhanced package, and integrity-stamped
+  frontend before replacing the installed components.
+- Requires matching backend and frontend readiness when Steam Big Picture is
+  active. The RK-Enhanced panel does not need to be open.
+- Performs backend-only verification when Steam Big Picture is inactive and
+  explicitly says that the frontend was not tested.
+- Retains transactional backup and rollback of RK-Enhanced, Decky, and their
+  recorded versions when required readiness is not reached.
 
 ## Updating
 
-- **From beta.8:** use RK-Enhanced's normal Update action. No panel reopening is
-  required after Decky reloads.
-- **From beta.7 or older:** run the full installer once because those older
-  updaters cannot refresh Decky as part of the first transition:
+- **From beta.9 or older:** run the full installer once. The updater that starts
+  an in-plugin update comes from the currently installed release and does not
+  yet use beta.10's prerelease-aware Decky selection before replacement.
 
   ```sh
   curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh
   ```
 
-After beta.9 is installed, future Update and Reinstall actions refresh stable
-Decky automatically.
+After beta.10 is installed, future Update, Reinstall, and Downgrade actions use
+the corrected Decky selection automatically.
 
 ## Validation
 
-- 191 local regression tests pass.
-- TypeScript, Python, POSIX shell, frontend-integrity, source-map, packaging,
-  transaction, and rollback checks pass.
-- A beta.8 to beta.9 upgrade on the Pocket FIT Elite with Decky v3.2.6 passed
-  exact backend/frontend readiness without any post-reload panel interaction.
+- The Python regression suite, TypeScript checks, POSIX shell validation,
+  frontend integrity, source-map verification, packaging, and rollback
+  contracts pass.
+- The full installer was exercised on a Pocket EVO with Steam active and Decky
+  `v3.2.8-pre1`; exact backend/frontend readiness passed without opening the
+  RK-Enhanced panel.
 
 This remains a pre-release. Bugs and device-specific gaps are still expected;
 reports with logs from `/storage/homebrew/logs/RK-Enhanced/` are welcome.

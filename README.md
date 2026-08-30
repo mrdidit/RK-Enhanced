@@ -242,8 +242,8 @@ Release discovery includes GitHub pre-releases.
 
 Updates are installed by a detached updater that:
 
-1. Downloads and validates the selected RK-Enhanced release and the latest
-   stable Decky Loader.
+1. Downloads and validates the selected RK-Enhanced release and the newest
+   published Decky Loader, including compatibility prereleases.
 2. Creates unique rollback copies of both installed components and their
    version metadata.
 3. Replaces RK-Enhanced and Decky as one serialized transaction.
@@ -260,11 +260,13 @@ from the exact frontend bundle after Decky evaluates and registers that bundle
 and it completes a successful `getState()` round trip. This startup proof is
 independent of whether Quick Access or the RK-Enhanced panel is open. It proves
 bundle execution and backend communication, not that a particular panel is
-currently visible. The check also binds release version, boot ID, live process
-start times, backend hash, bundle hash, and the bundle's independently verified
-self-integrity ID. A fresh SSH install requires backend readiness only because
-Steam may be closed. Neither path records the new installed version merely
-because the systemd unit became active.
+currently visible. A full SSH install applies the same frontend proof whenever
+Steam Big Picture is active. When Steam Big Picture is inactive, it reports
+that only the backend was verified and the frontend was not tested, rather than
+implying a deferred check. The check also binds release version, boot ID,
+live process start times, backend hash, bundle hash, and the bundle's
+independently verified self-integrity ID. Neither path records the new installed
+version merely because the systemd unit became active.
 
 Installer and updater shutdown is bounded and scoped to
 `plugin_loader.service`: they request a non-blocking stop, wait up to 15
@@ -596,18 +598,23 @@ Run the installer as `root` on the ROCKNIX device:
 curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh
 ```
 
-The installer retrieves the latest published RK-Enhanced release, including
-pre-releases, and refreshes Decky Loader from its latest stable release every
-time. Review `install.sh` before piping it into a shell.
+The installer retrieves the latest published RK-Enhanced release and Decky
+Loader, including prereleases. Decky prereleases are included because current
+Steam builds can require compatibility fixes not yet present in Decky's latest
+stable build. Review `install.sh` before piping it into a shell.
 
-The updater bundled with `v0.2.0-beta.7` predates coordinated Decky updates.
-When moving from beta.7 or older to beta.9, run the full installer above once.
-Beta.8 can install beta.9 through its normal Update action because the staged
-beta.9 bundle supplies its readiness proof automatically. Updates initiated by
-beta.9 and later refresh Decky and verify the new frontend without requiring
-the panel to be reopened. The legacy visibility-hook fallback remains in place
-so an older Loader cannot prevent RK-Enhanced from rendering during this
-transition.
+When moving from beta.9 or earlier to beta.10, run the full installer above
+once. An in-plugin update is started by the updater from the currently
+installed release, so the older updater does not yet use beta.10's
+prerelease-aware Decky selection before replacement begins. If the selected
+Loader is incompatible, readiness verification rejects it and restores the
+previous installation instead of recording a false success.
+
+After beta.10 is installed, future Update, Reinstall, and Downgrade actions use
+the corrected Decky selection automatically. Frontend readiness is verified
+without requiring Quick Access or the RK-Enhanced panel to be open. The legacy
+visibility-hook fallback remains in place so an older Loader cannot prevent
+RK-Enhanced from rendering during this transition.
 
 Manual layout:
 

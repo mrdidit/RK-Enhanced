@@ -704,14 +704,13 @@ class FrontendIntegrityPackagingTests(unittest.TestCase):
         notes = (ROOT / "RELEASE_NOTES.md").read_text()
 
         self.assertIn(
-            "name: RK-Enhanced ${{ github.ref_name }} — Reliable unattended updates",
+            "name: RK-Enhanced ${{ github.ref_name }} — Compatible Decky installation",
             workflow,
         )
         self.assertIn("body_path: RELEASE_NOTES.md", workflow)
         self.assertNotIn("generate_release_notes: true", workflow)
         self.assertIn("## Changelog", notes)
-        self.assertIn("**From beta.8:**", notes)
-        self.assertIn("**From beta.7 or older:**", notes)
+        self.assertIn("**From beta.9 or older:**", notes)
         self.assertIn(
             "curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh",
             notes,

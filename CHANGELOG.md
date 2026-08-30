@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.2.0-beta.10 — 2026-08-30
+
+### Compatible Decky installation
+
+- Selects Decky's newest published Loader build, including prereleases, instead
+  of silently replacing a compatible installation with an older stable build.
+- Fixes missing Decky UI on newer Steam clients that require Decky's renamed
+  Steam-initialization API compatibility update.
+- Makes a full SSH install require both backend and frontend readiness whenever
+  Steam Big Picture is active. When Steam Big Picture is inactive, success
+  explicitly says the frontend was not tested.
+- Keeps RK-Enhanced and Decky replacement transactional: a failed readiness
+  check restores both previous components and their recorded versions.
+- Requires beta.9 and earlier installations to use the full SSH installer once;
+  subsequent in-plugin updates use the corrected Decky selection automatically.
+
 ## v0.2.0-beta.9 — 2026-08-27
 
 ### Reliable unattended update verification
