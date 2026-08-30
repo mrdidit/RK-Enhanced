@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# RK-Enhanced + stable Decky installer for ROCKNIX.
+# RK-Enhanced + compatible Decky installer for ROCKNIX.
 
 set -eu
 
@@ -30,6 +30,7 @@ maintenance_active=0
 transaction_active=0
 health_created=0
 transaction_committed=0
+frontend_requirement=""
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "RK-Enhanced installer must run as root." >&2
@@ -252,6 +253,7 @@ legacy_release_allowed() {
 
 write_install_health_request() {
     rke_health_version="$1"
+    rke_health_frontend="$2"
     rke_health_nonce="$(cat "${PROC_ROOT}/sys/kernel/random/uuid" 2>/dev/null)" || return 1
     rke_health_boot_id="$(cat "${PROC_ROOT}/sys/kernel/random/boot_id" 2>/dev/null)" || return 1
     rke_health_main_hash="$(sha256sum "${PLUGINS_DIR}/RK-Enhanced/main.py" | cut -d' ' -f1)" || return 1
@@ -259,6 +261,10 @@ write_install_health_request() {
     rke_health_bundle_id="$(frontend_integrity_id \
         "${PLUGINS_DIR}/RK-Enhanced")" || return 1
     [ -n "${rke_health_nonce}" ] && [ -n "${rke_health_boot_id}" ] || return 1
+    case "${rke_health_frontend}" in
+        require-frontend) rke_health_frontend_json=true ;;
+        *) rke_health_frontend_json=false ;;
+    esac
     rke_health_temporary="$(mktemp "${SETTINGS_DIR}/install-health-request.XXXXXX")" || return 1
     if ! jq -n \
         --arg nonce "${rke_health_nonce}" \
@@ -267,10 +273,11 @@ write_install_health_request() {
         --arg main_sha256 "${rke_health_main_hash}" \
         --arg dist_sha256 "${rke_health_dist_hash}" \
         --arg frontend_bundle_id "${rke_health_bundle_id}" \
+        --argjson require_frontend "${rke_health_frontend_json}" \
         '{protocol: 1, nonce: $nonce, version: $version, boot_id: $boot_id,
           main_sha256: $main_sha256, dist_sha256: $dist_sha256,
           frontend_bundle_id: $frontend_bundle_id,
-          require_frontend: false}' > "${rke_health_temporary}"; then
+          require_frontend: $require_frontend}' > "${rke_health_temporary}"; then
         rm -f "${rke_health_temporary}"
         return 1
     fi
@@ -287,6 +294,7 @@ write_install_health_request() {
     HEALTH_MAIN_HASH="${rke_health_main_hash}"
     HEALTH_DIST_HASH="${rke_health_dist_hash}"
     HEALTH_BUNDLE_ID="${rke_health_bundle_id}"
+    HEALTH_REQUIRE_FRONTEND="${rke_health_frontend_json}"
     return 0
 }
 
@@ -312,13 +320,14 @@ health_response_matches() {
         --arg main_sha256 "${HEALTH_MAIN_HASH}" \
         --arg dist_sha256 "${HEALTH_DIST_HASH}" \
         --arg frontend_bundle_id "${HEALTH_BUNDLE_ID}" \
+        --argjson require_frontend "${HEALTH_REQUIRE_FRONTEND}" \
         --argjson loader_pid "${rke_health_loader_pid}" \
         --argjson loader_start "${rke_health_loader_start}" \
         '.protocol == 1 and .nonce == $nonce and .version == $version and
          .boot_id == $boot_id and .main_sha256 == $main_sha256 and
          .dist_sha256 == $dist_sha256 and
          .frontend_bundle_id == $frontend_bundle_id and
-         .require_frontend == false and
+         .require_frontend == $require_frontend and
          (.lifecycle_token | type) == "string" and
          (.lifecycle_token | test("^[0-9a-f]{32}$")) and
          .loader.pid == $loader_pid and
@@ -337,15 +346,27 @@ health_response_matches() {
 }
 
 wait_for_rke_health() {
+    rke_health_frontend_requirement="$1"
     rke_health_deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
     rke_health_stable=0
     rke_health_previous_fingerprint=""
     while [ "$(date +%s)" -lt "${rke_health_deadline}" ]; do
         rke_health_loader_pid="$(systemctl_bounded show --property=MainPID --value \
             "${PLUGIN_LOADER_UNIT}" 2>/dev/null || true)"
+        rke_health_sample=""
         if systemctl_bounded is-active --quiet "${PLUGIN_LOADER_UNIT}" && \
            health_response_matches "${BACKEND_READY_FILE}" "${rke_health_loader_pid}"; then
-            rke_health_sample="${HEALTH_RESPONSE_FINGERPRINT}"
+            rke_health_backend_fingerprint="${HEALTH_RESPONSE_FINGERPRINT}"
+            if [ "${rke_health_frontend_requirement}" != "require-frontend" ]; then
+                rke_health_sample="${rke_health_backend_fingerprint}"
+            elif health_response_matches \
+                    "${FRONTEND_READY_FILE}" "${rke_health_loader_pid}" && \
+                 [ "${HEALTH_RESPONSE_FINGERPRINT}" = \
+                    "${rke_health_backend_fingerprint}" ]; then
+                rke_health_sample="${rke_health_backend_fingerprint}"
+            fi
+        fi
+        if [ -n "${rke_health_sample}" ]; then
             if [ "${rke_health_sample}" = "${rke_health_previous_fingerprint}" ]; then
                 rke_health_stable=$((rke_health_stable + 1))
             else
@@ -462,7 +483,8 @@ cleanup_install() {
                          [ -e "${PLUGINS_DIR}/RK-Enhanced/dist/frontend-integrity.json" ]; }; then
                         if health_protocol_supported \
                                 "${PLUGINS_DIR}/RK-Enhanced" && \
-                           write_install_health_request "${rollback_version}"; then
+                           write_install_health_request \
+                               "${rollback_version}" ""; then
                             rollback_health=1
                         else
                             rollback_ok=0
@@ -481,7 +503,7 @@ cleanup_install() {
             fi
             end_plugin_loader_maintenance
             if [ "${rollback_health}" -eq 1 ]; then
-                if wait_for_rke_health; then
+                if wait_for_rke_health ""; then
                     rollback_health_verified=1
                 else
                     rollback_ok=0
@@ -532,15 +554,20 @@ if ! begin_install_transaction; then
     exit 1
 fi
 
-echo "Reading stable Decky release metadata..."
+echo "Reading the newest published Decky release metadata..."
 decky_metadata="${work_dir}/decky.json"
-curl -fL "https://api.github.com/repos/${DECKY_REPOSITORY}/releases/latest" -o "${decky_metadata}"
-decky_version="$(jq -r '.tag_name' "${decky_metadata}")"
-decky_url="$(jq -r '.assets[] | select(.name == "PluginLoader") | .browser_download_url' "${decky_metadata}")"
-decky_digest="$(jq -r '.assets[] | select(.name == "PluginLoader") | .digest // empty' "${decky_metadata}")"
+curl -fL "https://api.github.com/repos/${DECKY_REPOSITORY}/releases?per_page=20" \
+    -o "${decky_metadata}"
+decky_release_filter='[.[] | select(.draft == false) | . as $release | $release.assets[] | select(.name == "PluginLoader") | {version: $release.tag_name, url: .browser_download_url, digest: (.digest // "")}] | first'
+decky_version="$(jq -r "${decky_release_filter} | .version // empty" \
+    "${decky_metadata}")"
+decky_url="$(jq -r "${decky_release_filter} | .url // empty" \
+    "${decky_metadata}")"
+decky_digest="$(jq -r "${decky_release_filter} | .digest // empty" \
+    "${decky_metadata}")"
 
-if [ -z "${decky_version}" ] || [ "${decky_version}" = "null" ] || [ -z "${decky_url}" ]; then
-    echo "Could not resolve the latest stable Decky release." >&2
+if [ -z "${decky_version}" ] || [ -z "${decky_url}" ]; then
+    echo "Could not resolve the newest published Decky release." >&2
     exit 1
 fi
 
@@ -651,6 +678,13 @@ if [ -d "${PLUGINS_DIR}/RK-Enhanced" ]; then
     rmdir "${plugin_backup}"
 fi
 
+if systemctl_bounded is-active --quiet steam-bigpicture.scope; then
+    frontend_requirement="require-frontend"
+    echo "Steam frontend is active; Decky frontend readiness will be verified."
+else
+    echo "Steam frontend is not active; Decky frontend will not be tested by this run."
+fi
+
 echo "Stopping Decky cleanly..."
 if ! begin_plugin_loader_maintenance; then
     echo "Another PluginLoader maintenance action is running." >&2
@@ -702,7 +736,7 @@ Environment=LOG_LEVEL=INFO
 WantedBy=multi-user.target
 EOF
 
-if ! write_install_health_request "${rke_version}"; then
+if ! write_install_health_request "${rke_version}" "${frontend_requirement}"; then
     echo "Could not create a fresh RK-Enhanced install health challenge." >&2
     exit 1
 fi
@@ -720,9 +754,13 @@ fi
 # after the tentative unit is active, then verify the nonce-bound response
 # while the separate install transaction lock prevents overlapping changes.
 end_plugin_loader_maintenance
-echo "Verifying RK-Enhanced backend readiness..."
-if ! wait_for_rke_health; then
-    echo "RK-Enhanced did not pass backend readiness; rolling back." >&2
+if [ "${frontend_requirement}" = "require-frontend" ]; then
+    echo "Verifying RK-Enhanced backend and Decky frontend readiness..."
+else
+    echo "Verifying RK-Enhanced backend readiness..."
+fi
+if ! wait_for_rke_health "${frontend_requirement}"; then
+    echo "RK-Enhanced did not pass required readiness checks; rolling back." >&2
     exit 1
 fi
 installed_version_temporary="$(mktemp \
@@ -734,6 +772,10 @@ if [ "${health_created}" -eq 1 ]; then
     clear_install_health
     health_created=0
 fi
-echo "Installed Decky ${decky_version} and RK-Enhanced ${rke_version}; backend verified."
+if [ "${frontend_requirement}" = "require-frontend" ]; then
+    echo "Installed Decky ${decky_version} and RK-Enhanced ${rke_version}; backend and frontend verified."
+else
+    echo "Installed Decky ${decky_version} and RK-Enhanced ${rke_version}; backend verified, frontend not tested because Steam is inactive."
+fi
 transaction_committed=1
 end_install_transaction

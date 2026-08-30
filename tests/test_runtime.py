@@ -898,7 +898,10 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
             '[ -e "${staged}/install-health.json" ] ||', updater)
         self.assertIn(
             '[ -e "${staged}/dist/frontend-integrity.json" ]', updater)
-        self.assertIn("require_frontend: false", installer)
+        self.assertIn(
+            '--argjson require_frontend "${rke_health_frontend_json}"',
+            installer,
+        )
         self.assertIn(
             '--argjson require_frontend "${rke_health_frontend_json}"',
             updater,
@@ -915,6 +918,36 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
             '[ "${HEALTH_RESPONSE_FINGERPRINT}" = \\', updater)
         self.assertIn(
             '"${rke_health_backend_fingerprint}" ]; then', updater)
+
+        self.assertIn(
+            "systemctl_bounded is-active --quiet steam-bigpicture.scope",
+            installer,
+        )
+        self.assertIn(
+            "systemctl_bounded is-active --quiet steam-bigpicture.scope",
+            updater,
+        )
+        self.assertIn(
+            '[ -z "${frontend_requirement}" ]', updater)
+        self.assertIn(
+            'frontend_requirement="require-frontend"', installer)
+        self.assertIn(
+            'write_install_health_request "${rke_version}" '
+            '"${frontend_requirement}"',
+            installer,
+        )
+        self.assertIn(
+            'wait_for_rke_health "${frontend_requirement}"', installer)
+        self.assertIn(
+            'elif health_response_matches \\', installer)
+        self.assertIn(
+            '"${FRONTEND_READY_FILE}" "${rke_health_loader_pid}"',
+            installer,
+        )
+        self.assertIn(
+            "frontend not tested because Steam is inactive", installer)
+        self.assertIn(
+            "frontend not tested because Steam is inactive", updater)
 
     def test_updater_limits_metadata_free_releases_to_explicit_legacy_tags(self):
         source = (ROOT / "updater.sh").read_text()
@@ -968,9 +1001,7 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
                 self.assertIn("flock -n 9", source)
 
                 health_wait_marker = (
-                    "if ! wait_for_rke_health; then"
-                    if name == "install.sh"
-                    else 'if ! wait_for_rke_health "${frontend_requirement}"; then'
+                    'if ! wait_for_rke_health "${frontend_requirement}"; then'
                 )
                 health_wait = source.index(health_wait_marker)
                 release = source.rfind(
@@ -1018,7 +1049,7 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
             "install.sh": (
                 "cleanup_install() {",
                 "trap cleanup_install EXIT",
-                "wait_for_rke_health; then",
+                'wait_for_rke_health ""; then',
             ),
             "updater.sh": (
                 "cleanup_failure() {",
@@ -1038,6 +1069,15 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
                 self.assertIn(
                     '"${rollback_version}"',
                     cleanup[challenge:challenge + 120],
+                )
+                self.assertRegex(
+                    cleanup[challenge:challenge + 180],
+                    r'write_install_health_request\s+\\?\s*'
+                    r'"\$\{rollback_version\}" ""',
+                )
+                self.assertNotIn(
+                    '"${rollback_version}" "${frontend_requirement}"',
+                    cleanup[challenge:challenge + 180],
                 )
                 start = cleanup.index(
                     'systemctl_bounded start "${PLUGIN_LOADER_UNIT}"',
@@ -1114,30 +1154,113 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
                 transaction_end = source.rindex("end_install_transaction")
                 self.assertLess(commit, transaction_end)
 
-    def test_updater_fetches_replaces_and_rolls_back_decky(self):
-        source = (ROOT / "updater.sh").read_text()
-        cleanup = source.split("cleanup_failure() {", 1)[1].split(
-            "trap cleanup_failure EXIT INT TERM", 1)[0]
+    def test_installers_fetch_newest_published_decky_and_roll_back(self):
+        cases = {
+            "install.sh": ("cleanup_install() {", "trap cleanup_install EXIT"),
+            "updater.sh": ("cleanup_failure() {", "trap cleanup_failure EXIT"),
+        }
+        release_fixture = [
+            {
+                "tag_name": "v9.0.0-draft",
+                "draft": True,
+                "prerelease": False,
+                "assets": [{
+                    "name": "PluginLoader",
+                    "browser_download_url": "https://invalid/draft",
+                    "digest": "sha256:draft",
+                }],
+            },
+            {
+                "tag_name": "v3.2.9-pre1",
+                "draft": False,
+                "prerelease": True,
+                "assets": [{
+                    "name": "source.tar.gz",
+                    "browser_download_url": "https://invalid/no-loader",
+                    "digest": "sha256:no-loader",
+                }],
+            },
+            {
+                "tag_name": "v3.2.8-pre1",
+                "draft": False,
+                "prerelease": True,
+                "assets": [{
+                    "name": "PluginLoader",
+                    "browser_download_url": "https://valid/pre",
+                    "digest": "sha256:pre",
+                }],
+            },
+            {
+                "tag_name": "v3.2.6",
+                "draft": False,
+                "prerelease": False,
+                "assets": [{
+                    "name": "PluginLoader",
+                    "browser_download_url": "https://valid/stable",
+                    "digest": "sha256:stable",
+                }],
+            },
+        ]
 
-        self.assertIn(
-            'DECKY_REPOSITORY="SteamDeckHomebrew/decky-loader"', source)
-        self.assertIn(
-            'https://api.github.com/repos/${DECKY_REPOSITORY}/releases/latest',
-            source,
-        )
-        self.assertIn(
-            'curl -fL "${decky_url}" -o "${work_dir}/PluginLoader"',
-            source,
-        )
-        self.assertIn(
-            'cp -p "${PLUGIN_LOADER_PATH}" "${loader_backup}"', source)
-        self.assertIn(
-            'cp "${work_dir}/PluginLoader" "${PLUGIN_LOADER_PATH}"', source)
-        self.assertIn(
-            'cp -p "${loader_backup}" "${PLUGIN_LOADER_PATH}"', cleanup)
-        self.assertIn(
-            'cp -p "${loader_version_backup}" \\', cleanup)
-        self.assertIn('"${PLUGIN_LOADER_VERSION_FILE}"; then', cleanup)
+        for name, (cleanup_start, cleanup_end) in cases.items():
+            with self.subTest(name=name):
+                source = (ROOT / name).read_text()
+                cleanup = source.split(cleanup_start, 1)[1].split(
+                    cleanup_end, 1)[0]
+
+                self.assertIn(
+                    'DECKY_REPOSITORY="SteamDeckHomebrew/decky-loader"',
+                    source,
+                )
+                self.assertIn(
+                    'https://api.github.com/repos/${DECKY_REPOSITORY}/'
+                    'releases?per_page=20',
+                    source,
+                )
+                self.assertNotIn(
+                    'repos/${DECKY_REPOSITORY}/releases/latest', source)
+                filter_match = re.search(
+                    r"decky_release_filter='([^']+)'", source)
+                self.assertIsNotNone(filter_match)
+                release_filter = filter_match.group(1)
+                self.assertIn("select(.draft == false)", release_filter)
+                self.assertNotIn("prerelease", release_filter)
+                result = subprocess.run(
+                    ["jq", "-c", release_filter],
+                    input=json.dumps(release_fixture),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {
+                    "version": "v3.2.8-pre1",
+                    "url": "https://valid/pre",
+                    "digest": "sha256:pre",
+                })
+                self.assertIn(
+                    'curl -fL "${decky_url}" -o '
+                    '"${work_dir}/PluginLoader"',
+                    source,
+                )
+                self.assertIn(
+                    'cp -p "${PLUGIN_LOADER_PATH}" "${loader_backup}"',
+                    source,
+                )
+                self.assertIn(
+                    'cp "${work_dir}/PluginLoader" '
+                    '"${PLUGIN_LOADER_PATH}"',
+                    source,
+                )
+                self.assertIn(
+                    'cp -p "${loader_backup}" "${PLUGIN_LOADER_PATH}"',
+                    cleanup,
+                )
+                self.assertIn(
+                    'cp -p "${loader_version_backup}" \\', cleanup)
+                self.assertIn(
+                    '"${PLUGIN_LOADER_VERSION_FILE}"; then', cleanup)
 
     def test_documentation_describes_runtime_guard_not_update_recovery(self):
         readme = (ROOT / "README.md").read_text()

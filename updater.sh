@@ -550,17 +550,19 @@ if ! begin_install_transaction; then
     exit 1
 fi
 
-write_status "Checking the latest stable Decky release…"
+write_status "Checking the newest published Decky release…"
 decky_metadata="${work_dir}/decky.json"
-curl -fL "https://api.github.com/repos/${DECKY_REPOSITORY}/releases/latest" \
+curl -fL "https://api.github.com/repos/${DECKY_REPOSITORY}/releases?per_page=20" \
     -o "${decky_metadata}"
-decky_version="$(jq -r '.tag_name // empty' "${decky_metadata}")"
-decky_url="$(jq -r '.assets[] | select(.name == "PluginLoader") | .browser_download_url' \
+decky_release_filter='[.[] | select(.draft == false) | . as $release | $release.assets[] | select(.name == "PluginLoader") | {version: $release.tag_name, url: .browser_download_url, digest: (.digest // "")}] | first'
+decky_version="$(jq -r "${decky_release_filter} | .version // empty" \
     "${decky_metadata}")"
-decky_digest="$(jq -r '.assets[] | select(.name == "PluginLoader") | .digest // empty' \
+decky_url="$(jq -r "${decky_release_filter} | .url // empty" \
+    "${decky_metadata}")"
+decky_digest="$(jq -r "${decky_release_filter} | .digest // empty" \
     "${decky_metadata}")"
 if [ -z "${decky_version}" ] || [ -z "${decky_url}" ]; then
-    write_status "Update failed: latest stable Decky could not be resolved"
+    write_status "Update failed: newest published Decky could not be resolved"
     exit 1
 fi
 curl -fL "${decky_url}" -o "${work_dir}/PluginLoader"
@@ -689,6 +691,11 @@ if [ -d "${PLUGIN_DIR}" ]; then
     rmdir "${backup_dir}"
 fi
 
+if [ -z "${frontend_requirement}" ] && \
+   systemctl_bounded is-active --quiet steam-bigpicture.scope; then
+    frontend_requirement="require-frontend"
+fi
+
 write_status "Installing ${version}; Decky is reloading…"
 if ! begin_plugin_loader_maintenance; then
     write_status "Update failed: another PluginLoader maintenance action is running"
@@ -740,7 +747,7 @@ if [ "${health_supported}" -eq 1 ]; then
     if [ "${frontend_requirement}" = "require-frontend" ]; then
         install_result="backend and frontend verified"
     else
-        install_result="backend verified"
+        install_result="backend verified; frontend not tested because Steam is inactive"
     fi
 else
     install_result="legacy release; backend readiness unavailable"
