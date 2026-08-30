@@ -1,5 +1,5 @@
 import { call } from "@decky/api";
-import type { BatteryLimit, ChargingStatus, DeviceNetworkInfo, HardwareProfile, MonitorEpoch, RgbRequest, RgbState, State, Telemetry, UpdateInfo } from "./types";
+import type { BackupCleanupInfo, BatteryLimit, ChargingStatus, ConflictRemovalResult, DeviceNetworkInfo, HardwareProfile, InstallProgress, MonitorEpoch, PluginConflictStatus, RgbCalibrationRequest, RgbRequest, RgbState, State, Telemetry, UpdateInfo } from "./types";
 
 export const getState = () => call<[], State>("get_state");
 export const consumeAutomaticRecoveryFocusRequest = () =>
@@ -24,6 +24,8 @@ export const getChargingStatus = (monitorSession?: string, monitorGeneration?: n
 export const getRgbState = () => call<[], RgbState>("get_rgb_state");
 export const setRgbState = (request: RgbRequest) =>
   call<[RgbRequest], RgbState>("set_rgb_state", request);
+export const setRgbCalibration = (request: RgbCalibrationRequest) =>
+  call<[RgbCalibrationRequest], RgbState>("set_rgb_calibration", request);
 type BatteryPolicyRequest = ["normal" | "bypass"] | ["limit", BatteryLimit];
 export const setBatteryPolicy = (...request: BatteryPolicyRequest) =>
   call<BatteryPolicyRequest, ChargingStatus>("set_battery_policy", ...request);
@@ -34,7 +36,15 @@ export const lockExperimental = () => call<[], State>("lock_experimental");
 export const getLog = () => call<[], string>("get_log");
 export const clearLog = () => call<[], boolean>("clear_log");
 export const getUpdateInfo = () => call<[], UpdateInfo>("get_update_info");
-export const installRelease = (version: string) => call<[string], boolean>("install_release", version);
+export const installRelease = (version: string, removeConflict = false) =>
+  call<[string, boolean], boolean>("install_release", version, removeConflict);
+export const getInstallStatus = () => call<[], InstallProgress>("get_install_status");
+export const acknowledgeInstallStatus = (transactionId: string) =>
+  call<[string], boolean>("ack_install_status", transactionId);
+export const getPluginConflict = () => call<[], PluginConflictStatus>("get_plugin_conflict");
+export const removePluginConflict = () => call<[], ConflictRemovalResult>("remove_plugin_conflict");
+export const getBackupCleanupInfo = () => call<[], BackupCleanupInfo>("get_backup_cleanup_info");
+export const cleanOldBackups = () => call<[], BackupCleanupInfo>("clean_old_backups");
 export const applyProfile = (profile: HardwareProfile) => call<[HardwareProfile], boolean>("apply_profile", profile);
 export const savePreset = (name: string, profile: HardwareProfile) => call<[string, HardwareProfile], State>("save_preset", name, profile);
 export const restoreSteamDefault = () => call<[], State>("restore_steam_default");

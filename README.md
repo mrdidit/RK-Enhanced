@@ -44,9 +44,23 @@ The Monitor tab provides an at-a-glance view of:
 - CPU scheduler
 - CPU queue status
 - Active thermal limits
+- Combined RK-E CPU Load
 
 Temperature and load indicators use severity-based colours so unusual
 conditions can be recognised quickly.
+
+The Runtime section reports combined RK-E CPU Load on the same whole-device
+scale as Monitor's main CPU load: `100%` means all logical CPU cores are fully
+occupied. For example, process CPU equivalent to `60%` of one core is displayed
+as `7.5%` on an eight-core device. It combines the RK-Enhanced backend, its
+exact child/helper process tree, the PluginLoader lifecycle guard, and the
+runtime-restoration guard. Linux's cumulative child counters retain short-lived
+helper work after a process exits. Decky/PluginLoader, unrelated plugins, and
+native ROCKNIX services are excluded. Per-root process generations prevent
+departed or replaced guards from creating false spikes. If an expected guard
+cannot be identified exactly, the row reports `Unavailable` rather than a
+partial total. The metric reuses Monitor telemetry and creates no additional
+polling loop or system-wide process scan.
 
 Battery estimates use smoothed measurements where kernel-provided values are
 unreliable. Longer estimates are shortened to forms such as `10h+` to preserve
@@ -112,10 +126,10 @@ ROCKNIX provides one native Custom curve through:
 RK-Enhanced adds a graphical editor for this curve under:
 
 ```text
-Utils → Edit ROCKNIX Custom fan curve
+Fan Curves → Rocknix Fan Curve → Edit custom curve
 ```
 
-If `fancontrol.conf` does not exist, Utils can create it with a safe initial
+If `fancontrol.conf` does not exist, the editor can create it with a safe initial
 curve. The file can then be inspected and modified graphically through
 RK-Enhanced; a terminal or external file manager is not required.
 
@@ -140,7 +154,7 @@ native stick-ring lighting. Support is discovered from runtime capabilities,
 not from a device, product, or SoC allowlist. The tab is omitted when no verified
 native interface is available.
 
-Two interface families are supported. Devices with the known native LED-mode
+Three interface families are supported. Devices with the known native LED-mode
 and effect interface retain ROCKNIX's **LED Color** modes:
 
 - Off
@@ -166,15 +180,23 @@ colours, RK-Enhanced shows the right-ring colour and warns before saving. An
 explicit Save & Apply then makes both rings match. Native-state revisions stop
 an older open draft from overwriting a newer ROCKNIX-side edit.
 
-Where the running kernel exposes the known stick-ring effect interface,
-RK-Enhanced also offers:
+Pocket EVO kernels exposing the complete RGB ABI version 3 receive a dedicated
+provider ahead of both existing interfaces. Detection validates the ABI,
+attributes, physical zone order, writable controls, and required effects; it
+does not rely on a Pocket EVO product or SoC name. An unpatched Pocket EVO-S
+with no ABI 3 interface continues using the generic Static provider above and
+does not see any ABI 3-only controls. An ABI-looking but incomplete interface
+fails closed rather than risking a destructive shared-colour fallback.
+
+The verified FIT stick-ring effect interface offers:
 
 - Static
 - Breath
 - Rainbow
 
-Both providers present the stick rings as one shared lighting zone. Static mode
-persists through ROCKNIX's native `analogsticks.led` setting. RK-Enhanced stores
+The FIT and generic providers present the stick rings as one shared lighting
+zone. Static mode persists through ROCKNIX's native `analogsticks.led` setting.
+RK-Enhanced stores
 the chosen source colour, brightness, optional colour correction, and animated
 effect so the draft remains coherent across modes. It may reapply a saved
 animation at startup only for the verified effect provider while native LED
@@ -184,6 +206,32 @@ restoration, or unadvertised animation command.
 Colour correction is off by default and applies only to Static and Breath. When
 enabled for a colour containing red, the red channel is unchanged while green
 and blue are scaled to 80%. Rainbow is always passed through unchanged.
+
+On the ABI 3 Pocket EVO provider, **Static** remains the default effect. Its
+layout editor can address both rings together, the left and right rings, or all
+eight physical quadrants while still issuing one complete native Static layout.
+The additional native effects are Breath, RGB Breath, Rainbow, and Reactive.
+Only controls supported by the selected effect are shown; no unsupported speed
+or per-ring animation setting is invented.
+
+Pocket EVO colour calibration is performed by the kernel driver. RK-Enhanced
+provides explicit green and blue percentage controls plus Reset (`15 20`) and
+Raw (`100 100`) actions, and never layers the older 80% software correction on
+top. A saved calibration override may be restored once after boot. Lighting
+layouts, effects, and the user's Off state are never taken into background
+ownership or automatically restored.
+
+The Pocket EVO driver remains the sole owner of the RGB controller UART.
+RK-Enhanced neither opens the UART nor invokes `ledcontrol` for ABI 3 effects.
+It submits each command as one complete sysfs write and verifies native cached
+readback. Failed operations are followed by a complete native refresh; if an
+applied value could not be persisted, it remains visible as unsaved instead of
+being presented as committed. Dormant ABI 3 preferences are retained if a
+kernel without the EVO patch temporarily falls back to generic Static control.
+A genuinely mixed eight-zone Static layout can take roughly four seconds to
+apply, so work remains serialized in the backend and off the UI thread.
+ROCKNIX's temporary `enabled` suspend gate is displayed but never claimed as
+RK-Enhanced's persistent On/Off control.
 
 ### Presets and automatic game switching
 
@@ -229,16 +277,38 @@ continues while the RK-Enhanced panel is closed.
 The Utils tab contains:
 
 - Current device IPv4 address and network interface
-- The matching PC-side command for removing a stale SSH host-key record
-- Runtime logs
-- ROCKNIX Custom fan-curve editor
+- Combined runtime and installer logs
 - Installed and latest release discovery
 - Update to the latest published release
 - Reinstall the current release
-- Downgrade to the previous published release
+- Install the previous published release, clearly identified as release history
+  rather than local installation history
+- Restore the last installed release when trustworthy local history is available
+- Clean ordinary old RK-Enhanced rollback backups while retaining the newest
 - Hidden experimental controls
 
 Release discovery includes GitHub pre-releases.
+
+An update, reinstall, downgrade, or last-installed restore opens a blocking
+transaction view with real phases: download, validation, backup, installation,
+Decky reload, verification, and either completion or rollback. It does not
+display a fabricated percentage.
+RK-Enhanced mutations remain disabled while the transaction is active. Progress
+is stored outside the plugin directory, so the same transaction returns after
+Decky reloads or Quick Access is reopened. Every phase is also appended to the
+rotated installer journal shown by Utils → Logs.
+
+**Previous published release** means the release immediately before the
+installed version on GitHub; it may not have been installed on this device.
+**Last installed release** is shown separately only when a completed local
+cross-version transaction recorded it and it is not already the same release as
+the previous-published option.
+
+**Clean old RK-E backups** only considers real, immediate
+`RK-Enhanced-before-*` directories under
+`/storage/homebrew/plugin-backups`. It keeps the newest ordinary snapshot and
+never follows symlinks or removes install/update recovery artifacts, unknown
+directories, other plugins' backups, or Decky's active Loader rollback file.
 
 Updates are installed by a detached updater that:
 
@@ -254,6 +324,36 @@ Updates are installed by a detached updater that:
    maintenance reload, Steam may still leave a running game waiting on its
    Resume screen; automatic foreground restoration is reserved for automatic
    crash recovery.
+
+### Conflicting ROCKNIX Control installations
+
+The original ROCKNIX Control and Rocknix Control Enhanced use the same plugin
+manifest identity, **ROCKNIX Control**. Both can independently write CPU, GPU,
+and fan settings, so running either beside RK-Enhanced can create ownership
+races.
+
+The full SSH installer scans only immediate plugin directories and matches that
+exact normalized manifest identity. It blocks by default when a conflict is
+found. To explicitly remove the conflicting plugin directory without creating
+a plugin backup, then continue installation, use:
+
+```sh
+curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | \
+  sh -s -- --remove-conflicting-rocknix-control
+```
+
+The removal is permanent for the plugin files, but leaves that plugin's settings
+untouched. The installer stops only `plugin_loader.service`, revalidates the
+exact non-symlink plugin directory and manifest, removes it, restores native
+`fancontrol.service`, and then continues. Detection, removal, fancontrol
+restoration, and the final result are recorded in the installer journal.
+
+RK-Enhanced also checks this identity at runtime. If ROCKNIX Control is installed
+later, RK-Enhanced blocks preset and hardware mutations while leaving Monitor,
+Logs, Utils, and the removal action available. A release installed from an older
+RK-Enhanced updater cannot gain the new pre-install UI retroactively; the new
+runtime guard takes effect as soon as that release loads. Use the full SSH
+installer when the conflict must be handled before replacement begins.
 
 UI-initiated installs require a nonce-bound response from the exact backend and
 from the exact frontend bundle after Decky evaluates and registers that bundle
@@ -526,9 +626,9 @@ the request.
 - Hardware coverage remains limited.
 - Qualcomm KGSL and MSM DRM receive the strongest GPU-monitoring support.
 - Thermal sensor naming may require additional device-specific handling.
-- Utils can create `/storage/.config/fancontrol.conf` when it is missing and
-  graphically edit the ROCKNIX Custom curve afterward. Activation still occurs
-  through ROCKNIX or Steam cooling-profile settings.
+- The Fan Curves tab can create `/storage/.config/fancontrol.conf` when it is
+  missing and graphically edit the ROCKNIX Custom curve afterward. Activation
+  still occurs through ROCKNIX or Steam cooling-profile settings.
 - Native ROCKNIX profile overrides may remain active after Steam exits.
 - Crash recovery and ownership-aware restoration need broader long-duration
   testing across devices.
@@ -648,6 +748,7 @@ pnpm install
 python3 -m py_compile main.py charging.py rgb.py runtime-restore.py plugin_loader_recovery.py
 python3 -m unittest discover -s tests -v
 pnpm typecheck
+pnpm test:rgb-model
 pnpm build
 pnpm verify:frontend
 ```

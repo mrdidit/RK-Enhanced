@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import re
@@ -175,6 +176,355 @@ class CpuBoostDiscoveryTests(unittest.TestCase):
             self.assertEqual(policies[0]["maximum_frequencies"], [100, 200, 250, 300])
             self.assertEqual(policies[1]["boost_frequencies"], [400])
             self.assertEqual(policies[1]["maximum_frequencies"], [150, 350, 400])
+
+
+class RkeCpuTelemetryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.modules.setdefault("decky", types.SimpleNamespace(
+            logger=types.SimpleNamespace(info=lambda *_: None, error=lambda *_: None)))
+        import main
+        cls.main = main
+
+    def plugin(self, session="monitor-a", generation=1):
+        plugin = self.main.Plugin.__new__(self.main.Plugin)
+        plugin.monitor_lock = threading.RLock()
+        plugin.monitor_session = session
+        plugin.monitor_generation = generation
+        plugin.monitor_revision = 0
+        plugin.monitor_charging_valid = False
+        plugin.monitor_bypass_active = False
+        plugin.battery_discharge_ema = None
+        plugin.battery_discharge_samples = 0
+        plugin.battery_discharge_last_sample = 0.0
+        plugin.last_rke_cpu_sample = None
+        plugin.lifecycle_guard_unit = ""
+        plugin.lifecycle_guard_identity = None
+        plugin.runtime_guard_unit = ""
+        plugin.runtime_guard_identity = None
+        plugin.backend_identity = {"pid": 999, "start_time_ticks": 9999}
+        return plugin
+
+    def test_top_style_usage_combines_backend_and_live_child(self):
+        plugin = self.plugin()
+        samples = [
+            {(999, 9999): 1.0},
+            {(999, 9999): 1.72},
+        ]
+        with mock.patch.object(
+                 plugin, "_rke_cpu_snapshot", side_effect=samples), \
+             mock.patch.object(self.main.time, "monotonic",
+                               side_effect=[10.0, 11.0]):
+            first = plugin._sample_rke_cpu_percent("monitor-a", 1)
+            second = plugin._sample_rke_cpu_percent("monitor-a", 1)
+
+        self.assertIsNone(first)
+        self.assertAlmostEqual(second, 72.0)
+
+    def test_usage_allows_more_than_one_busy_core(self):
+        plugin = self.plugin()
+        samples = [
+            {(999, 9999): 1.0},
+            {(999, 9999): 2.5},
+        ]
+        with mock.patch.object(
+                 plugin, "_rke_cpu_snapshot", side_effect=samples), \
+             mock.patch.object(self.main.time, "monotonic",
+                               side_effect=[20.0, 21.0]):
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 150.0)
+
+    def test_short_helper_between_polls_is_retained_by_root_counter(self):
+        plugin = self.plugin()
+        samples = [
+            {(999, 9999): 1.0},
+            {(999, 9999): 1.25},
+        ]
+        with mock.patch.object(
+                 plugin, "_rke_cpu_snapshot", side_effect=samples), \
+             mock.patch.object(self.main.time, "monotonic",
+                               side_effect=[5.0, 6.0]):
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 25.0)
+
+    def test_usage_combines_exact_lifecycle_and_runtime_guards(self):
+        plugin = self.plugin()
+        plugin.lifecycle_guard_identity = {
+            "pid": 111, "start_time_ticks": 1111,
+        }
+        plugin.runtime_guard_identity = {
+            "pid": 222, "start_time_ticks": 2222,
+        }
+        process_snapshots = [
+            {(999, 9999): 1.0, (1000, 10000): 0.1},
+            {(111, 1111): 0.2},
+            {(222, 2222): 0.3},
+        ]
+        with mock.patch.object(
+                self.main, "_process_tree_cpu_snapshot",
+                side_effect=process_snapshots) as process_tree:
+            self.assertEqual(plugin._rke_cpu_snapshot(), {
+                (999, 9999): 1.1,
+                (111, 1111): 0.2,
+                (222, 2222): 0.3,
+            })
+
+        self.assertEqual(process_tree.call_args_list, [
+            mock.call(plugin.backend_identity),
+            mock.call(plugin.lifecycle_guard_identity),
+            mock.call(plugin.runtime_guard_identity),
+        ])
+
+    def test_exact_process_cpu_time_rejects_pid_reuse_and_malformed_stat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proc_root = Path(temporary)
+            process_root = proc_root / "432"
+            process_root.mkdir()
+            fields = ["0"] * 30
+            fields[0] = "S"
+            fields[1] = "1"
+            fields[11:15] = ["10", "20", "30", "40"]
+            fields[19] = "9876"
+            stat_path = process_root / "stat"
+            stat_path.write_text(
+                "432 (RK-E guard worker) " + " ".join(fields) + "\n")
+            identity = {"pid": 432, "start_time_ticks": 9876}
+
+            with mock.patch.object(
+                    self.main.os, "sysconf", return_value=100):
+                self.assertEqual(
+                    self.main._process_cpu_seconds(identity, proc_root), 1.0)
+                self.assertIsNone(self.main._process_cpu_seconds(
+                    {"pid": 432, "start_time_ticks": 9877}, proc_root))
+                stat_path.write_text("not a process stat\n")
+                self.assertIsNone(
+                    self.main._process_cpu_seconds(identity, proc_root))
+
+    def test_process_tree_snapshot_follows_exact_live_children(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proc_root = Path(temporary)
+
+            def create_process(pid, parent, start, user, system, children=""):
+                root = proc_root / str(pid)
+                (root / "task" / str(pid)).mkdir(parents=True)
+                fields = ["0"] * 30
+                fields[0] = "S"
+                fields[1] = str(parent)
+                fields[11] = str(user)
+                fields[12] = str(system)
+                fields[19] = str(start)
+                (root / "stat").write_text(
+                    f"{pid} (RK-E helper) " + " ".join(fields) + "\n")
+                (root / "task" / str(pid) / "children").write_text(
+                    children + "\n")
+
+            create_process(10, 1, 100, 10, 5, "11")
+            create_process(11, 10, 110, 7, 3, "12")
+            create_process(12, 11, 120, 2, 3)
+            with mock.patch.object(
+                    self.main.os, "sysconf", return_value=100):
+                snapshot = self.main._process_tree_cpu_snapshot(
+                    {"pid": 10, "start_time_ticks": 100}, proc_root)
+
+            self.assertEqual(snapshot, {
+                (10, 100): 0.15,
+                (11, 110): 0.1,
+                (12, 120): 0.05,
+            })
+
+    def test_live_child_to_reaped_counter_handoff_is_counted_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proc_root = Path(temporary)
+
+            def write_stat(pid, parent, start, own, children):
+                root = proc_root / str(pid)
+                (root / "task" / str(pid)).mkdir(
+                    parents=True, exist_ok=True)
+                fields = ["0"] * 30
+                fields[0] = "S"
+                fields[1] = str(parent)
+                fields[11] = str(own)
+                fields[13] = str(children)
+                fields[19] = str(start)
+                (root / "stat").write_text(
+                    f"{pid} (RK-E helper) " + " ".join(fields) + "\n")
+
+            write_stat(10, 1, 100, 50, 10)
+            write_stat(11, 10, 110, 20, 0)
+            children_path = proc_root / "10" / "task" / "10" / "children"
+            children_path.write_text("11\n")
+            (proc_root / "11" / "task" / "11" / "children").write_text("\n")
+            identity = {"pid": 10, "start_time_ticks": 100}
+
+            with mock.patch.object(
+                    self.main.os, "sysconf", return_value=100):
+                live = sum(self.main._process_tree_cpu_snapshot(
+                    identity, proc_root).values())
+                # The child is now waited/reaped. Its 20 ticks transfer once
+                # into the root's cumulative child counter.
+                write_stat(10, 1, 100, 60, 30)
+                children_path.write_text("\n")
+                reaped = sum(self.main._process_tree_cpu_snapshot(
+                    identity, proc_root).values())
+
+            self.assertEqual(live, 0.8)
+            self.assertEqual(reaped, 0.9)
+            self.assertAlmostEqual(reaped - live, 0.1)
+
+    def test_process_membership_changes_never_create_lifetime_spikes(self):
+        plugin = self.plugin()
+        samples = [
+            {(999, 9999): 1.0, (111, 1111): 10.0},
+            {(999, 9999): 1.1},
+            {(999, 9999): 1.2, (111, 1111): 20.0},
+            {(999, 9999): 1.3, (111, 1111): 20.1},
+        ]
+        with mock.patch.object(
+                 plugin, "_rke_cpu_snapshot", side_effect=samples), \
+             mock.patch.object(self.main.time, "monotonic",
+                               side_effect=[1.0, 2.0, 3.0, 4.0]):
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 10.0)
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 10.0)
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 20.0)
+
+    def test_unresolved_expected_guard_makes_tracking_unavailable(self):
+        plugin = self.plugin()
+        self.assertTrue(plugin._rke_cpu_tracking_available())
+
+        plugin.lifecycle_guard_unit = (
+            "rke-plugin-lifecycle-guard-999-abcdef12")
+        self.assertFalse(plugin._rke_cpu_tracking_available())
+
+        plugin.lifecycle_guard_identity = {
+            "pid": 111, "start_time_ticks": 1111,
+        }
+        self.assertTrue(plugin._rke_cpu_tracking_available())
+
+    def test_runtime_guard_identity_is_captured_and_cleared(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin = self.main.Plugin.__new__(self.main.Plugin)
+            plugin.runtime_marker = root / "runtime-session.active"
+            plugin.runtime_restore_request = (
+                root / "runtime-session.active.restore-request")
+            plugin.runtime_state_path = root / "runtime-session.json"
+            plugin.runtime_guard_path = root / "runtime-restore-guard.sh"
+            plugin.runtime_restore_path = root / "runtime-restore.py"
+            plugin.canonical_fan_config = root / "canonical.conf"
+            plugin.runtime_guard_unit = ""
+            plugin.runtime_guard_identity = None
+            plugin._install_runtime_restore_tools = mock.Mock()
+            plugin._capture_runtime_state = mock.Mock(
+                return_value={"version": 1, "controls": {}})
+            guard_identity = {
+                "pid": 765, "start_time_ticks": 4321, "parent_pid": 1,
+            }
+
+            with mock.patch.object(self.main, "_run") as run, \
+                 mock.patch.object(
+                     self.main, "_guard_unit_identity",
+                     return_value=guard_identity
+                 ) as identify, \
+                 mock.patch.object(
+                     self.main.time, "monotonic_ns", return_value=123456):
+                plugin._ensure_runtime_session_locked({})
+
+            expected_unit = (
+                "rke-runtime-restore-guard-" +
+                str(self.main.os.getpid()) + "-123456")
+            self.assertEqual(plugin.runtime_guard_unit, expected_unit)
+            self.assertEqual(plugin.runtime_guard_identity, guard_identity)
+            identify.assert_called_once_with(expected_unit)
+            self.assertEqual(run.call_args.args[0][0], "systemd-run")
+
+            def restore(command, **_kwargs):
+                plugin.runtime_marker.unlink()
+                return "restored"
+
+            with mock.patch.object(self.main, "_run", side_effect=restore):
+                self.assertTrue(plugin._restore_runtime_session())
+            self.assertEqual(plugin.runtime_guard_unit, "")
+            self.assertIsNone(plugin.runtime_guard_identity)
+
+    def test_stale_generation_cannot_replace_current_sampler(self):
+        plugin = self.plugin(session="monitor-new", generation=2)
+        plugin.last_rke_cpu_sample = (
+            "monitor-new", 2, {(999, 9999): 4.0}, 30.0)
+        previous = plugin.last_rke_cpu_sample
+        with mock.patch.object(
+                plugin, "_rke_cpu_snapshot",
+                return_value={(999, 9999): 9.0}), \
+             mock.patch.object(self.main.time, "monotonic", return_value=31.0):
+            result = plugin._sample_rke_cpu_percent("monitor-old", 1)
+
+        self.assertIsNone(result)
+        self.assertEqual(plugin.last_rke_cpu_sample, previous)
+
+    def test_nonpositive_elapsed_or_regressing_cpu_time_is_unavailable(self):
+        plugin = self.plugin()
+        samples = [
+            {(999, 9999): 1.0},
+            {(999, 9999): 1.5},
+            {(999, 9999): 1.0},
+        ]
+        with mock.patch.object(
+                 plugin, "_rke_cpu_snapshot", side_effect=samples), \
+             mock.patch.object(self.main.time, "monotonic",
+                               side_effect=[50.0, 50.0, 51.0]):
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+
+    def test_regressed_tree_snapshot_cannot_rebound_into_false_spike(self):
+        plugin = self.plugin()
+        samples = [
+            {(999, 9999): 10.0},
+            {(999, 9999): 1.0},
+            {(999, 9999): 10.2},
+            {(999, 9999): 10.3},
+        ]
+        with mock.patch.object(
+                 plugin, "_rke_cpu_snapshot", side_effect=samples), \
+             mock.patch.object(self.main.time, "monotonic",
+                               side_effect=[1.0, 2.0, 3.0, 4.0]):
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 10.0)
+
+    def test_monitor_activation_and_end_reset_the_cpu_baseline(self):
+        plugin = self.plugin(session="monitor-old", generation=1)
+        plugin.last_rke_cpu_sample = (
+            "monitor-old", 1, {(999, 9999): 5.0}, 40.0)
+
+        asyncio.run(plugin.begin_monitor_session("monitor-new", 2))
+
+        self.assertEqual(plugin.monitor_session, "monitor-new")
+        self.assertEqual(plugin.monitor_generation, 2)
+        self.assertIsNone(plugin.last_rke_cpu_sample)
+
+        plugin.last_rke_cpu_sample = (
+            "monitor-new", 2, {(999, 9999): 6.0}, 41.0)
+        asyncio.run(plugin.end_monitor_session("monitor-new", 2))
+
+        self.assertEqual(plugin.monitor_session, "")
+        self.assertIsNone(plugin.last_rke_cpu_sample)
 
 
 class BatteryPowerTelemetryTests(unittest.TestCase):
@@ -704,7 +1054,7 @@ class FrontendIntegrityPackagingTests(unittest.TestCase):
         notes = (ROOT / "RELEASE_NOTES.md").read_text()
 
         self.assertIn(
-            "name: RK-Enhanced ${{ github.ref_name }} — Compatible Decky installation",
+            "name: RK-Enhanced ${{ github.ref_name }} — Installer safety and Pocket EVO RGB",
             workflow,
         )
         self.assertIn("body_path: RELEASE_NOTES.md", workflow)
@@ -781,7 +1131,7 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
                     "systemctl_bounded kill --kill-who=all --signal=SIGKILL", source)
                 self.assertIn('timeout 5 systemctl "$@"', source)
                 self.assertIn(
-                    "for command in curl cut flock grep jq sed sha256sum systemctl timeout tr unzip wc; do",
+                    "for command in cmp curl cut flock grep jq sed sha256sum stat systemctl timeout tr unzip wc; do",
                     source,
                 )
                 self.assertNotIn('""|inactive|failed)', source)
@@ -1291,6 +1641,24 @@ class PluginLoaderRecoveryPackagingContractTests(unittest.TestCase):
 
 
 class FrontendLifecycleContractTests(unittest.TestCase):
+    def test_conflict_removal_is_on_monitor_and_fan_heading_is_compact(self):
+        content = (ROOT / "src" / "Content.tsx").read_text()
+        monitor = content.split("const monitorContent = <>", 1)[1].split(
+            "const availableTabs = [", 1)[0]
+
+        self.assertIn(
+            'onClick={confirmConflictRemoval}>Remove conflicting plugin',
+            monitor,
+        )
+        self.assertIn('label="Permanent removal"', monitor)
+        self.assertNotIn(">Open Utils</ButtonItem>", monitor.split(
+            ": runtimeMutationBlocked", 1)[0])
+        self.assertIn(
+            '<PerformanceHeading title="Rocknix Fan Curve" />', content
+        )
+        self.assertIn('"Edit custom curve"', content)
+        self.assertNotIn("Remove conflict &", content)
+
     def test_automatic_recovery_focus_is_one_shot_and_non_launching(self):
         index = (ROOT / "src" / "index.tsx").read_text()
         backend = (ROOT / "src" / "backend.ts").read_text()
@@ -1330,13 +1698,16 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertIn("return () => { cancelled = true; };", content)
         self.assertIn(
             'call<[], DeviceNetworkInfo>("get_device_network_info")', backend)
-        self.assertIn("Run this on the PC you connect from: ssh-keygen -R", content)
+        self.assertNotIn("Run this on the PC you connect from: ssh-keygen -R", content)
+        self.assertNotIn("Reset SSH trust on your PC", content)
         self.assertNotIn("clear_ssh", backend)
 
     def test_rgb_tab_is_capability_and_quick_access_gated_without_polling(self):
         content = (ROOT / "src" / "Content.tsx").read_text()
         rgb = (ROOT / "src" / "RGB.tsx").read_text()
+        rgb_model = (ROOT / "src" / "rgbModel.ts").read_text()
         typescript = (ROOT / "src" / "types.ts").read_text()
+        backend = (ROOT / "src" / "backend.ts").read_text()
         main = (ROOT / "main.py").read_text()
 
         self.assertRegex(
@@ -1354,12 +1725,41 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertIn("needsRefreshAfterStaleApply.current = true;", rgb)
         self.assertIn("activeRef.current", rgb)
         self.assertIn("[active, refreshRequest]", rgb)
-        self.assertEqual(rgb.count("getRgbState()"), 1)
+        # One read activates/reloads the page; the second reconciles every
+        # native attribute after a failed mutation. Neither is a poll loop.
+        self.assertEqual(rgb.count("getRgbState()"), 2)
+        self.assertIn("reconcileFailedOperation", rgb)
+        self.assertIn("Actual RGB state could not be refreshed", rgb)
+        self.assertIn("rgbFailureDisposition", rgb)
+        self.assertIn("transport is suspended; retry after resume", rgb_model)
+        self.assertIn("baseline.revision = actual.revision", rgb)
+        self.assertIn("setSaved(baseline)", rgb)
+        self.assertIn('draft ? "RGB change not saved"', rgb)
+        self.assertIn("preMutationRejection", rgb)
+        self.assertIn("state changed; refresh before applying", rgb_model)
         self.assertNotIn("setInterval", rgb)
         self.assertNotIn("setTimeout", rgb)
         self.assertIn(
-            '"none" | "sysfs-effects" | "analog-static"', typescript)
+            '"none" | "sysfs-effects" | "analog-static" | "pocket-evo-v3"',
+            typescript)
         self.assertIn('status?.provider === "analog-static"', rgb)
+        self.assertIn(
+            'status?.provider === "pocket-evo-v3"', rgb)
+        self.assertIn(
+            'state.resume_lighting || defaultNonOffLighting(state)', rgb)
+        self.assertIn('label="Layout"', rgb)
+        self.assertIn('both: "Both rings"', rgb)
+        self.assertIn('"per-stick": "Per stick"', rgb)
+        self.assertIn('quadrants: "Quadrants"', rgb)
+        self.assertIn('"rgb-breath": "RGB Breath"', rgb)
+        self.assertIn('reactive: "Reactive"', rgb)
+        self.assertIn('label="Saved calibration override"', rgb)
+        self.assertIn('setEvoStaticGroup', rgb_model)
+        self.assertIn('setEvoLayoutMode', rgb_model)
+        self.assertIn(
+            'call<[RgbCalibrationRequest], RgbState>("set_rgb_calibration", request)',
+            backend)
+        self.assertIn('async def set_rgb_calibration(self, request):', main)
         self.assertIn('provider: state.provider', rgb)
         self.assertIn('revision: state.revision', rgb)
         self.assertIn('left.provider === right.provider', rgb)
@@ -1378,7 +1778,7 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertIn('needsRefreshAfterStaleApply.current = true;', rgb)
         self.assertIn('Reload current RGB state', rgb)
         self.assertIn('get_runtime_capability=_rocknix_env', main)
-        tabs = content.split("const tabs = [", 1)[1].split("];", 1)[0]
+        tabs = content.split("const availableTabs = [", 1)[1].split("];", 1)[0]
         expected = [
             'id: "Monitor"', 'id: "Performance"', 'id: "Fan"',
             'id: "Presets"', 'id: "RGB"', 'id: "Utils"',
@@ -1560,6 +1960,27 @@ class FrontendLifecycleContractTests(unittest.TestCase):
             monitor.rfind('<Metric label="Thermal limit"'),
             monitor.rfind('<Metric label="CPU load"'),
         )
+        self.assertIn("rke_cpu_percent: number | null;", typescript)
+        self.assertIn("rke_cpu_available: boolean;", typescript)
+        self.assertIn('label="RK-E CPU Load"', monitor)
+        self.assertIn('typeof data.rke_cpu_percent === "number"', monitor)
+        self.assertIn(
+            'rkeCpuUsage / logicalCpus', monitor)
+        self.assertIn('rkeCpuLoad === null ? "Calculating…"', monitor)
+        self.assertIn('!rkeCpuLoadAvailable ? "Unavailable"', monitor)
+        self.assertIn('value >= 50 ? "#fc5c65"', monitor)
+        self.assertIn('value >= 25 ? "#f39c3d"', monitor)
+        self.assertIn('value >= 10 ? "#fed330"', monitor)
+        self.assertLess(
+            monitor.rfind('<Metric label="CPU queue"'),
+            monitor.rfind('<Metric label="RK-E CPU Load"'),
+        )
+        self.assertLess(
+            monitor.rfind('<Metric label="RK-E CPU Load"'),
+            monitor.rfind('<Heading onActivate={backToTop}>Back to top</Heading>'),
+        )
+        self.assertEqual(monitor.count("getTelemetry("), 1)
+        self.assertNotIn("setInterval", monitor)
 
     def test_experimental_uses_compact_qcom_normal_label(self):
         experimental = (ROOT / "src" / "Experimental.tsx").read_text()

@@ -52,7 +52,10 @@ DEFAULT_PRESET = "RK-E Default"
 LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default", "Steam Default")
 SETTINGS_FILE = "settings.json"
 UPDATE_STATUS_FILE = "update-status.txt"
+INSTALL_PROGRESS_FILE = "install-progress.json"
+INSTALL_PROGRESS_ACK_FILE = "install-progress-ack.txt"
 INSTALLED_VERSION_FILE = "installed-version.txt"
+LAST_INSTALLED_VERSION_FILE = "last-installed-version.txt"
 INSTALL_HEALTH_REQUEST_FILE = "install-health-request.json"
 INSTALL_BACKEND_READY_FILE = "install-backend-ready.json"
 INSTALL_FRONTEND_READY_FILE = "install-frontend-ready.json"
@@ -69,7 +72,23 @@ AUTO_RECOVERY_FOCUS_REQUEST = (
 AUTO_RECOVERY_FOCUS_MAX_AGE_SECONDS = 90.0
 LIFECYCLE_LOCK = Path(
     "/run/lock/rk-enhanced-plugin-loader-recovery.lock")
+INSTALL_TRANSACTION_LOCK = Path(
+    "/run/lock/rk-enhanced-install-transaction.lock")
 PLUGIN_LOADER_SERVICE = "plugin_loader.service"
+LEGACY_CONTROL_PLUGIN_NAME = "ROCKNIX Control"
+INSTALL_PROGRESS_PROTOCOL = 1
+
+INSTALL_PROGRESS_PHASES = {
+    "idle", "starting", "preflight", "checking-releases", "downloading",
+    "validating", "backing-up", "removing-conflict", "stopping-decky",
+    "installing", "starting-decky", "verifying", "rolling-back",
+    "completed", "rolled-back", "blocked", "failed", "unavailable",
+}
+INSTALL_PROGRESS_OUTCOMES = {
+    "idle", "running", "succeeded", "failed", "rolled-back", "blocked",
+    "unavailable",
+}
+INSTALL_PROGRESS_STALE_SECONDS = 15 * 60
 
 
 def _read(path, default=""):
@@ -93,11 +112,11 @@ def _read_ints(path):
         return []
 
 
-def _process_identity(pid):
+def _process_identity(pid, proc_root=Path("/proc")):
     """Return the PID-reuse-safe identity used by the external lifecycle guard."""
     try:
         pid = int(pid)
-        raw = (Path("/proc") / str(pid) / "stat").read_text()
+        raw = (Path(proc_root) / str(pid) / "stat").read_text()
         close = raw.rfind(")")
         if pid <= 0 or close < 0:
             return None
@@ -109,6 +128,90 @@ def _process_identity(pid):
         }
     except (OSError, IndexError, TypeError, ValueError):
         return None
+
+
+def _process_cpu_seconds(identity, proc_root=Path("/proc")):
+    """Read own CPU time for one exact process generation."""
+    if not isinstance(identity, dict):
+        return None
+    try:
+        pid = int(identity["pid"])
+        expected_start = int(identity["start_time_ticks"])
+        raw = (Path(proc_root) / str(pid) / "stat").read_text()
+        close = raw.rfind(")")
+        if pid <= 0 or close < 0:
+            return None
+        fields = raw[close + 2:].split()
+        if int(fields[19]) != expected_start:
+            return None
+        # Include completed descendants. While a child is live its counters
+        # are included separately by the exact tree snapshot; after wait/reap,
+        # Linux transfers those counters into its parent's cutime/cstime. This
+        # keeps each root aggregate cumulative across short helper lifetimes.
+        ticks = sum(int(fields[index]) for index in (11, 12, 13, 14))
+        ticks_per_second = int(os.sysconf("SC_CLK_TCK"))
+        if ticks < 0 or ticks_per_second <= 0:
+            return None
+        return ticks / ticks_per_second
+    except (KeyError, OSError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _process_tree_cpu_snapshot(identity, proc_root=Path("/proc")):
+    """Return own CPU counters for one exact live process tree.
+
+    Child discovery is restricted to each known process's task children files;
+    this never scans the system process table. Exact start times protect every
+    counter from PID reuse, while a fixed bound keeps Monitor work predictable.
+    """
+    if not isinstance(identity, dict):
+        return {}
+    pending = [identity]
+    visited = set()
+    snapshot = {}
+    while pending and len(visited) < 128:
+        current = pending.pop()
+        try:
+            pid = int(current["pid"])
+            start_time = int(current["start_time_ticks"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (pid, start_time)
+        if key in visited:
+            continue
+        visited.add(key)
+        cpu_seconds = _process_cpu_seconds(current, proc_root)
+        if cpu_seconds is None:
+            continue
+        snapshot[key] = cpu_seconds
+
+        task_root = Path(proc_root) / str(pid) / "task"
+        try:
+            tasks = sorted(
+                (task for task in task_root.iterdir()
+                 if task.name.isdigit()),
+                key=lambda task: int(task.name),
+            )[:128]
+        except OSError:
+            tasks = []
+        child_pids = set()
+        for task in tasks:
+            try:
+                values = (task / "children").read_text().split()
+            except OSError:
+                continue
+            for value in values:
+                try:
+                    child_pid = int(value)
+                except ValueError:
+                    continue
+                if child_pid > 0:
+                    child_pids.add(child_pid)
+        for child_pid in sorted(child_pids, reverse=True):
+            child = _process_identity(child_pid, proc_root)
+            if child is not None and child.get("parent_pid") == pid:
+                pending.append(child)
+    return snapshot
 
 
 def _battery_power(battery):
@@ -144,6 +247,29 @@ def _run(command, check=True, timeout=15):
     if check and process.returncode:
         raise RuntimeError(process.stderr.strip() or f"command failed: {command[0]}")
     return process.stdout.strip()
+
+
+def _guard_unit_identity(unit):
+    """Resolve only an internally named RK-E guard unit to its live identity."""
+    if (not isinstance(unit, str) or
+            re.fullmatch(
+                r"rke-(?:plugin-lifecycle|runtime-restore)-guard-"
+                r"[A-Za-z0-9-]{1,128}", unit) is None):
+        return None
+    for attempt in range(3):
+        try:
+            pid = int(_run([
+                "systemctl", "show", "--property=MainPID", "--value", unit,
+            ], timeout=3) or "0")
+        except (OSError, RuntimeError, subprocess.SubprocessError,
+                TypeError, ValueError):
+            pid = 0
+        identity = _process_identity(pid)
+        if identity is not None:
+            return identity
+        if attempt < 2:
+            time.sleep(0.05)
+    return None
 
 
 def _parse_device_network_info(output):
@@ -245,12 +371,78 @@ def _atomic_text(path, content):
     temporary.replace(path)
 
 
+def _atomic_executable_copy(source, target, mode=0o755):
+    """Stage an executable without following an existing target symlink."""
+    source = Path(source)
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target_mode = target.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(target_mode):
+            raise RuntimeError(
+                f"Refusing unsafe updater staging path: {target}")
+    temporary = None
+    try:
+        with NamedTemporaryFile(
+                "wb", dir=target.parent,
+                prefix=f".{target.name}.", delete=False) as output:
+            temporary = Path(output.name)
+            with source.open("rb") as input_file:
+                shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _sha256_file(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _legacy_conflict_approval_token(directory):
+    """Bind a destructive request to one real directory and manifest inode."""
+    directory = Path(directory)
+    manifest = directory / "plugin.json"
+    directory_status = directory.lstat()
+    manifest_status = manifest.lstat()
+    if (not stat.S_ISDIR(directory_status.st_mode) or
+            not stat.S_ISREG(manifest_status.st_mode) or
+            any(ord(character) < 32 or ord(character) == 127
+                for character in directory.name)):
+        raise RuntimeError("The conflict path is unsafe for automatic removal.")
+    try:
+        metadata = json.loads(manifest.read_text())
+    except (OSError, ValueError, json.JSONDecodeError) as reason:
+        raise RuntimeError(
+            "The conflict manifest could not be validated.") from reason
+    if (not isinstance(metadata, dict) or
+            not isinstance(metadata.get("name"), str) or
+            metadata["name"].strip().casefold() !=
+            LEGACY_CONTROL_PLUGIN_NAME.casefold()):
+        raise RuntimeError("The approved plugin is no longer ROCKNIX Control.")
+    fingerprint = (
+        f"{directory}\t"
+        f"{directory_status.st_dev}:{directory_status.st_ino}:"
+        f"{int(directory_status.st_ctime)}\t"
+        f"{manifest_status.st_dev}:{manifest_status.st_ino}:"
+        f"{int(manifest_status.st_ctime)}:{manifest_status.st_size}\t"
+        f"{_sha256_file(manifest)}\n"
+    )
+    return hashlib.sha256(fingerprint.encode()).hexdigest()
 
 
 def _frontend_bundle_id(plugin_dir):
@@ -633,7 +825,18 @@ class Plugin:
             self.settings_dir / INSTALL_BACKEND_READY_FILE)
         self.install_frontend_ready_path = (
             self.settings_dir / INSTALL_FRONTEND_READY_FILE)
+        self.install_progress_path = (
+            self.settings_dir / INSTALL_PROGRESS_FILE)
+        self.install_progress_ack_path = (
+            self.settings_dir / INSTALL_PROGRESS_ACK_FILE)
+        self.backup_root = self.settings_dir.parent.parent / "plugin-backups"
+        self.plugins_root = Path(__file__).resolve().parent.parent
         self.install_health_response = None
+        self.install_status_generation = 0
+        self.install_status_transaction_id = ""
+        self.plugin_conflict_fingerprint = ""
+        self.startup_rgb_pending = False
+        self.mutation_transaction_local = threading.local()
         self.legacy_fan_guard_marker = self.settings_dir / "fan-curve-session.active"
         self.runtime_marker = self.settings_dir / "runtime-session.active"
         self.runtime_restore_request = (
@@ -642,6 +845,8 @@ class Plugin:
         self.runtime_lock_path = self.settings_dir / "runtime-session.lock"
         self.runtime_restore_path = self.settings_dir / "runtime-restore.py"
         self.runtime_guard_path = self.settings_dir / "runtime-restore-guard.sh"
+        self.runtime_guard_unit = ""
+        self.runtime_guard_identity = None
         self.plugin_loader_recovery_path = (
             self.settings_dir / "plugin_loader_recovery.py")
         self.canonical_fan_config = self.settings_dir / "rocknix-custom-fancontrol.conf"
@@ -658,6 +863,8 @@ class Plugin:
         self.monitor_revision = 0
         self.monitor_bypass_active = False
         self.monitor_charging_valid = None
+        self.last_rke_cpu_sample = None
+        self.backend_identity = _process_identity(os.getpid())
         self.battery_discharge_ema = None
         self.battery_discharge_samples = 0
         self.battery_discharge_last_sample = 0.0
@@ -678,6 +885,8 @@ class Plugin:
         self.lifecycle_active_path = None
         self.lifecycle_heartbeat_path = None
         self.lifecycle_ready_path = None
+        self.lifecycle_guard_unit = ""
+        self.lifecycle_guard_identity = None
 
     def _plugin_version(self):
         plugin_dir = Path(__file__).resolve().parent
@@ -800,6 +1009,403 @@ class Plugin:
             return True
         return await asyncio.to_thread(work)
 
+    def _plugin_conflict_state(self, record_transition=False):
+        """Return exact legacy plugin conflicts from immediate plugin children.
+
+        Detection deliberately uses the manifest identity, not a directory-name
+        guess. Symlinked plugins are still conflicts (Decky may load them), but
+        are never offered to the destructive maintenance helper.
+        """
+        plugins_root = Path(getattr(
+            self, "plugins_root", Path(__file__).resolve().parent.parent))
+        conflicts = []
+        scan_errors = []
+        try:
+            children = sorted(plugins_root.iterdir(), key=lambda path: path.name)
+        except OSError as reason:
+            children = []
+            scan_errors.append(f"Could not inspect Decky plugins: {reason}")
+        for directory in children:
+            try:
+                directory_mode = directory.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            except OSError as reason:
+                scan_errors.append(
+                    f"Could not inspect plugin path {directory.name}: {reason}")
+                continue
+            if not (stat.S_ISDIR(directory_mode) or
+                    (stat.S_ISLNK(directory_mode) and directory.is_dir())):
+                continue
+            manifest = directory / "plugin.json"
+            try:
+                manifest_mode = manifest.lstat().st_mode
+                metadata = json.loads(manifest.read_text())
+            except FileNotFoundError:
+                continue
+            except OSError as reason:
+                scan_errors.append(
+                    f"Could not inspect {directory.name}/plugin.json: {reason}")
+                continue
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if (not isinstance(metadata, dict) or
+                    not isinstance(metadata.get("name"), str) or
+                    metadata["name"].strip().casefold() !=
+                    LEGACY_CONTROL_PLUGIN_NAME.casefold()):
+                continue
+            version = str(metadata.get("version", "Unknown")).strip()
+            if not version or len(version) > 80 or any(
+                    character in version for character in "\r\n\0"):
+                version = "Unknown"
+            removable = (
+                stat.S_ISDIR(directory_mode) and
+                stat.S_ISREG(manifest_mode) and
+                directory.parent == plugins_root
+            )
+            conflicts.append({
+                "name": LEGACY_CONTROL_PLUGIN_NAME,
+                "version": version,
+                "directory": str(directory),
+                "removable": removable,
+                "reason": "" if removable else
+                    "Symlinked plugin paths cannot be removed automatically.",
+            })
+        scan_error = "; ".join(scan_errors)
+        blocked = bool(conflicts or scan_error)
+        if conflicts:
+            message = (
+                "ROCKNIX Control is installed and can compete with "
+                "RK-Enhanced for CPU, GPU, and fan control. Remove it before "
+                "using RK-Enhanced controls."
+            )
+        elif scan_error:
+            message = (
+                f"{scan_error} RK-Enhanced controls are disabled until the "
+                "plugin directory can be checked."
+            )
+        else:
+            message = ""
+        state = {
+            "blocked": blocked,
+            "conflicts": conflicts,
+            "message": message,
+            "scan_error": scan_error,
+        }
+        if record_transition:
+            fingerprint = json.dumps(state, sort_keys=True)
+            previous = getattr(self, "plugin_conflict_fingerprint", "")
+            if fingerprint != previous:
+                if blocked:
+                    decky.logger.error(
+                        "RK-Enhanced mutations blocked: " + message)
+                elif previous:
+                    decky.logger.info(
+                        "ROCKNIX Control conflict cleared; RK-Enhanced controls are available")
+                self.plugin_conflict_fingerprint = fingerprint
+        return state
+
+    def _require_mutations_allowed(self):
+        local = getattr(self, "mutation_transaction_local", None)
+        in_transaction = bool(local and getattr(local, "depth", 0))
+        if not in_transaction:
+            install_status = self._install_status()
+            if install_status["active"]:
+                raise RuntimeError(
+                    "An RK-Enhanced installation is in progress; controls are temporarily disabled.")
+            try:
+                with _exclusive_file_lock(INSTALL_TRANSACTION_LOCK, timeout=0):
+                    pass
+            except TimeoutError as reason:
+                raise RuntimeError(
+                    "An RK-Enhanced installation is starting; controls are temporarily disabled.") from reason
+            except OSError as reason:
+                raise RuntimeError(
+                    "The RK-Enhanced installation lock could not be verified; controls are disabled.") from reason
+        conflict = self._plugin_conflict_state(record_transition=True)
+        if conflict["blocked"]:
+            raise RuntimeError(conflict["message"])
+        return True
+
+    @contextmanager
+    def _install_mutation_guard(self):
+        """Serialize a complete backend mutation against install replacement."""
+        local = getattr(self, "mutation_transaction_local", None)
+        if local is None:
+            local = threading.local()
+            self.mutation_transaction_local = local
+        depth = int(getattr(local, "depth", 0) or 0)
+        if depth:
+            local.depth = depth + 1
+            try:
+                yield
+            finally:
+                local.depth = depth
+            return
+        try:
+            with _exclusive_file_lock(INSTALL_TRANSACTION_LOCK, timeout=0):
+                local.depth = 1
+                try:
+                    yield
+                finally:
+                    local.depth = 0
+        except TimeoutError as reason:
+            raise RuntimeError(
+                "An RK-Enhanced installation is in progress; controls are disabled.") from reason
+
+    @contextmanager
+    def _hardware_mutation_guard(self):
+        """Serialize and conflict-check one complete hardware/preset change."""
+        with self._install_mutation_guard():
+            conflict = self._plugin_conflict_state(
+                record_transition=True)
+            if conflict["blocked"]:
+                raise RuntimeError(conflict["message"])
+            yield
+
+    def _run_hardware_mutation(self, function, *arguments):
+        with self._hardware_mutation_guard():
+            return function(*arguments)
+
+    def _run_install_mutation(self, function, *arguments):
+        with self._install_mutation_guard():
+            return function(*arguments)
+
+    def _install_progress_paths(self):
+        settings_dir = Path(getattr(
+            self, "settings_dir",
+            Path(__file__).resolve().parent / "settings"))
+        progress = Path(getattr(
+            self, "install_progress_path",
+            settings_dir / INSTALL_PROGRESS_FILE))
+        acknowledgement = Path(getattr(
+            self, "install_progress_ack_path",
+            settings_dir / INSTALL_PROGRESS_ACK_FILE))
+        return progress, acknowledgement
+
+    @staticmethod
+    def _idle_install_status(message=""):
+        return {
+            "protocol": INSTALL_PROGRESS_PROTOCOL,
+            "transaction_id": "",
+            "generation": 0,
+            "active": False,
+            "terminal": False,
+            "kind": "",
+            "source_version": "",
+            "target_version": "",
+            "decky_version": "",
+            "phase": "idle",
+            "message": str(message),
+            "outcome": "idle",
+            "started_at": 0,
+            "updated_at": 0,
+            "success": False,
+            "rolled_back": False,
+            "error": "",
+            "acknowledged": False,
+        }
+
+    @staticmethod
+    def _validate_install_status_payload(payload):
+        if not isinstance(payload, dict):
+            raise ValueError("installer progress is not an object")
+        transaction_id = payload.get("transaction_id")
+        generation = payload.get("generation")
+        phase = payload.get("phase")
+        outcome = payload.get("outcome")
+        started_at = payload.get("started_at")
+        updated_at = payload.get("updated_at")
+        writer = payload.get("writer")
+        if payload.get("protocol") != INSTALL_PROGRESS_PROTOCOL:
+            raise ValueError("unsupported installer progress protocol")
+        if (not isinstance(transaction_id, str) or
+                not re.fullmatch(
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", transaction_id)):
+            raise ValueError("invalid installer transaction id")
+        if (isinstance(generation, bool) or not isinstance(generation, int) or
+                generation < 1):
+            raise ValueError("invalid installer generation")
+        if phase not in INSTALL_PROGRESS_PHASES:
+            raise ValueError("invalid installer phase")
+        if outcome not in INSTALL_PROGRESS_OUTCOMES:
+            raise ValueError("invalid installer outcome")
+        for field in ("active", "terminal", "rolled_back"):
+            if not isinstance(payload.get(field), bool):
+                raise ValueError(f"invalid installer {field} flag")
+        if (payload.get("success") is not None and
+                not isinstance(payload.get("success"), bool)):
+            raise ValueError("invalid installer success state")
+        for field in (
+                "kind", "source_version", "target_version", "decky_version",
+                "message"):
+            value = payload.get(field)
+            if (not isinstance(value, str) or len(value) > 2048 or
+                    "\0" in value):
+                raise ValueError(f"invalid installer {field}")
+        error = payload.get("error")
+        if (error is not None and
+                (not isinstance(error, str) or len(error) > 2048 or
+                 "\0" in error)):
+            raise ValueError("invalid installer error")
+        if not isinstance(writer, dict):
+            raise ValueError("invalid installer writer")
+        writer_pid = writer.get("pid")
+        writer_start = writer.get("start_time_ticks")
+        writer_boot = writer.get("boot_id")
+        if (isinstance(writer_pid, bool) or not isinstance(writer_pid, int) or
+                writer_pid <= 0 or isinstance(writer_start, bool) or
+                not isinstance(writer_start, int) or writer_start <= 0 or
+                not isinstance(writer_boot, str) or not writer_boot or
+                len(writer_boot) > 128 or "\0" in writer_boot):
+            raise ValueError("invalid installer writer identity")
+        if (isinstance(started_at, bool) or not isinstance(started_at, int) or
+                started_at <= 0 or isinstance(updated_at, bool) or
+                not isinstance(updated_at, int) or updated_at < started_at):
+            raise ValueError("invalid installer timestamps")
+        if payload["active"] == payload["terminal"]:
+            raise ValueError("installer active/terminal state is inconsistent")
+        if payload["active"] and outcome != "running":
+            raise ValueError("active installer outcome is not running")
+        if payload["active"] and payload["success"] is not None:
+            raise ValueError("active installer success state is already final")
+        if payload["terminal"] and outcome == "running":
+            raise ValueError("terminal installer outcome is still running")
+        if (payload["terminal"] and
+                payload["success"] != (outcome == "succeeded")):
+            raise ValueError("installer success state is inconsistent")
+        if payload["rolled_back"] != (outcome == "rolled-back"):
+            raise ValueError("installer rollback state is inconsistent")
+        normalized = dict(payload)
+        normalized["writer"] = dict(writer)
+        normalized["error"] = error or ""
+        return normalized
+
+    def _interrupt_stale_install_status(self, status, progress_path):
+        if not status["active"]:
+            return status
+        writer = status["writer"]
+        current_boot = _read("/proc/sys/kernel/random/boot_id")
+        writer_identity = _process_identity(writer["pid"])
+        writer_alive = (
+            writer_identity is not None and
+            writer_identity.get("start_time_ticks") ==
+            writer["start_time_ticks"]
+        )
+        stale = (
+            not current_boot or writer["boot_id"] != current_boot or
+            not writer_alive or
+            time.time() - status["updated_at"] >
+            INSTALL_PROGRESS_STALE_SECONDS
+        )
+        if not stale:
+            return status
+        # Both the SSH installer and detached updater hold this exact lock for
+        # the complete transaction. Acquiring it proves that an old active
+        # record has no live owner; this avoids mistaking a slow manual install
+        # for a crash merely because its progress timestamp is old.
+        try:
+            with _exclusive_file_lock(INSTALL_TRANSACTION_LOCK, timeout=0):
+                try:
+                    current = self._validate_install_status_payload(
+                        json.loads(progress_path.read_text()))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return status
+                if (current["transaction_id"] != status["transaction_id"] or
+                        current["generation"] != status["generation"] or
+                        not current["active"]):
+                    return current
+                now = int(time.time())
+                current.update({
+                    "active": False,
+                    "terminal": True,
+                    "phase": "failed",
+                    "message": "Installation was interrupted before completion.",
+                    "outcome": "failed",
+                    "updated_at": max(now, current["started_at"]),
+                    "success": False,
+                    "rolled_back": False,
+                    "error": "The installer transaction is no longer running.",
+                })
+                _atomic_text(
+                    progress_path,
+                    json.dumps(current, indent=2, sort_keys=True) + "\n")
+                progress_path.chmod(0o600)
+                decky.logger.error(
+                    "Marked stale installer transaction "
+                    f"{current['transaction_id']} as interrupted")
+                return current
+        except (OSError, TimeoutError):
+            return status
+
+    def _install_status(self):
+        progress_path, acknowledgement_path = self._install_progress_paths()
+        try:
+            payload = json.loads(progress_path.read_text())
+            status = self._validate_install_status_payload(payload)
+            status = self._interrupt_stale_install_status(
+                status, progress_path)
+            status = self._validate_install_status_payload(status)
+        except FileNotFoundError:
+            settings_dir = Path(getattr(
+                self, "settings_dir",
+                Path(__file__).resolve().parent / "settings"))
+            return self._idle_install_status(
+                _read(settings_dir / UPDATE_STATUS_FILE))
+        except (OSError, ValueError, json.JSONDecodeError) as reason:
+            unavailable = self._idle_install_status(
+                "Installer status is unavailable.")
+            unavailable.update({
+                "terminal": True,
+                "phase": "unavailable",
+                "outcome": "unavailable",
+                "error": str(reason),
+            })
+            return unavailable
+
+        seen_generation = int(getattr(
+            self, "install_status_generation", 0) or 0)
+        seen_transaction = str(getattr(
+            self, "install_status_transaction_id", "") or "")
+        if (status["generation"] < seen_generation or
+                (status["generation"] == seen_generation and
+                 seen_transaction and
+                 status["transaction_id"] != seen_transaction)):
+            unavailable = self._idle_install_status(
+                "Installer status was rejected as stale.")
+            unavailable.update({
+                "terminal": True,
+                "phase": "unavailable",
+                "outcome": "unavailable",
+                "error": "Installer generation moved backwards or changed identity.",
+            })
+            return unavailable
+        self.install_status_generation = status["generation"]
+        self.install_status_transaction_id = status["transaction_id"]
+        status["acknowledged"] = (
+            status["terminal"] and
+            _read(acknowledgement_path) == status["transaction_id"]
+        )
+        return status
+
+    async def get_install_status(self):
+        return await asyncio.to_thread(self._install_status)
+
+    async def ack_install_status(self, transaction_id):
+        def work():
+            requested = str(transaction_id)
+            status = self._install_status()
+            if (not status["terminal"] or not status["transaction_id"] or
+                    requested != status["transaction_id"]):
+                raise ValueError(
+                    "only the current completed installer transaction can be dismissed")
+            _, acknowledgement_path = self._install_progress_paths()
+            _atomic_text(acknowledgement_path, requested + "\n")
+            acknowledgement_path.chmod(0o600)
+            return True
+        return await asyncio.to_thread(work)
+
     def _load(self):
         try:
             data = json.loads(self.settings_path.read_text())
@@ -868,11 +1474,27 @@ class Plugin:
         if data.get("system_fan_curve") != normalized_system:
             data["system_fan_curve"] = normalized_system
             changed = True
-        if changed:
+        ownership_available = (
+            not self._install_status()["active"] and
+            not self._plugin_conflict_state()["blocked"]
+        )
+        if changed and ownership_available:
             self._save(data)
-        self._write_canonical_fan_config(data["system_fan_curve"])
-        if not FAN_CONFIG.exists():
-            _write_fan_curve(data["system_fan_curve"])
+        if ownership_available:
+            self._write_canonical_fan_config(data["system_fan_curve"])
+        # Creating the system Custom curve changes the same file used by the
+        # legacy control plugin. Keep settings migration readable, but never
+        # claim that shared fan boundary while a conflict exists.
+        if ownership_available and not FAN_CONFIG.exists():
+            try:
+                with self._hardware_mutation_guard():
+                    if not FAN_CONFIG.exists():
+                        _write_fan_curve(data["system_fan_curve"])
+            except RuntimeError:
+                # A transaction or conflict can appear after the read-only
+                # checks. State loading must stay available; Custom curve
+                # creation is safely deferred to a later generation.
+                pass
         return data
 
     def _write_canonical_fan_config(self, curve):
@@ -959,6 +1581,8 @@ class Plugin:
 
     def _start_plugin_lifecycle_guard(self):
         """Start an out-of-cgroup guard for this exact backend generation."""
+        self.lifecycle_guard_unit = ""
+        self.lifecycle_guard_identity = None
         self._install_plugin_loader_recovery_tool()
         owner = _process_identity(os.getpid())
         try:
@@ -972,6 +1596,7 @@ class Plugin:
         boot_id = _read("/proc/sys/kernel/random/boot_id")
         if owner is None or loader is None or not boot_id:
             raise RuntimeError("could not identify the PluginLoader generation")
+        self.backend_identity = owner
 
         token = secrets.token_hex(16)
         LIFECYCLE_RUN_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1032,8 +1657,12 @@ class Plugin:
                 _remove_lifecycle_current(token)
             except OSError:
                 pass
+            self.lifecycle_guard_unit = ""
+            self.lifecycle_guard_identity = None
             raise
 
+        self.lifecycle_guard_unit = unit
+        self.lifecycle_guard_identity = _guard_unit_identity(unit)
         self.lifecycle_token = token
         self.lifecycle_lease_path = lease_path
         self.lifecycle_active_path = active_path
@@ -1060,6 +1689,8 @@ class Plugin:
     def _mark_lifecycle_guard_clean(self):
         token = self.lifecycle_token
         if not token:
+            self.lifecycle_guard_unit = ""
+            self.lifecycle_guard_identity = None
             return False
         errors = []
         # Tombstone first. The independent guard treats a missing active file
@@ -1085,6 +1716,8 @@ class Plugin:
             self.lifecycle_active_path = None
             self.lifecycle_heartbeat_path = None
             self.lifecycle_ready_path = None
+            self.lifecycle_guard_unit = ""
+            self.lifecycle_guard_identity = None
         if errors:
             decky.logger.warning(
                 "PluginLoader lifecycle cleanup was incomplete: " +
@@ -1124,6 +1757,8 @@ class Plugin:
     def _ensure_runtime_session_locked(self, capabilities):
         if self.runtime_marker.exists():
             return self._runtime_state()
+        self.runtime_guard_unit = ""
+        self.runtime_guard_identity = None
         self.runtime_restore_request.unlink(missing_ok=True)
         self._install_runtime_restore_tools()
         state = self._capture_runtime_state(capabilities)
@@ -1137,9 +1772,13 @@ class Plugin:
                   str(self.runtime_state_path), str(self.runtime_restore_path),
                   str(self.canonical_fan_config), str(FAN_CONFIG)])
         except Exception:
+            self.runtime_guard_unit = ""
+            self.runtime_guard_identity = None
             self.runtime_marker.unlink(missing_ok=True)
             self.runtime_state_path.unlink(missing_ok=True)
             raise
+        self.runtime_guard_unit = unit
+        self.runtime_guard_identity = _guard_unit_identity(unit)
         decky.logger.info("Captured native runtime baseline and started restoration guard")
         return state
 
@@ -1177,6 +1816,8 @@ class Plugin:
 
     def _restore_runtime_session(self):
         if not self.runtime_marker.exists():
+            self.runtime_guard_unit = ""
+            self.runtime_guard_identity = None
             return False
         self._install_runtime_restore_tools()
         output = _run([
@@ -1186,6 +1827,8 @@ class Plugin:
         ], timeout=30)
         if self.runtime_marker.exists():
             raise RuntimeError(output or "runtime restoration did not complete")
+        self.runtime_guard_unit = ""
+        self.runtime_guard_identity = None
         decky.logger.info(output or "Restored native runtime baseline")
         return True
 
@@ -1206,15 +1849,22 @@ class Plugin:
 
     def _state(self):
         data = self._load()
+        conflict = self._plugin_conflict_state(record_transition=True)
         effective = _get_setting("cooling.profile", "")
         capabilities = _capabilities()
         capabilities["rgb"] = self.rgb.capabilities()
         return {"capabilities": capabilities, **data,
                 "active_preset": self.active_preset, "active_appid": self.active_appid,
                 "effective_cooling_profile": effective,
-                "fan_curve_active": effective == "custom" and self._fan_session_active()}
+                "fan_curve_active": effective == "custom" and self._fan_session_active(),
+                "plugin_conflict": conflict,
+                "mutations_blocked": conflict["blocked"]}
 
     def _apply(self, profile, capabilities=None):
+        with self._hardware_mutation_guard():
+            return self._apply_hardware(profile, capabilities)
+
+    def _apply_hardware(self, profile, capabilities=None):
         capabilities = capabilities or _capabilities()
         clean = _validate_profile(profile, capabilities)
         effective_cooling = _get_setting("cooling.profile", "")
@@ -1248,6 +1898,80 @@ class Plugin:
     async def get_state(self):
         return await asyncio.to_thread(self._state)
 
+    async def get_plugin_conflict(self):
+        return await asyncio.to_thread(
+            self._plugin_conflict_state, True)
+
+    async def remove_plugin_conflict(self):
+        """Start exact legacy-plugin removal outside PluginLoader's cgroup."""
+        def work():
+            if self._install_status()["active"]:
+                raise RuntimeError(
+                    "An RK-Enhanced installation is already in progress.")
+            conflict = self._plugin_conflict_state(record_transition=True)
+            removable = [
+                item for item in conflict["conflicts"]
+                if item.get("removable")
+            ]
+            if not removable:
+                if conflict["conflicts"]:
+                    raise RuntimeError(
+                        "The conflicting plugin path cannot be removed automatically.")
+                raise RuntimeError("No ROCKNIX Control plugin was detected.")
+            # Remove one exact plugin per Loader generation. If both legacy
+            # variants were installed separately, the next generation remains
+            # blocked and offers the second exact path rather than silently
+            # broadening this destructive request.
+            target_directory = removable[0]["directory"]
+            approval_token = _legacy_conflict_approval_token(
+                target_directory)
+            source = Path(__file__).resolve().parent / "updater.sh"
+            if not source.exists() or not stat.S_ISREG(source.lstat().st_mode):
+                raise RuntimeError(
+                    "updater.sh is missing from this RK-Enhanced installation")
+            detached = self.settings_dir / "maintenance-updater.sh"
+            try:
+                detached_mode = detached.lstat().st_mode
+            except FileNotFoundError:
+                detached_mode = None
+            if detached_mode is not None and not stat.S_ISREG(detached_mode):
+                raise RuntimeError(
+                    "the detached maintenance helper path is not a regular file")
+            self.settings_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_executable_copy(source, detached, mode=0o700)
+            before = self._install_status()
+            unit = (
+                f"rk-enhanced-conflict-removal-{os.getpid()}-"
+                f"{time.monotonic_ns()}")
+            _run(["systemctl", "reset-failed", unit + ".service"],
+                 check=False)
+            _run([
+                "systemd-run", f"--unit={unit}", "--collect",
+                str(detached), "--remove-rocknix-control", target_directory,
+                approval_token,
+            ], timeout=5)
+            transaction_id = ""
+            deadline = time.monotonic() + 0.75
+            while time.monotonic() < deadline:
+                current = self._install_status()
+                if (current["generation"] > before["generation"] and
+                        current.get("kind") == "remove-conflict"):
+                    transaction_id = current["transaction_id"]
+                    break
+                time.sleep(0.05)
+            decky.logger.info(
+                "Detached ROCKNIX Control removal started for exact path: "
+                f"{target_directory}")
+            return {
+                "started": True,
+                "transaction_id": transaction_id,
+                "message": (
+                    "Removing ROCKNIX Control without a backup; Decky will reload."
+                ),
+                "conflict": removable[0],
+            }
+        return await asyncio.to_thread(work)
+
     async def get_device_network_info(self):
         return await asyncio.to_thread(_device_network_info)
 
@@ -1255,16 +1979,38 @@ class Plugin:
         return await asyncio.to_thread(self.rgb.get_state)
 
     async def set_rgb_state(self, request):
+        self._require_mutations_allowed()
+        def work():
+            with self._hardware_mutation_guard():
+                return self.rgb.set_state(request)
         if self.rgb_lock is None:
             self.rgb_lock = asyncio.Lock()
         async with self.rgb_lock:
-            state = await asyncio.to_thread(self.rgb.set_state, request)
+            state = await asyncio.to_thread(work)
+        effect = state.get("effect") or (state.get("lighting") or {}).get("effect")
         decky.logger.info(
             f"Applied native RGB state: mode={state.get('mode')} "
-            f"effect={state.get('effect')}")
+            f"effect={effect}")
+        return state
+
+    async def set_rgb_calibration(self, request):
+        self._require_mutations_allowed()
+        def work():
+            with self._hardware_mutation_guard():
+                return self.rgb.set_calibration(request)
+        if self.rgb_lock is None:
+            self.rgb_lock = asyncio.Lock()
+        async with self.rgb_lock:
+            state = await asyncio.to_thread(work)
+        calibration = state.get("calibration") or {}
+        decky.logger.info(
+            "Applied native RGB calibration: "
+            f"green={calibration.get('green_percent')} "
+            f"blue={calibration.get('blue_percent')}")
         return state
 
     async def apply_profile(self, profile):
+        self._require_mutations_allowed()
         if self.lock is None:
             self.lock = asyncio.Lock()
         async with self.lock:
@@ -1272,6 +2018,7 @@ class Plugin:
 
     async def save_preset(self, name, profile):
         def work():
+            self._require_mutations_allowed()
             clean_name = _validate_name(name)
             capabilities = _capabilities()
             clean = _validate_profile(profile, capabilities)
@@ -1282,10 +2029,11 @@ class Plugin:
             decky.logger.info(f"Saved preset: {clean_name}")
             self.active_preset = clean_name
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def restore_steam_default(self):
         def work():
+            self._require_mutations_allowed()
             data = self._load()
             capabilities = _capabilities()
             restored = _validate_profile(data["steam_default_original"], capabilities)
@@ -1295,10 +2043,11 @@ class Plugin:
                 self._apply(restored, capabilities)
             decky.logger.info("Restored RK-E Default from its original setup snapshot")
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def rename_preset(self, old_name, new_name):
         def work():
+            self._require_mutations_allowed()
             old, new = str(old_name), _validate_name(new_name)
             if old == DEFAULT_PRESET:
                 raise ValueError(f"{DEFAULT_PRESET} cannot be renamed")
@@ -1314,10 +2063,11 @@ class Plugin:
                 self.active_preset = new
             self._save(data)
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def delete_preset(self, name):
         def work():
+            self._require_mutations_allowed()
             target = str(name)
             if target == DEFAULT_PRESET:
                 raise ValueError(f"{DEFAULT_PRESET} cannot be deleted")
@@ -1334,10 +2084,11 @@ class Plugin:
                 self._apply(data["presets"][DEFAULT_PRESET])
             self._save(data)
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def assign_game(self, appid, preset):
         def work():
+            self._require_mutations_allowed()
             game, target = str(appid), str(preset)
             if not game.isdigit() or game == "0":
                 raise ValueError("a running Steam game is required")
@@ -1350,10 +2101,11 @@ class Plugin:
                 self._apply(data["presets"][target])
                 self.active_preset = target
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def set_steam_default(self, preset):
         def work():
+            self._require_mutations_allowed()
             target = str(preset)
             data = self._load()
             if target not in data["presets"]:
@@ -1364,34 +2116,41 @@ class Plugin:
                 self._apply(data["presets"][target])
                 self.active_preset = target
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def save_system_fan_curve(self, curve):
         def work():
-            clean = _normalize_fan_curve(curve)
-            if not isinstance(curve, list) or len(clean) != len(curve):
-                raise ValueError("system fan curve must contain valid unique points")
-            previous_temp, previous_pwm = -1, -1
-            for temp, pwm in clean:
-                if not 10000 <= temp <= 120000 or not 0 <= pwm <= 255:
-                    raise ValueError("fan temperatures must be 10-120°C and PWM must be 0-255")
-                if temp <= previous_temp or pwm < previous_pwm:
-                    raise ValueError("fan temperature and PWM points must rise")
-                previous_temp, previous_pwm = temp, pwm
-            data = self._load()
-            data["system_fan_curve"] = clean
-            self._save(data)
-            self._write_canonical_fan_config(clean)
-            if not self._fan_session_active():
-                _write_fan_curve(clean)
-                if _get_setting("cooling.profile", "") == "custom":
-                    _restart_fancontrol()
-            decky.logger.info(f"Saved ROCKNIX Custom system fan curve: {clean}")
-            return self._state()
-        return await asyncio.to_thread(work)
+            self._require_mutations_allowed()
+            with self._hardware_mutation_guard():
+                clean = _normalize_fan_curve(curve)
+                if not isinstance(curve, list) or len(clean) != len(curve):
+                    raise ValueError(
+                        "system fan curve must contain valid unique points")
+                previous_temp, previous_pwm = -1, -1
+                for temp, pwm in clean:
+                    if not 10000 <= temp <= 120000 or not 0 <= pwm <= 255:
+                        raise ValueError(
+                            "fan temperatures must be 10-120°C and PWM must be 0-255")
+                    if temp <= previous_temp or pwm < previous_pwm:
+                        raise ValueError(
+                            "fan temperature and PWM points must rise")
+                    previous_temp, previous_pwm = temp, pwm
+                data = self._load()
+                data["system_fan_curve"] = clean
+                self._save(data)
+                self._write_canonical_fan_config(clean)
+                if not self._fan_session_active():
+                    _write_fan_curve(clean)
+                    if _get_setting("cooling.profile", "") == "custom":
+                        _restart_fancontrol()
+                decky.logger.info(
+                    f"Saved ROCKNIX Custom system fan curve: {clean}")
+                return self._state()
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def unassign_game(self, appid):
         def work():
+            self._require_mutations_allowed()
             data = self._load()
             game = str(appid)
             data["game_profiles"].pop(game, None)
@@ -1401,10 +2160,11 @@ class Plugin:
                 self._apply(data["presets"][fallback])
                 self.active_preset = fallback
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def activate_game(self, appid):
         def work():
+            self._require_mutations_allowed()
             target = str(appid or "")
             data = self._load()
             preset = data["game_profiles"].get(target, data["steam_default"])
@@ -1422,7 +2182,7 @@ class Plugin:
             self._apply(data["presets"][preset])
             self.active_preset = preset
             return {"applied": True, "preset": preset}
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     def _steam_scope_active(self):
         cgroups = (
@@ -1563,6 +2323,33 @@ class Plugin:
         steam_was_active = False
         while True:
             try:
+                install_status = await asyncio.to_thread(self._install_status)
+                if install_status["active"]:
+                    pending, confirmations = None, 0
+                    await asyncio.sleep(2)
+                    continue
+                conflict = await asyncio.to_thread(
+                    self._plugin_conflict_state, True)
+                if conflict["blocked"]:
+                    pending, confirmations = None, 0
+                    await asyncio.sleep(2)
+                    continue
+                if getattr(self, "startup_rgb_pending", False):
+                    try:
+                        self._require_mutations_allowed()
+                        def reapply_rgb():
+                            with self._hardware_mutation_guard():
+                                return self.rgb.reapply_startup()
+                        startup_rgb_action = await asyncio.to_thread(
+                            reapply_rgb)
+                        if startup_rgb_action:
+                            decky.logger.info(
+                                "Applied deferred RGB startup state after installation")
+                    except Exception as reason:
+                        decky.logger.warning(
+                            f"Unable to apply deferred RGB startup state: {reason}")
+                    finally:
+                        self.startup_rgb_pending = False
                 steam_active = await asyncio.to_thread(self._steam_scope_active)
                 if not steam_active:
                     steam_was_active = False
@@ -1688,6 +2475,75 @@ class Plugin:
             "revision": self.monitor_revision,
         }
 
+    def _rke_cpu_snapshot(self):
+        """Return cumulative counters for exact RK-E process-tree roots."""
+        backend = getattr(self, "backend_identity", None)
+        if backend is None:
+            backend = _process_identity(os.getpid())
+            self.backend_identity = backend
+        snapshot = {}
+        for identity in (
+                backend,
+                getattr(self, "lifecycle_guard_identity", None),
+                getattr(self, "runtime_guard_identity", None)):
+            if not isinstance(identity, dict):
+                continue
+            try:
+                root_key = (
+                    int(identity["pid"]), int(identity["start_time_ticks"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            tree = _process_tree_cpu_snapshot(identity)
+            if root_key in tree:
+                snapshot[root_key] = sum(tree.values())
+        return snapshot
+
+    def _rke_cpu_tracking_available(self):
+        """Return whether every expected RK-E root has an exact identity."""
+        if not isinstance(getattr(self, "backend_identity", None), dict):
+            return False
+        for unit_attribute, identity_attribute in (
+                ("lifecycle_guard_unit", "lifecycle_guard_identity"),
+                ("runtime_guard_unit", "runtime_guard_identity")):
+            if (getattr(self, unit_attribute, "") and
+                    not isinstance(getattr(self, identity_attribute, None), dict)):
+                return False
+        return True
+
+    def _sample_rke_cpu_percent(self, monitor_session, monitor_generation):
+        """Return top-style combined RK-E CPU load for the Monitor epoch."""
+        cpu_snapshot = self._rke_cpu_snapshot()
+        sampled_at = time.monotonic()
+        with self.monitor_lock:
+            if not self._monitor_current_locked(
+                    monitor_session, monitor_generation):
+                return None
+            previous = self.last_rke_cpu_sample
+            current = (
+                monitor_session, monitor_generation, cpu_snapshot, sampled_at)
+            if (previous is None or previous[0] != monitor_session or
+                    previous[1] != monitor_generation):
+                self.last_rke_cpu_sample = current
+                return None
+            elapsed = sampled_at - previous[3]
+            shared = cpu_snapshot.keys() & previous[2].keys()
+            deltas = [
+                cpu_snapshot[key] - previous[2][key] for key in shared]
+            if elapsed <= 0 or any(delta < 0 for delta in deltas):
+                # A process can be reaped between the exact parent/child proc
+                # reads. Never install that transiently regressed aggregate as
+                # the next baseline or its rebound would become a false spike.
+                self.last_rke_cpu_sample = None
+                return None
+            self.last_rke_cpu_sample = current
+            if not shared:
+                return None
+            cpu_delta = sum(deltas)
+        # Match top-style process accounting: 100% is one fully occupied
+        # logical core. Do not divide by the number of device CPUs because the
+        # purpose of this row is to reveal expensive plugin work.
+        return cpu_delta * 100 / elapsed
+
     def _reset_bypass_estimate_locked(self):
         self.battery_discharge_ema = None
         self.battery_discharge_samples = 0
@@ -1771,6 +2627,10 @@ class Plugin:
             cpu_percent = 100 * (total - idle) / total if total else 0
         if counters:
             self.last_cpu_sample = counters
+        rke_cpu_available = self._rke_cpu_tracking_available()
+        rke_cpu_percent = self._sample_rke_cpu_percent(
+            monitor_session, monitor_generation
+        ) if monitor_request and rke_cpu_available else None
         # Match MangoHud's msm_drm/KGSL backend on Qualcomm devices: this is
         # total GPU load, rather than the load of gamescope's DRM client.
         kgsl_load = _read_int(KGSL_GPU_ROOT / "gpu_busy_percentage", -1)
@@ -1870,6 +2730,10 @@ class Plugin:
                 max(primary_gpu_temps or gpu_temps) / 1000, 1
             ) if primary_gpu_temps or gpu_temps else 0,
             "cpu_percent": round(cpu_percent, 1),
+            "rke_cpu_percent": (
+                round(rke_cpu_percent, 1)
+                if rke_cpu_percent is not None else None),
+            "rke_cpu_available": rke_cpu_available,
             "gpu_percent": round(gpu_percent, 1),
             "cpu_clocks": [{"id": item["id"], "cpus": item["cpus"], "frequency": item["current"],
                             "minimum": item["minimum"], "maximum": item["effective_maximum"]} for item in cpu],
@@ -1903,6 +2767,7 @@ class Plugin:
                 raise RuntimeError("monitor activation is stale")
             self.monitor_session = monitor_session
             self.monitor_generation = monitor_generation
+            self.last_rke_cpu_sample = None
             self._invalidate_current_monitor_locked(force=True)
             # The new activation has not observed a charging status yet. Its
             # first invalid result must invalidate any telemetry that raced it,
@@ -1917,11 +2782,13 @@ class Plugin:
             if self._monitor_current_locked(monitor_session, monitor_generation):
                 self._invalidate_current_monitor_locked(force=True)
                 self.monitor_session = ""
+                self.last_rke_cpu_sample = None
             elif monitor_generation > self.monitor_generation:
                 # Tombstone an end which overtakes its begin RPC, so that the
                 # delayed activation cannot resurrect a hidden Monitor tab.
                 self.monitor_generation = monitor_generation
                 self.monitor_session = ""
+                self.last_rke_cpu_sample = None
                 self._invalidate_current_monitor_locked(force=True)
             return self._monitor_epoch_locked()
 
@@ -1996,10 +2863,14 @@ class Plugin:
         return status
 
     async def set_battery_policy(self, mode, limit=None):
-        if not self._load().get("experimental_unlocked", False):
-            raise RuntimeError("unlock experimental controls in Utils first")
-        result = await asyncio.to_thread(
-            self.charging.set_battery_policy, mode, limit)
+        self._require_mutations_allowed()
+        def work():
+            with self._hardware_mutation_guard():
+                if not self._load().get("experimental_unlocked", False):
+                    raise RuntimeError(
+                        "unlock experimental controls in Utils first")
+                return self.charging.set_battery_policy(mode, limit)
+        result = await asyncio.to_thread(work)
         with self.monitor_lock:
             if self.monitor_session:
                 self._invalidate_current_monitor_locked(force=True)
@@ -2010,11 +2881,15 @@ class Plugin:
         return result
 
     async def set_pump_profile(self, profile, experimental_risk_confirmed=False):
-        if not self._load().get("experimental_unlocked", False):
-            raise RuntimeError("unlock experimental controls in Utils first")
-        result = await asyncio.to_thread(
-            self.charging.set_pump_profile, profile,
-            experimental_risk_confirmed)
+        self._require_mutations_allowed()
+        def work():
+            with self._hardware_mutation_guard():
+                if not self._load().get("experimental_unlocked", False):
+                    raise RuntimeError(
+                        "unlock experimental controls in Utils first")
+                return self.charging.set_pump_profile(
+                    profile, experimental_risk_confirmed)
+        result = await asyncio.to_thread(work)
         operation = result.get("operation") or {}
         decky.logger.info(
             f"Pump profile request {operation.get('requested', profile)}: "
@@ -2030,7 +2905,7 @@ class Plugin:
             self._save(data)
             decky.logger.info("Experimental controls unlocked")
             return self._state()
-        return await asyncio.to_thread(work)
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
 
     async def lock_experimental(self):
         def work():
@@ -2039,6 +2914,190 @@ class Plugin:
             self._save(data)
             decky.logger.info("Experimental controls hidden")
             return self._state()
+        return await asyncio.to_thread(self._run_hardware_mutation, work)
+
+    def _backup_root_path(self):
+        return Path(getattr(
+            self, "backup_root",
+            self.settings_dir.parent.parent / "plugin-backups"))
+
+    @staticmethod
+    def _backup_tree_size(path):
+        """Count logical file bytes without following any symlink."""
+        total = 0
+        pending = [Path(path)]
+        while pending:
+            directory = pending.pop()
+            for child in directory.iterdir():
+                mode = child.lstat().st_mode
+                if stat.S_ISREG(mode):
+                    total += child.lstat().st_size
+                elif stat.S_ISDIR(mode):
+                    pending.append(child)
+                # Symlinks and special files are intentionally not followed or
+                # counted. rmtree removes their directory entries only.
+        return total
+
+    @staticmethod
+    def _backup_creation_order(path, status):
+        marker = Path(path) / ".rke-backup-created.json"
+        try:
+            marker_status = marker.lstat()
+            marker_data = json.loads(marker.read_text())
+            transaction_id = marker_data.get("transaction_id")
+            created_at = marker_data.get("created_at")
+            valid_marker = (
+                stat.S_ISREG(marker_status.st_mode) and
+                isinstance(marker_data, dict) and
+                set(marker_data) == {
+                    "protocol", "created_at", "transaction_id"} and
+                marker_data.get("protocol") == 1 and
+                not isinstance(created_at, bool) and
+                isinstance(created_at, int) and created_at > 0 and
+                created_at <= int(time.time()) + 300 and
+                isinstance(transaction_id, str) and
+                re.fullmatch(
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", transaction_id)
+            )
+            if valid_marker:
+                return created_at, 2, "marker"
+        except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+            pass
+        match = re.search(
+            r"-(\d{8}-\d{6})\.[A-Za-z0-9]+$", Path(path).name)
+        if match:
+            try:
+                created_at = int(time.mktime(time.strptime(
+                    match.group(1), "%Y%m%d-%H%M%S")))
+                return created_at, 1, "name"
+            except (OverflowError, ValueError):
+                pass
+        return int(status.st_mtime), 0, "mtime"
+
+    def _backup_cleanup_info(self):
+        root = self._backup_root_path()
+        try:
+            root_mode = root.lstat().st_mode
+        except FileNotFoundError:
+            return {
+                "eligible_count": 0,
+                "eligible_bytes": 0,
+                "kept": None,
+                "removable": [],
+                "errors": [],
+            }
+        except OSError as reason:
+            return {
+                "eligible_count": 0,
+                "eligible_bytes": 0,
+                "kept": None,
+                "removable": [],
+                "errors": [str(reason)],
+            }
+        if not stat.S_ISDIR(root_mode):
+            return {
+                "eligible_count": 0,
+                "eligible_bytes": 0,
+                "kept": None,
+                "removable": [],
+                "errors": ["The RK-Enhanced backup root is not a real directory."],
+            }
+
+        candidates = []
+        errors = []
+        try:
+            children = list(root.iterdir())
+        except OSError as reason:
+            children = []
+            errors.append(str(reason))
+        for child in children:
+            if not re.fullmatch(
+                    r"RK-Enhanced-before-[A-Za-z0-9._-]+", child.name):
+                continue
+            try:
+                status = child.lstat()
+                if (not stat.S_ISDIR(status.st_mode) or
+                        child.parent != root):
+                    continue
+                size = self._backup_tree_size(child)
+                created_at, order_source, created_source = (
+                    self._backup_creation_order(child, status))
+            except OSError as reason:
+                errors.append(f"{child.name}: {reason}")
+                continue
+            candidates.append({
+                "name": child.name,
+                "path": str(child),
+                "bytes": size,
+                "modified_at": int(status.st_mtime),
+                "created_at": created_at,
+                "created_source": created_source,
+                # Prefer the strongest creation evidence before comparing its
+                # timestamp. This prevents a skewed legacy mtime/name from
+                # making a marker-backed rollback snapshot disposable.
+                "_order": (order_source, created_at),
+            })
+        candidates.sort(
+            key=lambda item: (item["_order"], item["name"]),
+            reverse=True)
+        for item in candidates:
+            item.pop("_order", None)
+        kept = candidates[0] if candidates else None
+        removable = candidates[1:]
+        return {
+            "eligible_count": len(removable),
+            "eligible_bytes": sum(item["bytes"] for item in removable),
+            "kept": kept,
+            "removable": removable,
+            "errors": errors,
+        }
+
+    async def get_backup_cleanup_info(self):
+        return await asyncio.to_thread(self._backup_cleanup_info)
+
+    async def clean_old_backups(self):
+        def work():
+            root = self._backup_root_path()
+            try:
+                with _exclusive_file_lock(INSTALL_TRANSACTION_LOCK, timeout=0):
+                    before = self._backup_cleanup_info()
+                    if before["errors"]:
+                        raise RuntimeError(
+                            "Backup cleanup was withheld: " +
+                            "; ".join(before["errors"]))
+                    removed_count = 0
+                    removed_bytes = 0
+                    for summary in before["removable"]:
+                        path = Path(summary["path"])
+                        try:
+                            status = path.lstat()
+                        except FileNotFoundError:
+                            continue
+                        if (path.parent != root or
+                                not re.fullmatch(
+                                    r"RK-Enhanced-before-[A-Za-z0-9._-]+",
+                                    path.name) or
+                                not stat.S_ISDIR(status.st_mode)):
+                            raise RuntimeError(
+                                f"Backup changed during cleanup: {path.name}")
+                        shutil.rmtree(path)
+                        removed_count += 1
+                        removed_bytes += int(summary["bytes"])
+                    after = self._backup_cleanup_info()
+            except TimeoutError as reason:
+                raise RuntimeError(
+                    "An RK-Enhanced installation is already in progress; "
+                    "backup cleanup was not started.") from reason
+            decky.logger.info(
+                "Cleaned old RK-Enhanced backups: "
+                f"removed={removed_count} bytes={removed_bytes} "
+                f"kept={(after['kept'] or {}).get('name', 'none')}")
+            return {
+                **after,
+                "removed_count": removed_count,
+                "removed_bytes": removed_bytes,
+            }
         return await asyncio.to_thread(work)
 
     def _log_text(self):
@@ -2048,17 +3107,49 @@ class Plugin:
         else:
             log_dir = self.settings_dir.parent.parent / "logs" / "RK-Enhanced"
         try:
-            logs = sorted(log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime)
+            logs = sorted(
+                log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime)
         except OSError:
             logs = []
         if not logs:
             return "No RK-Enhanced log file found."
-        try:
-            lines = logs[-1].read_text(errors="replace").splitlines()
-        except OSError as error:
-            return f"Could not read log: {error}"
-        offset = self.log_offsets.get(str(logs[-1]), 0)
-        return "\n".join(lines[offset:][-200:])
+        entries = []
+        errors = []
+        timestamp_pattern = re.compile(
+            r"^\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})"
+            r"(?:,\d+)?\]?")
+        for log_path in logs:
+            try:
+                lines = log_path.read_text(errors="replace").splitlines()
+                modified = log_path.stat().st_mtime
+            except OSError as reason:
+                errors.append(f"Could not read {log_path.name}: {reason}")
+                continue
+            offset = self.log_offsets.get(str(log_path), 0)
+            if offset > len(lines):
+                offset = 0
+            visible = lines[offset:]
+            for index, line in enumerate(visible):
+                match = timestamp_pattern.match(line)
+                timestamp = modified + index / max(1, len(visible))
+                display = line
+                if match:
+                    try:
+                        timestamp = time.mktime(time.strptime(
+                            match.group(1).replace("T", " "),
+                            "%Y-%m-%d %H:%M:%S"))
+                    except ValueError:
+                        pass
+                    if not line.startswith("["):
+                        display = (
+                            "[" + match.group(1).replace("T", " ") + "]" +
+                            line[match.end():])
+                entries.append((timestamp, str(log_path), index, display))
+        entries.sort(key=lambda item: item[:3])
+        merged = [entry[3] for entry in entries[-400:]]
+        if errors:
+            merged.extend(errors)
+        return "\n".join(merged) if merged else "Log is empty."
 
     async def get_log(self):
         return await asyncio.to_thread(self._log_text)
@@ -2118,29 +3209,67 @@ class Plugin:
                 position = releases.index(installed)
                 if position + 1 < len(releases):
                     previous = releases[position + 1]
+            last_installed = _read(
+                self.settings_dir / LAST_INSTALLED_VERSION_FILE)
+            if (len(last_installed) > 64 or any(
+                    character not in
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                    for character in last_installed)):
+                last_installed = ""
+            last_installed_available = bool(
+                last_installed and last_installed != installed and
+                last_installed in releases)
+            if not last_installed_available:
+                last_installed = ""
             return {"installed": installed, "latest": latest,
                     "update_available": bool(latest and installed != latest),
-                    "previous": previous, "error": error}
+                    # `previous` remains the previous published GitHub release,
+                    # regardless of this device's actual upgrade path.
+                    "previous": previous,
+                    "previous_published": previous,
+                    "last_installed": last_installed,
+                    "last_installed_available": last_installed_available,
+                    "error": error}
         return await asyncio.to_thread(work)
 
-    async def install_release(self, version):
+    async def install_release(self, version, remove_conflict=False):
         def work():
             requested = str(version).strip()
+            if self._install_status()["active"]:
+                raise RuntimeError(
+                    "An RK-Enhanced installation is already in progress.")
+            if not isinstance(remove_conflict, bool):
+                raise ValueError("remove_conflict must be a boolean")
             if (not requested or len(requested) > 64 or
                     any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
                         for character in requested)):
                 raise ValueError("invalid release version")
+            conflict = self._plugin_conflict_state(record_transition=True)
+            if conflict["scan_error"]:
+                raise RuntimeError(conflict["message"])
+            if conflict["conflicts"] and not remove_conflict:
+                raise RuntimeError(
+                    "ROCKNIX Control must be removed before installing a release.")
+            if (remove_conflict and any(
+                    not item.get("removable")
+                    for item in conflict["conflicts"])):
+                raise RuntimeError(
+                    "A conflicting plugin path cannot be removed automatically.")
             source = Path(__file__).resolve().parent / "updater.sh"
             if not source.exists():
                 raise RuntimeError("updater.sh is missing from this RK-Enhanced installation")
             target = Path("/storage/homebrew/rk-enhanced-updater.sh")
-            shutil.copy2(source, target)
-            target.chmod(0o755)
+            _atomic_executable_copy(source, target)
             _atomic_text(self.settings_dir / UPDATE_STATUS_FILE,
                          f"Starting installation of {requested}…\n")
             _run(["systemctl", "reset-failed", "rk-enhanced-update.service"], check=False)
-            _run(["systemd-run", "--unit=rk-enhanced-update", "--collect",
-                  str(target), requested, "require-frontend"])
+            command = [
+                "systemd-run", "--unit=rk-enhanced-update", "--collect",
+                str(target), requested, "require-frontend",
+            ]
+            if remove_conflict:
+                command.append("remove-conflicting-rocknix-control")
+            _run(command)
             decky.logger.info(f"Detached release installation started: {requested}")
             return True
         return await asyncio.to_thread(work)
@@ -2168,19 +3297,51 @@ class Plugin:
                 f"Unable to start PluginLoader lifecycle guard: {reason}")
 
         def initialise():
+            conflict = self._plugin_conflict_state(record_transition=True)
             self._load()
+            # A prior RK-E owner may have died after applying a runtime
+            # session. Restore that exact owned baseline once before yielding;
+            # this is crash cleanup, not a new preset application. All new
+            # hardware ownership (including startup RGB reapply) remains
+            # blocked below while the legacy plugin is installed.
             if self.runtime_marker.exists():
                 self._restore_runtime_session()
             if self.legacy_fan_guard_marker.exists():
-                self._restore_legacy_system_fan_curve()
+                if conflict["blocked"]:
+                    # This older marker restoration unconditionally rewrites
+                    # fancontrol.conf and may restart native fancontrol. Defer
+                    # it until the conflicting controller has been removed;
+                    # unlike the ownership-aware runtime session above, it
+                    # cannot prove that its old values are still RK-E-owned.
+                    decky.logger.warning(
+                        "Deferred legacy fan-curve restoration until the "
+                        "ROCKNIX Control conflict is removed")
+                else:
+                    self._restore_legacy_system_fan_curve()
+            if conflict["blocked"]:
+                decky.logger.warning(
+                    "Skipped startup RGB and preset ownership because "
+                    "ROCKNIX Control conflicts with RK-Enhanced")
+                return
+            if self._install_status()["active"]:
+                self.startup_rgb_pending = True
+                decky.logger.info(
+                    "Deferred RGB startup state until the active installation completes")
+                return
             try:
-                if self.rgb.reapply_startup():
+                self._require_mutations_allowed()
+                with self._hardware_mutation_guard():
+                    startup_rgb_action = self.rgb.reapply_startup()
+                if startup_rgb_action == "calibration":
+                    decky.logger.info(
+                        "Reapplied the saved native RGB calibration")
+                elif startup_rgb_action:
                     decky.logger.info("Reapplied the saved native RGB animation")
             except Exception as reason:
                 # RGB support is optional and must never prevent the plugin
                 # from loading on unsupported or partially configured devices.
                 decky.logger.warning(
-                    f"Unable to reapply the saved RGB animation: {reason}")
+                    f"Unable to apply saved RGB startup state: {reason}")
         try:
             await asyncio.to_thread(initialise)
         except Exception:

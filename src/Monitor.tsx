@@ -30,6 +30,8 @@ const severity = (value: number, warning: number, critical: number) =>
 const temperatureColor = (value: number) => value >= 85 ? "#fc5c65"
   : value >= 70 ? "#f39c3d" : value >= 50 ? "#fed330" : "#26de81";
 const batteryColor = (value: number) => value <= 15 ? "#fc5c65" : value <= 30 ? "#fed330" : "#26de81";
+const rkeCpuColor = (value: number) => value >= 50 ? "#fc5c65"
+  : value >= 25 ? "#f39c3d" : value >= 10 ? "#fed330" : "#26de81";
 const clusterLabel = (index: number, cpus: string[]) => {
   if (!cpus.length) return `Cluster ${index + 1}`;
   return `Cluster ${index + 1} (${cpus.length > 1 ? `${cpus[0]}–${cpus[cpus.length - 1]}` : cpus[0]})`;
@@ -279,6 +281,11 @@ export function Monitor({ active }: { active: boolean }) {
   const oneMinuteLoad = data.load_average[0] || 0;
   const queueStatus = logicalCpus && oneMinuteLoad > logicalCpus ? "Overloaded"
     : logicalCpus && oneMinuteLoad >= logicalCpus * 0.75 ? "Busy" : "Normal";
+  const rkeCpuUsage = typeof data.rke_cpu_percent === "number" &&
+    Number.isFinite(data.rke_cpu_percent) ? data.rke_cpu_percent : null;
+  const rkeCpuLoadAvailable = data.rke_cpu_available && logicalCpus > 0;
+  const rkeCpuLoad = rkeCpuUsage === null || !logicalCpus
+    ? null : rkeCpuUsage / logicalCpus;
   const bypassSelected = batteryPolicyCurrent && batteryPolicy?.mode === "bypass";
   const batteryFlowState = !data.battery_power_available ? "Unavailable"
     : data.battery_flow_watts >= 0.2 ? "Charging"
@@ -347,6 +354,11 @@ export function Monitor({ active }: { active: boolean }) {
       <Metric label="CPU queue" value={logicalCpus ? queueStatus : "Unavailable"}
         detail={logicalCpus ? `${oneMinuteLoad.toFixed(1)} / ${logicalCpus} cores` : undefined}
         valueColor={queueStatus === "Overloaded" ? "#fc5c65" : queueStatus === "Busy" ? "#fed330" : "#26de81"} />
+      <Metric label="RK-E CPU Load"
+        value={!rkeCpuLoadAvailable ? "Unavailable"
+          : rkeCpuLoad === null ? "Calculating…" : `${rkeCpuLoad.toFixed(1)}%`}
+        valueColor={!rkeCpuLoadAvailable || rkeCpuLoad === null
+          ? undefined : rkeCpuColor(rkeCpuLoad)} />
       {error && <PanelSectionRow><Field label={error} /></PanelSectionRow>}
       <Heading onActivate={backToTop}>Back to top</Heading>
     </PanelSection>

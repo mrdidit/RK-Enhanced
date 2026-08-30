@@ -18,6 +18,11 @@ BACKUP_ROOT="${HOMEBREW_DIR}/plugin-backups"
 SETTINGS_DIR="${HOMEBREW_DIR}/settings/RK-Enhanced"
 STATUS_FILE="${SETTINGS_DIR}/update-status.txt"
 INSTALLED_VERSION_FILE="${SETTINGS_DIR}/installed-version.txt"
+LAST_INSTALLED_VERSION_FILE="${SETTINGS_DIR}/last-installed-version.txt"
+INSTALL_PROGRESS_FILE="${SETTINGS_DIR}/install-progress.json"
+LOG_DIR="${HOMEBREW_DIR}/logs/RK-Enhanced"
+INSTALL_JOURNAL_FILE="${LOG_DIR}/installer.log"
+INSTALL_JOURNAL_LIMIT=524288
 HEALTH_REQUEST_FILE="${SETTINGS_DIR}/install-health-request.json"
 BACKEND_READY_FILE="${SETTINGS_DIR}/install-backend-ready.json"
 FRONTEND_READY_FILE="${SETTINGS_DIR}/install-frontend-ready.json"
@@ -26,12 +31,65 @@ RECOVERY_LOCK_PATH="${RUN_ROOT}/lock/rk-enhanced-plugin-loader-recovery.lock"
 RECOVERY_MARKER_PATH="${RUN_ROOT}/rk-enhanced-plugin-loader-recovery.active"
 TRANSACTION_LOCK_PATH="${RUN_ROOT}/lock/rk-enhanced-install-transaction.lock"
 HEALTH_TIMEOUT="${RKE_HEALTH_TIMEOUT:-90}"
-requested_version="${1:-}"
-frontend_requirement="${2:-}"
+operation_kind="update"
+conflict_removal_target=""
+conflict_removal_approval=""
+requested_version=""
+frontend_requirement=""
+remove_conflicting_control=0
+if [ "${1:-}" = "--remove-rocknix-control" ]; then
+    operation_kind="remove-conflict"
+    conflict_removal_target="${2:-}"
+    conflict_removal_approval="${3:-}"
+    case "${conflict_removal_approval}" in
+        ""|*[!0-9a-f]* )
+            echo "Invalid exact conflict approval token." >&2
+            exit 1
+            ;;
+    esac
+    if [ -z "${conflict_removal_target}" ] || \
+       [ "${#conflict_removal_approval}" -ne 64 ] || [ -n "${4:-}" ]; then
+        echo "Usage: updater.sh --remove-rocknix-control EXACT_PLUGIN_DIRECTORY APPROVAL_SHA256" >&2
+        exit 1
+    fi
+else
+    requested_version="${1:-}"
+    frontend_requirement="${2:-}"
+    case "${3:-}" in
+        "") ;;
+        remove-conflicting-rocknix-control) remove_conflicting_control=1 ;;
+        *)
+            echo "Invalid updater conflict option." >&2
+            exit 1
+            ;;
+    esac
+    [ -z "${4:-}" ] || {
+        echo "Too many updater arguments." >&2
+        exit 1
+    }
+fi
+case "${RKE_REMOVE_CONFLICTING_ROCKNIX_CONTROL:-0}" in
+    1|true|yes) remove_conflicting_control=1 ;;
+    0|false|no|"") ;;
+    *)
+        echo "Invalid RKE_REMOVE_CONFLICTING_ROCKNIX_CONTROL value." >&2
+        exit 1
+        ;;
+esac
 maintenance_active=0
 transaction_active=0
 health_created=0
 transaction_committed=0
+progress_transaction_id=""
+progress_generation=0
+progress_started_at=0
+progress_source_version=""
+progress_target_version=""
+progress_decky_version=""
+progress_terminal_written=0
+progress_boot_id=""
+progress_writer_start=0
+legacy_control_removed=0
 
 case "${frontend_requirement}" in
     ""|require-frontend) ;;
@@ -41,10 +99,226 @@ case "${frontend_requirement}" in
         ;;
 esac
 
-mkdir -p "$(dirname "${STATUS_FILE}")" "${BACKUP_ROOT}"
+mkdir -p "$(dirname "${STATUS_FILE}")" "${BACKUP_ROOT}" "${LOG_DIR}"
 
 write_status() {
     printf '%s\n' "$1" > "${STATUS_FILE}"
+}
+
+rotate_installer_journal() {
+    mkdir -p "${LOG_DIR}" || return 1
+    if [ -f "${INSTALL_JOURNAL_FILE}" ]; then
+        rke_journal_size="$(wc -c < "${INSTALL_JOURNAL_FILE}" 2>/dev/null | tr -d ' ')" || \
+            rke_journal_size=0
+        case "${rke_journal_size}" in
+            ""|*[!0-9]*) rke_journal_size=0 ;;
+        esac
+        if [ "${rke_journal_size}" -ge "${INSTALL_JOURNAL_LIMIT}" ]; then
+            mv -f "${INSTALL_JOURNAL_FILE}" "${INSTALL_JOURNAL_FILE}.1" || return 1
+        fi
+    fi
+    return 0
+}
+
+append_installer_journal() {
+    rke_journal_outcome="$1"
+    rke_journal_phase="$2"
+    rke_journal_message="$(printf '%s' "$3" | tr '\r\n' '  ')"
+    rotate_installer_journal || return 1
+    printf '%s [%s] [%s] [%s] [%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "${progress_transaction_id:-unassigned}" "${operation_kind}" \
+        "${rke_journal_phase}" "${rke_journal_outcome}" \
+        "${rke_journal_message}" >> "${INSTALL_JOURNAL_FILE}" || return 1
+    chmod 600 "${INSTALL_JOURNAL_FILE}" 2>/dev/null || true
+}
+
+begin_progress_transaction() {
+    mkdir -p "${SETTINGS_DIR}" || return 1
+    progress_transaction_id="$(cat "${PROC_ROOT}/sys/kernel/random/uuid" 2>/dev/null)" || \
+        return 1
+    progress_boot_id="$(cat "${PROC_ROOT}/sys/kernel/random/boot_id" 2>/dev/null)" || \
+        return 1
+    progress_writer_start="$(process_start_time "$$")" || return 1
+    [ -n "${progress_transaction_id}" ] && [ -n "${progress_boot_id}" ] || return 1
+    rke_previous_generation="$(jq -r \
+        'if .protocol == 1 and (.generation | type) == "number" then .generation else 0 end' \
+        "${INSTALL_PROGRESS_FILE}" 2>/dev/null || printf '0')"
+    case "${rke_previous_generation}" in
+        ""|*[!0-9]*) rke_previous_generation=0 ;;
+    esac
+    progress_generation=$((rke_previous_generation + 1))
+    progress_started_at="$(date +%s)"
+    return 0
+}
+
+publish_install_progress() {
+    rke_progress_outcome="$1"
+    rke_progress_phase="$2"
+    rke_progress_message="$3"
+    rke_progress_error="${4:-}"
+    case "${rke_progress_outcome}" in
+        running)
+            rke_progress_active=true
+            rke_progress_terminal=false
+            rke_progress_success=null
+            rke_progress_rolled_back=false
+            ;;
+        succeeded)
+            rke_progress_active=false
+            rke_progress_terminal=true
+            rke_progress_success=true
+            rke_progress_rolled_back=false
+            ;;
+        rolled-back)
+            rke_progress_active=false
+            rke_progress_terminal=true
+            rke_progress_success=false
+            rke_progress_rolled_back=true
+            ;;
+        failed|blocked)
+            rke_progress_active=false
+            rke_progress_terminal=true
+            rke_progress_success=false
+            rke_progress_rolled_back=false
+            ;;
+        *) return 1 ;;
+    esac
+    rke_progress_temporary="$(mktemp \
+        "${SETTINGS_DIR}/install-progress.XXXXXX")" || return 1
+    if ! jq -n \
+        --arg transaction_id "${progress_transaction_id}" \
+        --argjson generation "${progress_generation}" \
+        --arg kind "${operation_kind}" \
+        --arg source_version "${progress_source_version}" \
+        --arg target_version "${progress_target_version}" \
+        --arg decky_version "${progress_decky_version}" \
+        --arg phase "${rke_progress_phase}" \
+        --arg message "${rke_progress_message}" \
+        --arg outcome "${rke_progress_outcome}" \
+        --arg error "${rke_progress_error}" \
+        --arg boot_id "${progress_boot_id}" \
+        --argjson writer_pid "$$" \
+        --argjson writer_start_time_ticks "${progress_writer_start}" \
+        --argjson active "${rke_progress_active}" \
+        --argjson terminal "${rke_progress_terminal}" \
+        --argjson success "${rke_progress_success}" \
+        --argjson rolled_back "${rke_progress_rolled_back}" \
+        --argjson started_at "${progress_started_at}" \
+        --argjson updated_at "$(date +%s)" \
+        '{protocol: 1, transaction_id: $transaction_id,
+          generation: $generation, active: $active, terminal: $terminal,
+          kind: $kind, source_version: $source_version,
+          target_version: $target_version, decky_version: $decky_version,
+          phase: $phase, message: $message, outcome: $outcome,
+          started_at: $started_at, updated_at: $updated_at,
+          writer: {pid: $writer_pid, start_time_ticks: $writer_start_time_ticks,
+                   boot_id: $boot_id},
+          success: $success, rolled_back: $rolled_back,
+          error: (if $error == "" then null else $error end)}' \
+        > "${rke_progress_temporary}"; then
+        rm -f "${rke_progress_temporary}"
+        return 1
+    fi
+    chmod 600 "${rke_progress_temporary}" || {
+        rm -f "${rke_progress_temporary}"
+        return 1
+    }
+    mv "${rke_progress_temporary}" "${INSTALL_PROGRESS_FILE}" || return 1
+    if [ "${rke_progress_terminal}" = true ]; then
+        progress_terminal_written=1
+    fi
+    return 0
+}
+
+record_install_event() {
+    rke_event_outcome="$1"
+    rke_event_phase="$2"
+    rke_event_message="$3"
+    rke_event_error="${4:-}"
+    write_status "${rke_event_message}" || true
+    publish_install_progress "${rke_event_outcome}" "${rke_event_phase}" \
+        "${rke_event_message}" "${rke_event_error}" || true
+    append_installer_journal "${rke_event_outcome}" "${rke_event_phase}" \
+        "${rke_event_message}" || true
+}
+
+normalized_plugin_name() {
+    jq -r 'select((.name | type) == "string") | .name |
+        gsub("^\\s+|\\s+$"; "") | ascii_downcase' "$1" 2>/dev/null
+}
+
+scan_legacy_rocknix_control() {
+    rke_conflict_output="$1"
+    : > "${rke_conflict_output}" || return 1
+    [ -d "${PLUGINS_DIR}" ] || return 0
+    for rke_conflict_path in "${PLUGINS_DIR}"/*; do
+        [ -d "${rke_conflict_path}" ] || continue
+        rke_conflict_manifest="${rke_conflict_path}/plugin.json"
+        [ -f "${rke_conflict_manifest}" ] || continue
+        if [ "$(normalized_plugin_name "${rke_conflict_manifest}")" = \
+             "rocknix control" ]; then
+            printf '%s\n' "${rke_conflict_path}" >> "${rke_conflict_output}" || return 1
+        fi
+    done
+}
+
+validate_legacy_rocknix_control_path() {
+    rke_conflict_path="$1"
+    rke_conflict_prefix="${PLUGINS_DIR}/"
+    [ -d "${PLUGINS_DIR}" ] && [ ! -L "${PLUGINS_DIR}" ] || return 1
+    case "${rke_conflict_path}" in
+        "${rke_conflict_prefix}"*)
+            rke_conflict_leaf="${rke_conflict_path#"${rke_conflict_prefix}"}"
+            ;;
+        *) return 1 ;;
+    esac
+    case "${rke_conflict_leaf}" in
+        ""|.|..|*/*) return 1 ;;
+    esac
+    if printf '%s' "${rke_conflict_leaf}" | grep -q '[[:cntrl:]]'; then
+        return 1
+    fi
+    [ "${rke_conflict_path}" = "${rke_conflict_prefix}${rke_conflict_leaf}" ] || return 1
+    [ -d "${rke_conflict_path}" ] && [ ! -L "${rke_conflict_path}" ] || return 1
+    rke_conflict_manifest="${rke_conflict_path}/plugin.json"
+    [ -f "${rke_conflict_manifest}" ] && [ ! -L "${rke_conflict_manifest}" ] || return 1
+    [ "$(normalized_plugin_name "${rke_conflict_manifest}")" = \
+      "rocknix control" ]
+}
+
+fingerprint_legacy_rocknix_control() {
+    rke_conflict_input="$1"
+    rke_conflict_output="$2"
+    : > "${rke_conflict_output}" || return 1
+    while IFS= read -r rke_conflict_path; do
+        [ -n "${rke_conflict_path}" ] || continue
+        validate_legacy_rocknix_control_path "${rke_conflict_path}" || return 1
+        rke_conflict_manifest="${rke_conflict_path}/plugin.json"
+        rke_conflict_directory_identity="$(stat -c '%d:%i:%Z' \
+            "${rke_conflict_path}")" || return 1
+        rke_conflict_manifest_identity="$(stat -c '%d:%i:%Z:%s' \
+            "${rke_conflict_manifest}")" || return 1
+        rke_conflict_manifest_digest="$(sha256sum \
+            "${rke_conflict_manifest}" | cut -d ' ' -f 1)" || return 1
+        printf '%s\t%s\t%s\t%s\n' \
+            "${rke_conflict_path}" \
+            "${rke_conflict_directory_identity}" \
+            "${rke_conflict_manifest_identity}" \
+            "${rke_conflict_manifest_digest}" \
+            >> "${rke_conflict_output}" || return 1
+    done < "${rke_conflict_input}"
+}
+
+wait_for_native_fancontrol() {
+    rke_fan_deadline=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "${rke_fan_deadline}" ]; do
+        if systemctl_bounded is-active --quiet fancontrol.service; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 systemctl_bounded() {
@@ -387,12 +661,165 @@ wait_for_rke_health() {
     return 1
 }
 
-for command in curl cut flock grep jq sed sha256sum systemctl timeout tr unzip wc; do
+for command in cmp curl cut flock grep jq sed sha256sum stat systemctl timeout tr unzip wc; do
     if ! command -v "${command}" >/dev/null 2>&1; then
         write_status "Update failed: missing ${command}"
         exit 1
     fi
 done
+
+remove_all_legacy_rocknix_control() {
+    rke_conflict_approved="$1"
+    rke_conflict_approved_fingerprint="$2"
+    rke_conflict_current_fingerprint="${work_dir}/rocknix-control-remove.fingerprint"
+    fingerprint_legacy_rocknix_control \
+        "${rke_conflict_approved}" \
+        "${rke_conflict_current_fingerprint}" || return 1
+    cmp -s "${rke_conflict_approved_fingerprint}" \
+        "${rke_conflict_current_fingerprint}" || return 1
+    # All approved paths have now been revalidated. Delete only that exact set.
+    while IFS= read -r rke_conflict_path; do
+        [ -n "${rke_conflict_path}" ] || continue
+        rm -rf "${rke_conflict_path}" || return 1
+        legacy_control_removed=1
+        append_installer_journal running removing-conflict \
+            "Removed conflicting ROCKNIX Control plugin at ${rke_conflict_path}; no backup was created." || true
+    done < "${rke_conflict_approved}"
+    systemctl_bounded start fancontrol.service >/dev/null 2>&1 || return 1
+    wait_for_native_fancontrol 10 || return 1
+    return 0
+}
+
+verify_standalone_conflict_approval() {
+    rke_conflict_approved_path="${work_dir}/standalone-conflict-approved.txt"
+    rke_conflict_approved_fingerprint="${work_dir}/standalone-conflict.fingerprint"
+    printf '%s\n' "${conflict_removal_target}" \
+        > "${rke_conflict_approved_path}" || return 1
+    fingerprint_legacy_rocknix_control \
+        "${rke_conflict_approved_path}" \
+        "${rke_conflict_approved_fingerprint}" || return 1
+    rke_conflict_current_approval="$(sha256sum \
+        "${rke_conflict_approved_fingerprint}" | cut -d ' ' -f 1)" || return 1
+    [ "${rke_conflict_current_approval}" = \
+      "${conflict_removal_approval}" ]
+}
+
+run_standalone_conflict_removal() {
+    work_dir="$(mktemp -d /tmp/rk-enhanced-conflict-removal.XXXXXX)"
+    conflict_service_was_active=0
+    conflict_loader_stop_attempted=0
+    conflict_removal_committed=0
+
+    cleanup_standalone_conflict_removal() {
+        rke_conflict_result=$?
+        trap - EXIT HUP INT TERM
+        set +e
+        if [ "${rke_conflict_result}" -ne 0 ] && \
+           [ "${conflict_removal_committed}" -ne 1 ]; then
+            if [ "${conflict_loader_stop_attempted}" -eq 1 ]; then
+                systemctl_bounded start fancontrol.service >/dev/null 2>&1 || true
+                if [ "${conflict_service_was_active}" -eq 1 ]; then
+                    systemctl_bounded start "${PLUGIN_LOADER_UNIT}" >/dev/null 2>&1 || true
+                    wait_for_plugin_loader_start 15 || true
+                fi
+            fi
+            end_plugin_loader_maintenance
+            if [ "${progress_terminal_written}" -ne 1 ] && \
+               [ -n "${progress_transaction_id}" ]; then
+                record_install_event failed failed \
+                    "ROCKNIX Control removal failed; PluginLoader recovery was attempted." \
+                    "Removal exited with status ${rke_conflict_result}."
+            fi
+        fi
+        end_plugin_loader_maintenance
+        end_install_transaction
+        rm -rf "${work_dir}"
+        exit "${rke_conflict_result}"
+    }
+    trap cleanup_standalone_conflict_removal EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if ! begin_install_transaction; then
+        write_status "ROCKNIX Control removal blocked: another RK-Enhanced transaction is active"
+        append_installer_journal blocked blocked \
+            "ROCKNIX Control removal blocked because another RK-Enhanced transaction is active." || true
+        exit 1
+    fi
+    if ! begin_progress_transaction; then
+        write_status "ROCKNIX Control removal failed: progress state could not be initialized"
+        exit 1
+    fi
+    progress_source_version="$(sed -n '1p' "${INSTALLED_VERSION_FILE}" 2>/dev/null || true)"
+    progress_target_version="${progress_source_version}"
+    record_install_event running starting \
+        "ROCKNIX Control removal started."
+
+    if ! verify_standalone_conflict_approval; then
+        record_install_event blocked blocked \
+            "ROCKNIX Control removal was blocked; the approved plugin identity no longer matches." \
+            "Request removal again to approve the current exact path and manifest."
+        exit 1
+    fi
+    record_install_event running preflight \
+        "Validated conflicting ROCKNIX Control at ${conflict_removal_target}; removal is permanent and creates no backup."
+    if systemctl_bounded is-active --quiet "${PLUGIN_LOADER_UNIT}"; then
+        conflict_service_was_active=1
+    fi
+    if ! begin_plugin_loader_maintenance; then
+        record_install_event failed failed \
+            "ROCKNIX Control removal failed because another PluginLoader maintenance action is active." \
+            "PluginLoader maintenance lock is busy."
+        exit 1
+    fi
+    conflict_loader_stop_attempted=1
+    record_install_event running stopping-decky \
+        "Stopping Decky before removing ROCKNIX Control."
+    if ! stop_plugin_loader_bounded; then
+        record_install_event failed failed \
+            "ROCKNIX Control removal failed because Decky did not stop within the bounded timeout." \
+            "PluginLoader stop timed out."
+        exit 1
+    fi
+    if ! verify_standalone_conflict_approval; then
+        record_install_event failed failed \
+            "ROCKNIX Control changed during maintenance; nothing was deleted." \
+            "Exact path and manifest identity revalidation failed after Decky stopped."
+        exit 1
+    fi
+    record_install_event running removing-conflict \
+        "Removing ${conflict_removal_target} without a backup."
+    rm -rf "${conflict_removal_target}"
+    systemctl_bounded start fancontrol.service >/dev/null 2>&1
+    if ! wait_for_native_fancontrol 10; then
+        record_install_event failed failed \
+            "ROCKNIX Control was removed, but native fancontrol did not become active." \
+            "fancontrol.service failed to start."
+        exit 1
+    fi
+    if [ "${conflict_service_was_active}" -eq 1 ]; then
+        record_install_event running starting-decky \
+            "Restarting Decky after conflict removal."
+        systemctl_bounded start "${PLUGIN_LOADER_UNIT}"
+        if ! wait_for_plugin_loader_start 15; then
+            record_install_event failed failed \
+                "ROCKNIX Control was removed and fancontrol restored, but Decky did not restart." \
+                "PluginLoader start timed out."
+            exit 1
+        fi
+    fi
+    end_plugin_loader_maintenance
+    record_install_event succeeded completed \
+        "ROCKNIX Control was removed without a backup; native fancontrol is active."
+    conflict_removal_committed=1
+    end_install_transaction
+    exit 0
+}
+
+if [ "${operation_kind}" = "remove-conflict" ]; then
+    run_standalone_conflict_removal
+fi
 
 work_dir="$(mktemp -d /tmp/rk-enhanced-update.XXXXXX)"
 backup_dir=""
@@ -403,10 +830,14 @@ preserve_recovery=0
 loader_backup=""
 loader_version_backup=""
 installed_version_backup=""
+last_installed_version_backup=""
 loader_existed=0
 loader_had_version=0
 installed_version_existed=0
+last_installed_version_existed=0
+last_installed_version_changed=0
 installed_version_temporary=""
+last_installed_version_temporary=""
 service_was_active=0
 loader_stop_attempted=0
 files_mutated=0
@@ -422,7 +853,8 @@ cleanup_failure() {
         rollback_health_verified=0
         rollback_legacy=0
         if [ "${loader_stop_attempted}" -eq 1 ] || [ "${files_mutated}" -eq 1 ]; then
-            write_status "Update failed; rolling back RK-Enhanced and Decky"
+            record_install_event running rolling-back \
+                "Update failed; restoring the previous RK-Enhanced and Decky state."
             if [ "${maintenance_active}" -ne 1 ] && \
                ! begin_plugin_loader_maintenance_bounded 10; then
                 rollback_lock=0
@@ -436,6 +868,7 @@ cleanup_failure() {
                     clear_install_health
                     if [ -n "${backup_dir}" ] && [ -d "${backup_dir}" ]; then
                         rm -rf "${PLUGIN_DIR}"
+                        rm -f "${backup_dir}/.rke-backup-created.json"
                         if ! mv "${backup_dir}" "${PLUGIN_DIR}"; then
                             rollback_ok=0
                         fi
@@ -465,6 +898,16 @@ cleanup_failure() {
                         fi
                     else
                         rm -f "${INSTALLED_VERSION_FILE}"
+                    fi
+                    if [ "${last_installed_version_changed}" -eq 1 ]; then
+                        if [ "${last_installed_version_existed}" -eq 1 ]; then
+                            if ! cp -p "${last_installed_version_backup}" \
+                                "${LAST_INSTALLED_VERSION_FILE}"; then
+                                rollback_ok=0
+                            fi
+                        else
+                            rm -f "${LAST_INSTALLED_VERSION_FILE}"
+                        fi
                     fi
                 fi
                 if [ "${service_was_active}" -eq 1 ] && [ "${loader_existed}" -eq 1 ]; then
@@ -505,23 +948,41 @@ cleanup_failure() {
                 health_created=0
             fi
             if [ "${rollback_ok}" -eq 1 ]; then
+                rollback_conflict_note=""
+                if [ "${legacy_control_removed}" -eq 1 ]; then
+                    rollback_conflict_note=" Conflicting ROCKNIX Control remains permanently removed."
+                fi
                 if [ "${rollback_health_verified}" -eq 1 ]; then
-                    write_status "Update failed; previous RK-Enhanced and Decky restored; backend verified"
+                    record_install_event rolled-back rolled-back \
+                        "Update failed; previous RK-Enhanced and Decky restored; backend verified.${rollback_conflict_note}" \
+                        "The requested release did not pass verification."
                 elif [ "${rollback_legacy}" -eq 1 ]; then
-                    write_status "Update failed; previous RK-Enhanced and Decky restored; legacy backend unverified"
+                    record_install_event rolled-back rolled-back \
+                        "Update failed; previous RK-Enhanced and Decky restored; legacy backend unverified.${rollback_conflict_note}" \
+                        "The requested release did not pass verification."
                 else
-                    write_status "Update failed; previous Decky state and RK-Enhanced files restored"
+                    record_install_event rolled-back rolled-back \
+                        "Update failed; previous Decky state and RK-Enhanced files restored.${rollback_conflict_note}" \
+                        "The requested release did not complete."
                 fi
             else
                 if [ "${rollback_lock}" -eq 0 ]; then
-                    write_status "Update failed; rollback lock busy, no unlocked restoration attempted"
+                    record_install_event failed failed \
+                        "Update failed; rollback lock was busy and no unlocked restoration was attempted." \
+                        "Manual recovery is required."
                 else
-                    write_status "Update failed and rollback needs manual recovery"
+                    record_install_event failed failed \
+                        "Update failed and rollback needs manual recovery." \
+                        "Automatic rollback did not complete."
                 fi
                 preserve_recovery=1
             fi
         else
-            write_status "Update failed before installed files or Decky state changed"
+            if [ "${progress_terminal_written}" -ne 1 ]; then
+                record_install_event failed failed \
+                    "Update failed before installed files or Decky state changed." \
+                    "Updater exited with status ${result}."
+            fi
         fi
     fi
     if [ "${health_created}" -eq 1 ]; then
@@ -532,10 +993,15 @@ cleanup_failure() {
     if [ -n "${installed_version_temporary}" ]; then
         rm -f "${installed_version_temporary}"
     fi
+    if [ -n "${last_installed_version_temporary}" ]; then
+        rm -f "${last_installed_version_temporary}"
+    fi
     if [ -n "${recovery_dir}" ] && [ "${preserve_recovery}" -eq 0 ]; then
         rm -rf "${recovery_dir}"
     elif [ -n "${recovery_dir}" ] && [ "${preserve_recovery}" -eq 1 ]; then
-        write_status "Update failed; manual recovery files: ${recovery_dir}"
+        record_install_event failed failed \
+            "Update failed; manual recovery files: ${recovery_dir}" \
+            "Manual recovery files were preserved."
     fi
     rm -rf "${work_dir}"
     exit "${result}"
@@ -547,10 +1013,68 @@ trap 'exit 143' TERM
 
 if ! begin_install_transaction; then
     write_status "Update failed: another RK-Enhanced install or update is running"
+    append_installer_journal blocked blocked \
+        "Update blocked because another RK-Enhanced transaction is active." || true
     exit 1
 fi
 
-write_status "Checking the newest published Decky release…"
+if ! begin_progress_transaction; then
+    write_status "Update failed: progress state could not be initialized"
+    exit 1
+fi
+progress_source_version="$(sed -n '1p' "${INSTALLED_VERSION_FILE}" 2>/dev/null || true)"
+if [ -z "${progress_source_version}" ] && [ -d "${PLUGIN_DIR}" ]; then
+    progress_source_version="$(plugin_release_version \
+        "${PLUGIN_DIR}" 2>/dev/null || true)"
+fi
+if [ -n "${progress_source_version}" ]; then
+    record_install_event running starting \
+        "RK-Enhanced transaction started from ${progress_source_version}."
+else
+    record_install_event running starting \
+        "RK-Enhanced transaction started without installed-version metadata."
+fi
+
+legacy_conflicts="${work_dir}/rocknix-control-conflicts.txt"
+legacy_conflict_fingerprint="${work_dir}/rocknix-control-conflicts.fingerprint"
+if ! scan_legacy_rocknix_control "${legacy_conflicts}"; then
+    record_install_event failed failed \
+        "Update failed because installed plugins could not be scanned safely." \
+        "Plugin conflict scan failed."
+    exit 1
+fi
+if [ -s "${legacy_conflicts}" ]; then
+    if [ "${remove_conflicting_control}" -ne 1 ]; then
+        record_install_event blocked blocked \
+            "Conflicting ROCKNIX Control detected; update was blocked before files changed." \
+            "Remove the original ROCKNIX Control or Rocknix Control Enhanced installation first."
+        exit 1
+    fi
+    while IFS= read -r rke_conflict_path; do
+        [ -n "${rke_conflict_path}" ] || continue
+        if ! validate_legacy_rocknix_control_path "${rke_conflict_path}"; then
+            record_install_event blocked blocked \
+                "ROCKNIX Control was detected, but its plugin path is unsafe for automatic deletion." \
+                "Remove the symlinked or otherwise unsafe conflicting plugin manually."
+            exit 1
+        fi
+    done < "${legacy_conflicts}"
+    if ! fingerprint_legacy_rocknix_control \
+        "${legacy_conflicts}" "${legacy_conflict_fingerprint}"; then
+        record_install_event blocked blocked \
+            "ROCKNIX Control removal approval could not be recorded safely." \
+            "No conflicting plugin was removed."
+        exit 1
+    fi
+    record_install_event running preflight \
+        "Conflicting ROCKNIX Control detected; explicit permanent removal was approved."
+else
+    : > "${legacy_conflict_fingerprint}"
+    record_install_event running preflight "Plugin conflict preflight passed."
+fi
+
+record_install_event running checking-releases \
+    "Checking the newest published Decky release."
 decky_metadata="${work_dir}/decky.json"
 curl -fL "https://api.github.com/repos/${DECKY_REPOSITORY}/releases?per_page=20" \
     -o "${decky_metadata}"
@@ -561,24 +1085,32 @@ decky_url="$(jq -r "${decky_release_filter} | .url // empty" \
     "${decky_metadata}")"
 decky_digest="$(jq -r "${decky_release_filter} | .digest // empty" \
     "${decky_metadata}")"
+progress_decky_version="${decky_version}"
 if [ -z "${decky_version}" ] || [ -z "${decky_url}" ]; then
-    write_status "Update failed: newest published Decky could not be resolved"
+    record_install_event failed failed \
+        "Update failed: newest published Decky could not be resolved." \
+        "Decky release metadata did not contain a usable PluginLoader asset."
     exit 1
 fi
+record_install_event running downloading "Downloading Decky ${decky_version}."
 curl -fL "${decky_url}" -o "${work_dir}/PluginLoader"
 if [ -n "${decky_digest}" ]; then
     expected="${decky_digest#sha256:}"
     actual="$(sha256sum "${work_dir}/PluginLoader" | cut -d' ' -f1)"
     if [ "${actual}" != "${expected}" ]; then
-        write_status "Update failed: Decky checksum mismatch"
+        record_install_event failed failed \
+            "Update failed: Decky checksum mismatch." \
+            "Downloaded PluginLoader did not match its published digest."
         exit 1
     fi
 fi
 
 if [ -n "${requested_version}" ]; then
-    write_status "Downloading RK-Enhanced ${requested_version}…"
+    record_install_event running checking-releases \
+        "Resolving RK-Enhanced ${requested_version}."
 else
-    write_status "Downloading the latest RK-Enhanced release…"
+    record_install_event running checking-releases \
+        "Resolving the latest RK-Enhanced release."
 fi
 metadata="${work_dir}/releases.json"
 curl -fL "https://api.github.com/repos/${RKE_REPOSITORY}/releases?per_page=10" -o "${metadata}"
@@ -586,11 +1118,16 @@ release_filter='[.[] | select(.draft == false) | . as $release | $release.assets
 version="$(jq -r --arg requested "${requested_version}" "${release_filter} | .version // empty" "${metadata}")"
 url="$(jq -r --arg requested "${requested_version}" "${release_filter} | .url // empty" "${metadata}")"
 digest="$(jq -r --arg requested "${requested_version}" "${release_filter} | .digest // empty" "${metadata}")"
+progress_target_version="${version}"
 
 if [ -z "${version}" ] || [ -z "${url}" ]; then
-    write_status "Update failed: no RK-Enhanced release asset found"
+    record_install_event failed failed \
+        "Update failed: no RK-Enhanced release asset was found." \
+        "The requested published release does not contain RK-Enhanced.zip."
     exit 1
 fi
+record_install_event running checking-releases \
+    "Selected RK-Enhanced ${version} and Decky ${decky_version}."
 
 # Keep the current detached updater when moving backwards through the
 # published release order. Older plugin code can then safely return to the
@@ -609,40 +1146,53 @@ if [ -n "${requested_version}" ] && [ -n "${installed_version}" ]; then
     fi
 fi
 
+record_install_event running downloading "Downloading RK-Enhanced ${version}."
 curl -fL "${url}" -o "${work_dir}/RK-Enhanced.zip"
 if [ -n "${digest}" ]; then
     expected="${digest#sha256:}"
     actual="$(sha256sum "${work_dir}/RK-Enhanced.zip" | cut -d' ' -f1)"
     if [ "${actual}" != "${expected}" ]; then
-        write_status "Update failed: release checksum mismatch"
+        record_install_event failed failed \
+            "Update failed: RK-Enhanced release checksum mismatch." \
+            "Downloaded RK-Enhanced.zip did not match its published digest."
         exit 1
     fi
 fi
 
 unzip -q "${work_dir}/RK-Enhanced.zip" -d "${work_dir}/release"
+record_install_event running validating \
+    "Validating downloaded Decky and RK-Enhanced files."
 staged="${work_dir}/release/RK-Enhanced"
 if [ ! -f "${staged}/plugin.json" ] || [ ! -f "${staged}/main.py" ] || \
    [ ! -f "${staged}/charging.py" ] || \
    [ ! -f "${staged}/runtime-restore.py" ] || \
    [ ! -f "${staged}/runtime-restore-guard.sh" ] || \
    [ ! -f "${staged}/dist/index.js" ] || [ ! -f "${staged}/updater.sh" ]; then
-    write_status "Update failed: invalid release layout"
+    record_install_event failed failed \
+        "Update failed: invalid RK-Enhanced release layout." \
+        "Required plugin files are missing."
     exit 1
 fi
 if grep -q 'rgb\.py' "${staged}/main.py" && [ ! -f "${staged}/rgb.py" ]; then
-    write_status "Update failed: release is missing its RGB backend"
+    record_install_event failed failed \
+        "Update failed: release is missing its RGB backend." \
+        "The staged backend imports rgb.py but the file is absent."
     exit 1
 fi
 if grep -q 'plugin_loader_recovery\.py' "${staged}/main.py" && \
    [ ! -f "${staged}/plugin_loader_recovery.py" ]; then
-    write_status "Update failed: release is missing its PluginLoader recovery helper"
+    record_install_event failed failed \
+        "Update failed: release is missing its PluginLoader recovery helper." \
+        "The staged backend imports plugin_loader_recovery.py but the file is absent."
     exit 1
 fi
 health_supported=0
 if [ -e "${staged}/install-health.json" ] || \
    [ -e "${staged}/dist/frontend-integrity.json" ]; then
     if ! health_protocol_supported "${staged}"; then
-        write_status "Update failed: invalid install-health metadata or frontend integrity"
+        record_install_event failed failed \
+            "Update failed: invalid install-health metadata or frontend integrity." \
+            "The staged release did not pass frontend integrity validation."
         exit 1
     fi
     health_supported=1
@@ -653,6 +1203,9 @@ elif [ -n "${requested_version}" ] && \
     preserve_updater=1
 else
     write_status "Update failed: release is missing required install-health metadata"
+    record_install_event failed failed \
+        "Update failed: release is missing required install-health metadata." \
+        "Only explicitly allowlisted legacy releases may omit health metadata."
     exit 1
 fi
 if [ "${preserve_updater}" -eq 1 ]; then
@@ -666,12 +1219,17 @@ chmod 700 "${recovery_dir}"
 loader_backup="${recovery_dir}/PluginLoader.previous"
 loader_version_backup="${recovery_dir}/loader-version.previous"
 installed_version_backup="${recovery_dir}/installed-version.previous"
+last_installed_version_backup="${recovery_dir}/last-installed-version.previous"
+record_install_event running backing-up \
+    "Creating rollback files for the current RK-Enhanced and Decky installation."
 
 if systemctl_bounded is-active --quiet "${PLUGIN_LOADER_UNIT}"; then
     service_was_active=1
 fi
 if [ ! -f "${PLUGIN_LOADER_PATH}" ]; then
-    write_status "Update failed: the current Decky executable is missing"
+    record_install_event failed failed \
+        "Update failed: the current Decky executable is missing." \
+        "PluginLoader could not be backed up."
     exit 1
 fi
 loader_existed=1
@@ -683,6 +1241,10 @@ fi
 if [ -f "${INSTALLED_VERSION_FILE}" ]; then
     installed_version_existed=1
     cp -p "${INSTALLED_VERSION_FILE}" "${installed_version_backup}"
+fi
+if [ -f "${LAST_INSTALLED_VERSION_FILE}" ]; then
+    last_installed_version_existed=1
+    cp -p "${LAST_INSTALLED_VERSION_FILE}" "${last_installed_version_backup}"
 fi
 if [ -d "${PLUGIN_DIR}" ]; then
     plugin_had_current=1
@@ -696,20 +1258,64 @@ if [ -z "${frontend_requirement}" ] && \
     frontend_requirement="require-frontend"
 fi
 
-write_status "Installing ${version}; Decky is reloading…"
+record_install_event running stopping-decky \
+    "Stopping Decky through bounded PluginLoader maintenance."
 if ! begin_plugin_loader_maintenance; then
-    write_status "Update failed: another PluginLoader maintenance action is running"
+    record_install_event failed failed \
+        "Update failed: another PluginLoader maintenance action is running." \
+        "PluginLoader maintenance lock is busy."
     exit 1
 fi
 loader_stop_attempted=1
 if ! stop_plugin_loader_bounded; then
-    write_status "Update failed: Decky did not stop within the bounded timeout"
+    record_install_event failed failed \
+        "Update failed: Decky did not stop within the bounded timeout." \
+        "PluginLoader stop timed out."
     exit 1
 fi
 
+late_conflicts="${work_dir}/rocknix-control-late-conflicts.txt"
+late_conflict_fingerprint="${work_dir}/rocknix-control-late-conflicts.fingerprint"
+if ! scan_legacy_rocknix_control "${late_conflicts}"; then
+    record_install_event failed failed \
+        "Update failed: plugin conflict revalidation could not be completed." \
+        "No installed plugin files were changed."
+    exit 1
+fi
+if ! fingerprint_legacy_rocknix_control \
+    "${late_conflicts}" "${late_conflict_fingerprint}" || \
+   ! cmp -s "${legacy_conflict_fingerprint}" \
+        "${late_conflict_fingerprint}"; then
+    record_install_event failed failed \
+        "Update blocked because the approved ROCKNIX Control conflict set changed." \
+        "Rerun the update to review and approve the current exact paths."
+    exit 1
+fi
+if [ -s "${late_conflicts}" ]; then
+    record_install_event running removing-conflict \
+        "Revalidating and removing conflicting ROCKNIX Control installations without a backup."
+    if ! remove_all_legacy_rocknix_control \
+        "${legacy_conflicts}" "${legacy_conflict_fingerprint}"; then
+        record_install_event failed failed \
+            "Update failed while removing ROCKNIX Control or restoring native fancontrol." \
+            "Conflict removal did not complete safely."
+        exit 1
+    fi
+    record_install_event running removing-conflict \
+        "ROCKNIX Control removal completed; native fancontrol is active."
+fi
+
 files_mutated=1
+record_install_event running installing \
+    "Installing RK-Enhanced ${version} and Decky ${decky_version}."
 if [ "${plugin_had_current}" -eq 1 ]; then
     mv "${PLUGIN_DIR}" "${backup_dir}"
+    jq -n \
+        --argjson created_at "$(date +%s)" \
+        --arg transaction_id "${progress_transaction_id}" \
+        '{protocol: 1, created_at: $created_at, transaction_id: $transaction_id}' \
+        > "${backup_dir}/.rke-backup-created.json"
+    chmod 600 "${backup_dir}/.rke-backup-created.json"
 fi
 plugin_install_attempted=1
 mv "${staged}" "${PLUGIN_DIR}"
@@ -724,14 +1330,20 @@ chmod 755 "${PLUGIN_LOADER_PATH}"
 printf '%s\n' "${decky_version}" > "${PLUGIN_LOADER_VERSION_FILE}"
 if [ "${health_supported}" -eq 1 ]; then
     if ! write_install_health_request "${version}" "${frontend_requirement}"; then
-        write_status "Update failed: could not create a fresh install health challenge"
+        record_install_event failed failed \
+            "Update failed: could not create a fresh install health challenge." \
+            "Nonce-bound readiness challenge creation failed."
         exit 1
     fi
 fi
 
+record_install_event running starting-decky \
+    "Starting Decky with the tentative RK-Enhanced installation."
 systemctl_bounded start "${PLUGIN_LOADER_UNIT}"
 if ! wait_for_plugin_loader_start 15; then
-    write_status "Update failed: Decky did not start within the bounded timeout"
+    record_install_event failed failed \
+        "Update failed: Decky did not start within the bounded timeout." \
+        "PluginLoader start timed out."
     exit 1
 fi
 # Lifecycle publication uses the same lock as maintenance. Release it only
@@ -739,9 +1351,12 @@ fi
 # frontend responses while the separate transaction lock prevents overlap.
 end_plugin_loader_maintenance
 if [ "${health_supported}" -eq 1 ]; then
-    write_status "Verifying RK-Enhanced ${version} with Decky ${decky_version}…"
+    record_install_event running verifying \
+        "Verifying RK-Enhanced ${version} with Decky ${decky_version}."
     if ! wait_for_rke_health "${frontend_requirement}"; then
-        write_status "Update failed: RK-Enhanced did not pass backend/frontend readiness"
+        record_install_event failed failed \
+            "Update failed: RK-Enhanced did not pass required readiness checks." \
+            "Backend or frontend readiness verification timed out."
         exit 1
     fi
     if [ "${frontend_requirement}" = "require-frontend" ]; then
@@ -757,7 +1372,19 @@ installed_version_temporary="$(mktemp \
 printf '%s\n' "${version}" > "${installed_version_temporary}"
 chmod 600 "${installed_version_temporary}"
 mv "${installed_version_temporary}" "${INSTALLED_VERSION_FILE}"
-write_status "Installed ${version} with Decky ${decky_version}; ${install_result}"
+installed_version_temporary=""
+if [ -n "${progress_source_version}" ] && \
+   [ "${progress_source_version}" != "${version}" ]; then
+    last_installed_version_temporary="$(mktemp \
+        "${SETTINGS_DIR}/last-installed-version.XXXXXX")"
+    printf '%s\n' "${progress_source_version}" > "${last_installed_version_temporary}"
+    chmod 600 "${last_installed_version_temporary}"
+    last_installed_version_changed=1
+    mv "${last_installed_version_temporary}" "${LAST_INSTALLED_VERSION_FILE}"
+    last_installed_version_temporary=""
+fi
+record_install_event succeeded completed \
+    "Installed ${version} with Decky ${decky_version}; ${install_result}."
 if [ "${health_created}" -eq 1 ]; then
     clear_install_health
     health_created=0

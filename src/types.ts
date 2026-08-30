@@ -36,9 +36,33 @@ export interface GpuCapability {
 }
 
 export type RgbMode = "off" | "battery" | "rgb";
-export type RgbEffect = "static" | "breath" | "rainbow";
+export type RgbLegacyEffect = "static" | "breath" | "rainbow";
+export type RgbEvoEffect = "static" | "breath" | "rgb-breath" | "rainbow" | "reactive";
+export type RgbEffect = RgbLegacyEffect | RgbEvoEffect;
 export type RgbColor = [number, number, number];
-export type RgbProvider = "none" | "sysfs-effects" | "analog-static";
+export type RgbProvider = "none" | "sysfs-effects" | "analog-static" | "pocket-evo-v3";
+export type RgbEvoLayoutMode = "both" | "per-stick" | "quadrants";
+
+export interface RgbEvoZone {
+  id: string;
+  color: RgbColor;
+  brightness: number;
+}
+
+export interface RgbEvoLighting {
+  effect: RgbEvoEffect;
+  layout_mode: RgbEvoLayoutMode;
+  zones: RgbEvoZone[];
+  color: RgbColor;
+  brightness: number;
+  idle_color: RgbColor;
+  active_color: RgbColor;
+}
+
+export interface RgbEvoCalibration {
+  green_percent: number;
+  blue_percent: number;
+}
 
 export interface RgbCapability {
   available: boolean;
@@ -49,33 +73,71 @@ export interface RgbCapability {
   max_brightness: number;
 }
 
-export interface RgbRequest {
-  provider: Exclude<RgbProvider, "none">;
+export interface RgbLegacyRequest {
+  provider: "sysfs-effects" | "analog-static";
   revision: string;
   mode: RgbMode;
-  effect: RgbEffect;
+  effect: RgbLegacyEffect;
   color: RgbColor;
   brightness: number;
   correction: boolean;
 }
 
-export interface RgbState {
+export interface RgbEvoRequest {
+  provider: "pocket-evo-v3";
+  revision: string;
+  mode: "off" | "rgb";
+  lighting: RgbEvoLighting;
+}
+
+export type RgbRequest = RgbLegacyRequest | RgbEvoRequest;
+
+export interface RgbCalibrationRequest {
+  provider: "pocket-evo-v3";
+  revision: string;
+  action: "save" | "reset" | "raw";
+  green_percent?: number;
+  blue_percent?: number;
+}
+
+interface RgbStateBase {
   supported: boolean;
   valid: boolean;
   provider: RgbProvider;
   revision: string;
-  zones_differ: boolean;
   modes: RgbMode[];
   effects: RgbEffect[];
   shared_zone: boolean;
   max_brightness: number;
+  error: string;
+}
+
+export interface RgbUnavailableState extends RgbStateBase {
+  provider: "none";
+  mode: "unknown";
+}
+
+export interface RgbLegacyState extends RgbStateBase {
+  provider: "sysfs-effects" | "analog-static";
+  zones_differ: boolean;
   mode: RgbMode | "unknown";
-  effect: RgbEffect;
+  effect: RgbLegacyEffect;
   color: RgbColor;
   brightness: number;
   correction: boolean;
-  error: string;
 }
+
+export interface RgbEvoState extends RgbStateBase {
+  provider: "pocket-evo-v3";
+  mode: "off" | "rgb" | "unknown";
+  temporarily_gated: boolean;
+  lighting: RgbEvoLighting;
+  resume_lighting: RgbEvoLighting | null;
+  calibration: RgbEvoCalibration;
+  calibration_override: RgbEvoCalibration | null;
+}
+
+export type RgbState = RgbUnavailableState | RgbLegacyState | RgbEvoState;
 
 export interface Capabilities {
   cpu: CpuPolicy[];
@@ -98,6 +160,10 @@ export interface State {
   active_appid: string;
   effective_cooling_profile: string;
   fan_curve_active: boolean;
+  /** Runtime safety gate. Optional while upgrading from an older backend. */
+  mutations_blocked?: boolean;
+  /** Exact ROCKNIX Control identity conflicts found beside RK-Enhanced. */
+  plugin_conflict?: PluginConflictStatus;
 }
 
 export interface Telemetry {
@@ -114,6 +180,8 @@ export interface Telemetry {
   cpu_hotspot_temperature: number;
   gpu_temperature: number;
   cpu_percent: number;
+  rke_cpu_percent: number | null;
+  rke_cpu_available: boolean;
   gpu_percent: number;
   cpu_clocks: { id: string; cpus: string[]; frequency: number; minimum: number; maximum: number }[];
   cpu_governor: string;
@@ -224,6 +292,100 @@ export interface UpdateInfo {
   installed: string;
   latest: string;
   update_available: boolean;
+  /** The immediately preceding published GitHub release, not install history. */
   previous: string;
+  /** Last version replaced on this device, when reliable history is available. */
+  last_installed?: string;
+  last_installed_available?: boolean;
+  previous_published?: string;
   error: string;
+}
+
+export type InstallProgressPhase =
+  | "idle"
+  | "starting"
+  | "preflight"
+  | "checking-releases"
+  | "downloading"
+  | "validating"
+  | "backing-up"
+  | "removing-conflict"
+  | "stopping-decky"
+  | "installing"
+  | "starting-decky"
+  | "verifying"
+  | "rolling-back"
+  | "completed"
+  | "rolled-back"
+  | "blocked"
+  | "failed"
+  | string;
+
+export type InstallProgressOutcome =
+  | "idle"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "rolled-back"
+  | "blocked"
+  | string;
+
+/** Persisted installer state; timestamps are Unix seconds. */
+export interface InstallProgress {
+  protocol: number;
+  transaction_id: string;
+  generation: number;
+  active: boolean;
+  terminal: boolean;
+  acknowledged?: boolean;
+  kind: string;
+  source_version: string;
+  target_version: string;
+  decky_version: string;
+  phase: InstallProgressPhase;
+  message: string;
+  outcome: InstallProgressOutcome;
+  started_at: number;
+  updated_at: number;
+  success: boolean | null;
+  rolled_back: boolean;
+  error: string;
+}
+
+export interface PluginConflict {
+  name: string;
+  version: string;
+  directory: string;
+  removable?: boolean;
+  reason?: string;
+}
+
+export interface PluginConflictStatus {
+  blocked: boolean;
+  conflicts: PluginConflict[];
+  message: string;
+  scan_error?: string;
+}
+
+export interface ConflictRemovalResult {
+  started: boolean;
+  transaction_id: string;
+  message: string;
+}
+
+export interface BackupSummary {
+  name: string;
+  path: string;
+  bytes: number;
+  modified_at: number;
+}
+
+export interface BackupCleanupInfo {
+  eligible_count: number;
+  eligible_bytes: number;
+  kept: BackupSummary | null;
+  removable: BackupSummary[];
+  errors?: string[];
+  removed_count?: number;
+  removed_bytes?: number;
 }

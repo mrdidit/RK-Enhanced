@@ -4,37 +4,97 @@ import {
 } from "@decky/ui";
 import { useEffect, useRef, useState } from "react";
 import type { Ref } from "react";
-import { getRgbState, setRgbState } from "./backend";
-import type { RgbColor, RgbEffect, RgbMode, RgbRequest, RgbState } from "./types";
+import { getRgbState, setRgbCalibration, setRgbState } from "./backend";
+import {
+  calibrationRequest, cloneEvoLighting, cloneRgbColor, cloneRgbRequest,
+  rgbFailureDisposition, sameEvoCalibration, sameEvoLighting,
+  setEvoLayoutMode, setEvoStaticGroup,
+} from "./rgbModel";
+import type {
+  RgbColor, RgbEffect, RgbEvoCalibration, RgbEvoEffect, RgbEvoLayoutMode,
+  RgbEvoRequest, RgbLegacyEffect, RgbLegacyRequest, RgbMode, RgbRequest,
+  RgbState,
+} from "./types";
 
 const MODE_LABELS: Record<RgbMode, string> = {
   off: "Off",
   battery: "Battery",
   rgb: "RGB",
 };
-const EFFECT_LABELS: Record<RgbEffect, string> = {
+const LEGACY_EFFECT_LABELS: Record<RgbLegacyEffect, string> = {
   static: "Static",
   breath: "Breath",
   rainbow: "Rainbow",
 };
+const EVO_EFFECT_LABELS: Record<RgbEvoEffect, string> = {
+  static: "Static",
+  breath: "Breath",
+  "rgb-breath": "RGB Breath",
+  rainbow: "Rainbow",
+  reactive: "Reactive",
+};
+const LAYOUT_LABELS: Record<RgbEvoLayoutMode, string> = {
+  both: "Both rings",
+  "per-stick": "Per stick",
+  quadrants: "Quadrants",
+};
+const QUADRANT_LABELS = ["270° Left", "0° Top", "90° Right", "180° Bottom"];
 const option = <T extends string>(data: T, label: string) => ({ data, label });
 
-const requestFromState = (state: RgbState): RgbRequest | null =>
-  state.supported && state.valid && state.provider !== "none" && state.mode !== "unknown" ? {
+const isLegacyEffect = (effect: RgbEffect): effect is RgbLegacyEffect =>
+  effect === "static" || effect === "breath" || effect === "rainbow";
+const isEvoEffect = (effect: RgbEffect): effect is RgbEvoEffect =>
+  effect === "static" || effect === "breath" || effect === "rgb-breath" ||
+  effect === "rainbow" || effect === "reactive";
+
+const defaultNonOffLighting = (state: Extract<RgbState, { provider: "pocket-evo-v3" }>) => {
+  const lighting = cloneEvoLighting(state.lighting);
+  lighting.effect = "static";
+  lighting.layout_mode = "both";
+  lighting.zones = lighting.zones.map(zone => ({
+    ...zone,
+    color: cloneRgbColor(lighting.color),
+    brightness: lighting.brightness,
+  }));
+  return lighting;
+};
+
+const requestFromState = (state: RgbState): RgbRequest | null => {
+  if (!(state.supported && state.valid && state.provider !== "none" &&
+      state.mode !== "unknown")) return null;
+  if (state.provider === "pocket-evo-v3") {
+    const lighting = state.mode === "off"
+      ? state.resume_lighting || defaultNonOffLighting(state)
+      : state.lighting;
+    return {
+      provider: state.provider,
+      revision: state.revision,
+      mode: state.mode,
+      lighting: cloneEvoLighting(lighting),
+    };
+  }
+  return {
     provider: state.provider,
     revision: state.revision,
     mode: state.mode,
     effect: state.effect,
-    color: [...state.color],
+    color: cloneRgbColor(state.color),
     brightness: state.brightness,
     correction: state.correction,
-  } : null;
+  };
+};
 
-const sameRequest = (left: RgbRequest | null, right: RgbRequest | null) =>
-  left === right || Boolean(left && right && left.provider === right.provider &&
-    left.revision === right.revision && left.mode === right.mode && left.effect === right.effect &&
-    left.brightness === right.brightness && left.correction === right.correction &&
-    left.color.every((value, index) => value === right.color[index]));
+const sameRequest = (left: RgbRequest | null, right: RgbRequest | null) => {
+  if (left === right) return true;
+  if (!left || !right || !(left.provider === right.provider &&
+      left.revision === right.revision && left.mode === right.mode)) return false;
+  if (left.provider === "pocket-evo-v3" && right.provider === "pocket-evo-v3")
+    return sameEvoLighting(left.lighting, right.lighting);
+  if (left.provider === "pocket-evo-v3" || right.provider === "pocket-evo-v3") return false;
+  return left.effect === right.effect && left.brightness === right.brightness &&
+    left.correction === right.correction &&
+    left.color.every((value, index) => value === right.color[index]);
+};
 
 const hexColour = ([red, green, blue]: RgbColor) =>
   `#${[red, green, blue].map(value => value.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
@@ -53,12 +113,68 @@ const Heading = ({ title, headingRef, onActivate }: {
 const ValueLabel = ({ name, value }: { name: string; value: string }) =>
   <span className="rke-frequency-label"><span>{name}</span><span>{value}</span></span>;
 
+const ColourEditor = ({
+  color, brightness, maxBrightness, min = 0, disabled,
+  onColorChange, onBrightnessChange,
+}: {
+  color: RgbColor;
+  brightness?: number;
+  maxBrightness: number;
+  min?: number;
+  disabled: boolean;
+  onColorChange: (color: RgbColor) => void;
+  onBrightnessChange?: (brightness: number) => void;
+}) => <>
+  <PanelSectionRow><Field label="Colour" bottomSeparator="none">
+    <span className="rke-rgb-colour-value">
+      <span>{hexColour(color)}</span>
+      <span className="rke-rgb-swatch" style={{ backgroundColor: hexColour(color) }} />
+    </span>
+  </Field></PanelSectionRow>
+  {(["Red", "Green", "Blue"] as const).map((name, index) =>
+    <PanelSectionRow key={name}><SliderField
+      label={<ValueLabel name={name} value={String(color[index])} />}
+      bottomSeparator="none" disabled={disabled}
+      value={color[index]} min={0} max={255} step={1}
+      minimumDpadGranularity={1}
+      onChange={value => {
+        const next = cloneRgbColor(color);
+        next[index] = value;
+        onColorChange(next);
+      }} />
+    </PanelSectionRow>)}
+  {brightness !== undefined && onBrightnessChange && <PanelSectionRow><SliderField
+    label={<ValueLabel name="Brightness"
+      value={`${Math.round(brightness * 100 / maxBrightness)}%`} />}
+    bottomSeparator="none" disabled={disabled}
+    value={brightness} min={min} max={maxBrightness} step={1}
+    minimumDpadGranularity={1}
+    onChange={onBrightnessChange} />
+  </PanelSectionRow>}
+</>;
+
+const LegacyLightingToggle = ({
+  draft, disabled, onChange,
+}: {
+  draft: RgbLegacyRequest;
+  disabled: boolean;
+  onChange: (checked: boolean) => void;
+}) => <PanelSectionRow><ToggleField label="Stick lighting"
+  description="Independent of the system battery indicator."
+  bottomSeparator="none" disabled={disabled}
+  checked={draft.mode === "rgb"} onChange={onChange} />
+</PanelSectionRow>;
+
 export function RGB({ active }: { active: boolean }) {
   const [status, setStatus] = useState<RgbState | null>(null);
   const [saved, setSaved] = useState<RgbRequest | null>(null);
   const [draft, setDraft] = useState<RgbRequest | null>(null);
+  const [savedCalibration, setSavedCalibration] = useState<RgbEvoCalibration | null>(null);
+  const [draftCalibration, setDraftCalibration] = useState<RgbEvoCalibration | null>(null);
+  const [evoTargetIndex, setEvoTargetIndex] = useState(0);
+  const [reactiveTarget, setReactiveTarget] = useState<"idle" | "active">("idle");
   const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<false | "lighting" | "calibration">(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [refreshRequest, setRefreshRequest] = useState(0);
@@ -67,10 +183,28 @@ export function RGB({ active }: { active: boolean }) {
   const activeRef = useRef(active);
   const needsRefreshAfterStaleApply = useRef(false);
   const topRef = useRef<HTMLDivElement>(null);
-  const dirty = !sameRequest(saved, draft);
-  const dirtyRef = useRef(dirty);
+  const lightingDirty = !sameRequest(saved, draft);
+  const calibrationDirty = !sameEvoCalibration(savedCalibration, draftCalibration);
+  const dirtyRef = useRef(lightingDirty || calibrationDirty);
   activeRef.current = active;
-  dirtyRef.current = dirty;
+  dirtyRef.current = lightingDirty || calibrationDirty;
+
+  const adoptState = (next: RgbState) => {
+    const request = requestFromState(next);
+    setStatus(next);
+    setSaved(request);
+    setDraft(request ? cloneRgbRequest(request) : null);
+    if (next.provider === "pocket-evo-v3") {
+      const calibration = { ...next.calibration };
+      setSavedCalibration(calibration);
+      setDraftCalibration({ ...calibration });
+    } else {
+      setSavedCalibration(null);
+      setDraftCalibration(null);
+    }
+    setEvoTargetIndex(0);
+    return request;
+  };
 
   useEffect(() => {
     const requestGeneration = ++generation.current;
@@ -78,24 +212,22 @@ export function RGB({ active }: { active: boolean }) {
       setLoading(false);
       return;
     }
-    // Keep an unfinished controller edit when Quick Access or this tab was hidden.
-    // A write completed outside its original activation is the sole exception:
-    // its current backend state is authoritative over that stale draft.
+    // Preserve an unfinished controller edit across Quick Access visibility changes.
+    // A write completed outside its original activation is authoritative instead.
     const forceRefresh = needsRefreshAfterStaleApply.current;
     if (dirtyRef.current && !forceRefresh) return;
     needsRefreshAfterStaleApply.current = false;
     setStatus(null);
     setSaved(null);
     setDraft(null);
+    setSavedCalibration(null);
+    setDraftCalibration(null);
     setLoading(true);
     setMessage("");
     setError("");
     void getRgbState().then(next => {
       if (requestGeneration !== generation.current) return;
-      const request = requestFromState(next);
-      setStatus(next);
-      setSaved(request);
-      setDraft(request);
+      const request = adoptState(next);
       setError(request ? "" : next.error || "RGB status is unavailable.");
     }).catch(reason => {
       if (requestGeneration !== generation.current) return;
@@ -108,61 +240,172 @@ export function RGB({ active }: { active: boolean }) {
     };
   }, [active, refreshRequest]);
 
-  const update = (change: (request: RgbRequest) => void) => {
+  const replaceDraft = (change: (request: RgbRequest) => RgbRequest) => {
     setMessage("");
-    setDraft(current => {
-      if (!current) return current;
-      const next: RgbRequest = { ...current, color: [...current.color] };
-      change(next);
-      return next;
-    });
+    setDraft(current => current ? change(cloneRgbRequest(current)) : current);
   };
-  const updateColor = (index: number, value: number) => update(request => {
-    request.color[index] = value;
-  });
+  const updateLegacy = (change: (request: RgbLegacyRequest) => void) =>
+    replaceDraft(request => {
+      if (request.provider === "pocket-evo-v3") return request;
+      change(request);
+      return request;
+    });
+  const updateEvo = (change: (request: RgbEvoRequest) => RgbEvoRequest | void) =>
+    replaceDraft(request => {
+      if (request.provider !== "pocket-evo-v3") return request;
+      return change(request) || request;
+    });
   const reload = () => {
     if (!active || busyRef.current) return;
     needsRefreshAfterStaleApply.current = true;
     setRefreshRequest(current => current + 1);
   };
-  const apply = async () => {
-    if (!active || !draft || busyRef.current) return;
-    const requestGeneration = generation.current;
+
+  const beginOperation = () => {
+    if (!active || busyRef.current) return false;
     busyRef.current = true;
-    setBusy(true);
     setMessage("");
     setError("");
+    return true;
+  };
+  const finishOperation = (requestGeneration: number) => {
+    busyRef.current = false;
+    setBusy(false);
+    if (requestGeneration !== generation.current && activeRef.current)
+      setRefreshRequest(current => current + 1);
+  };
+
+  const reconcileFailedOperation = async (
+    reason: unknown,
+    requestGeneration: number,
+    attemptedLighting?: RgbRequest,
+    attemptedCalibration?: RgbEvoCalibration,
+    persistedLighting?: RgbRequest | null,
+    persistedCalibration?: RgbEvoCalibration | null,
+  ) => {
+    const failure = String(reason);
     try {
-      const next = await setRgbState({ ...draft, color: [...draft.color] });
+      // A sysfs error may occur after the driver changed its cached state,
+      // and a guarded rollback may deliberately yield to another writer.
+      // Always replace the stale pre-operation snapshot with a fresh complete
+      // provider read before reporting the failure.
+      const next = await getRgbState();
       if (requestGeneration !== generation.current) {
         needsRefreshAfterStaleApply.current = true;
         return;
       }
-      const applied = requestFromState(next);
-      setStatus(next);
+      const actual = adoptState(next);
+      const disposition = rgbFailureDisposition(failure);
+      const retryAfterResume = disposition === "retry-after-resume";
+      const preMutationRejection = disposition === "clean-refresh";
+      if (retryAfterResume && actual && attemptedLighting &&
+          actual.provider === attemptedLighting.provider) {
+        const retry = cloneRgbRequest(attemptedLighting);
+        retry.revision = actual.revision;
+        setDraft(retry);
+      }
+      if (retryAfterResume && next.provider === "pocket-evo-v3" &&
+          attemptedCalibration) {
+        setDraftCalibration({ ...attemptedCalibration });
+      }
+      if (!retryAfterResume && !preMutationRejection && actual && persistedLighting &&
+          actual.provider === persistedLighting.provider) {
+        // Keep the last known persisted request as the comparison baseline,
+        // but rebase its optimistic token onto the complete fresh snapshot.
+        // If rollback failed (or yielded to an external writer), the active
+        // native state is therefore visibly dirty and can be saved again.
+        const baseline = cloneRgbRequest(persistedLighting);
+        baseline.revision = actual.revision;
+        setSaved(baseline);
+      }
+      if (!retryAfterResume && !preMutationRejection &&
+          next.provider === "pocket-evo-v3" &&
+          persistedCalibration) {
+        setSavedCalibration({ ...persistedCalibration });
+      }
+      setError(failure);
+    } catch (refreshReason) {
+      if (requestGeneration === generation.current) {
+        setError(`${failure} Actual RGB state could not be refreshed: ${String(refreshReason)}`);
+      } else {
+        needsRefreshAfterStaleApply.current = true;
+      }
+    }
+  };
+
+  const applyLighting = async () => {
+    if (!draft || calibrationDirty || !beginOperation()) return;
+    const requestGeneration = generation.current;
+    const attempted = cloneRgbRequest(draft);
+    const persisted = saved ? cloneRgbRequest(saved) : null;
+    setBusy("lighting");
+    try {
+      const next = await setRgbState(attempted);
+      if (requestGeneration !== generation.current) {
+        needsRefreshAfterStaleApply.current = true;
+        return;
+      }
+      const applied = adoptState(next);
       if (!applied) {
         setError(next.error || "RGB settings could not be applied.");
         return;
       }
-      setSaved(applied);
-      setDraft(applied);
       setMessage("RGB settings saved and applied");
     } catch (reason) {
-      if (requestGeneration === generation.current) setError(String(reason));
-      else needsRefreshAfterStaleApply.current = true;
+      await reconcileFailedOperation(
+        reason, requestGeneration, attempted, undefined, persisted);
     } finally {
-      busyRef.current = false;
-      setBusy(false);
-      if (requestGeneration !== generation.current && activeRef.current)
-        setRefreshRequest(current => current + 1);
+      finishOperation(requestGeneration);
+    }
+  };
+
+  const applyCalibration = async (action: "save" | "reset" | "raw") => {
+    if (lightingDirty || !draftCalibration || draft?.provider !== "pocket-evo-v3" ||
+        !beginOperation()) return;
+    const requestGeneration = generation.current;
+    const attempted = { ...draftCalibration };
+    const persisted = savedCalibration ? { ...savedCalibration } : null;
+    setBusy("calibration");
+    try {
+      const next = await setRgbCalibration(calibrationRequest(
+        draft.revision,
+        action,
+        attempted,
+      ));
+      if (requestGeneration !== generation.current) {
+        needsRefreshAfterStaleApply.current = true;
+        return;
+      }
+      const applied = adoptState(next);
+      if (!applied || next.provider !== "pocket-evo-v3") {
+        setError(next.error || "RGB calibration could not be applied.");
+        return;
+      }
+      setMessage(action === "reset" ? "Calibration reset to Pocket EVO defaults" :
+        action === "raw" ? "Raw RGB calibration saved" : "RGB calibration saved");
+    } catch (reason) {
+      await reconcileFailedOperation(
+        reason, requestGeneration, undefined, attempted, undefined, persisted);
+    } finally {
+      finishOperation(requestGeneration);
     }
   };
 
   const modes = status?.modes || [];
   const effects = status?.effects || [];
   const analogStatic = status?.provider === "analog-static";
+  const evoStatus = status?.provider === "pocket-evo-v3" ? status : null;
+  const legacyDraft = draft && draft.provider !== "pocket-evo-v3" ? draft : null;
+  const evoDraft = draft?.provider === "pocket-evo-v3" ? draft : null;
   const maxBrightness = Math.max(1, status?.max_brightness || 255);
-  const showColour = draft?.mode === "rgb" && draft.effect !== "rainbow";
+  const lightingLocked = Boolean(busy || !active || calibrationDirty);
+  const calibrationLocked = Boolean(busy || !active || lightingDirty);
+  const calibrationNeedsSave = Boolean(draftCalibration &&
+    !sameEvoCalibration(evoStatus?.calibration_override || null, draftCalibration));
+  const selectedZone = evoDraft?.lighting.zones[Math.min(
+    Math.max(evoTargetIndex, 0),
+    Math.max(0, evoDraft.lighting.zones.length - 1),
+  )];
   const backToTop = () => {
     topRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
     topRef.current?.focus();
@@ -173,83 +416,253 @@ export function RGB({ active }: { active: boolean }) {
       <Heading title={analogStatic ? "Stick RGB" : "RGB Control"} headingRef={topRef} />
       {loading && !draft && <PanelSectionRow><Field label="Reading RGB settings…"
         bottomSeparator="none" /></PanelSectionRow>}
-      {draft && <>
+
+      {legacyDraft && <>
         {analogStatic
-          ? <PanelSectionRow><ToggleField label="Stick lighting"
-            description="Independent of the system battery indicator."
-            bottomSeparator="none" disabled={busy || !active}
-            checked={draft.mode === "rgb"}
-            onChange={checked => update(request => {
+          ? <LegacyLightingToggle draft={legacyDraft} disabled={Boolean(busy || !active)}
+            onChange={checked => updateLegacy(request => {
               request.mode = checked ? "rgb" : "off";
               request.effect = "static";
             })} />
-          </PanelSectionRow>
           : <PanelSectionRow><DropdownItem label="LED Color" bottomSeparator="none"
-            disabled={busy || !active}
-            selectedOption={draft.mode}
+            disabled={Boolean(busy || !active)}
+            selectedOption={legacyDraft.mode}
             rgOptions={modes.map(mode => option(mode, MODE_LABELS[mode]))}
-            onChange={(selected: any) => update(request => { request.mode = selected.data; })} />
+            onChange={(selected: any) => updateLegacy(request => { request.mode = selected.data; })} />
           </PanelSectionRow>}
-        {analogStatic && status?.zones_differ && <PanelSectionRow><Field
-          label="Saved ring colours differ"
-          description="Showing the right-stick colour. Save & Apply uses one colour for both rings."
-          bottomSeparator="none" />
-        </PanelSectionRow>}
-        {draft.mode === "rgb" && <>
-          {effects.length > 1 && <PanelSectionRow><DropdownItem label="Effect" bottomSeparator="none"
-              disabled={busy || !active}
-              selectedOption={draft.effect}
-              rgOptions={effects.map(effect => option(effect, EFFECT_LABELS[effect]))}
-              onChange={(selected: any) => update(request => { request.effect = selected.data; })} />
-            </PanelSectionRow>}
-          {showColour && <>
-            <PanelSectionRow><Field label="Colour" bottomSeparator="none">
-              <span className="rke-rgb-colour-value">
-                <span>{hexColour(draft.color)}</span>
-                <span className="rke-rgb-swatch" style={{ backgroundColor: hexColour(draft.color) }} />
-              </span>
-            </Field></PanelSectionRow>
-            {(["Red", "Green", "Blue"] as const).map((name, index) =>
-              <PanelSectionRow key={name}><SliderField
-                label={<ValueLabel name={name} value={String(draft.color[index])} />}
-                bottomSeparator="none" disabled={busy || !active}
-                value={draft.color[index]} min={0} max={255} step={1}
-                minimumDpadGranularity={1}
-                onChange={value => updateColor(index, value)} />
-              </PanelSectionRow>)}
-            {draft.effect === "static" && <PanelSectionRow><SliderField
-              label={<ValueLabel name="Brightness"
-                value={`${Math.round(draft.brightness * 100 / maxBrightness)}%`} />}
-              bottomSeparator="none" disabled={busy || !active}
-              value={draft.brightness} min={analogStatic ? 1 : 0} max={maxBrightness} step={1}
-              minimumDpadGranularity={1}
-              onChange={value => update(request => { request.brightness = value; })} />
-            </PanelSectionRow>}
+        {status?.provider === "analog-static" && status?.zones_differ &&
+          <PanelSectionRow><Field label="Saved ring colours differ"
+            description="Showing the right-stick colour. Save & Apply uses one colour for both rings."
+            bottomSeparator="none" />
+          </PanelSectionRow>}
+        {legacyDraft.mode === "rgb" && <>
+          {effects.length > 1 && <PanelSectionRow><DropdownItem
+            label="Effect" bottomSeparator="none" disabled={Boolean(busy || !active)}
+            selectedOption={legacyDraft.effect}
+            rgOptions={effects.filter(isLegacyEffect).map(effect =>
+              option(effect, LEGACY_EFFECT_LABELS[effect]))}
+            onChange={(selected: any) => updateLegacy(request => {
+              request.effect = selected.data;
+            })} />
+          </PanelSectionRow>}
+          {legacyDraft.effect !== "rainbow" && <>
+            <ColourEditor color={legacyDraft.color}
+              brightness={legacyDraft.effect === "static" ? legacyDraft.brightness : undefined}
+              maxBrightness={maxBrightness} min={analogStatic ? 1 : 0}
+              disabled={Boolean(busy || !active)}
+              onColorChange={color => updateLegacy(request => { request.color = color; })}
+              onBrightnessChange={brightness => updateLegacy(request => {
+                request.brightness = brightness;
+              })} />
             <PanelSectionRow><ToggleField label="Colour correction"
               description="When red is used, green and blue output are reduced to 80%."
-              bottomSeparator="none" disabled={busy || !active}
-              checked={draft.correction}
-              onChange={checked => update(request => { request.correction = checked; })} />
+              bottomSeparator="none" disabled={Boolean(busy || !active)}
+              checked={legacyDraft.correction}
+              onChange={checked => updateLegacy(request => { request.correction = checked; })} />
             </PanelSectionRow>
           </>}
-          {draft.effect === "rainbow" && <PanelSectionRow><Field
+          {legacyDraft.effect === "rainbow" && <PanelSectionRow><Field
             label="MCU-controlled effect" bottomSeparator="none"
             description="Rainbow has no adjustable colour or brightness." />
           </PanelSectionRow>}
         </>}
+      </>}
+
+      {evoDraft && evoStatus && <>
+        <PanelSectionRow><DropdownItem label="Stick lighting" bottomSeparator="none"
+          disabled={lightingLocked}
+          selectedOption={evoDraft.mode}
+          rgOptions={[option("off", "Off"), option("rgb", "RGB")]}
+          onChange={(selected: any) => updateEvo(request => {
+            request.mode = selected.data;
+          })} />
+        </PanelSectionRow>
+        {evoStatus.temporarily_gated && <div className="rke-rgb-warning">
+          <PanelSectionRow><Field label="RGB output temporarily suspended"
+            description="ROCKNIX has gated the LEDs. Saved changes will appear when output resumes."
+            bottomSeparator="none" />
+          </PanelSectionRow>
+        </div>}
+        {evoDraft.mode === "rgb" && <>
+          <PanelSectionRow><DropdownItem label="Effect" bottomSeparator="none"
+            disabled={lightingLocked}
+            selectedOption={evoDraft.lighting.effect}
+            rgOptions={effects.filter(isEvoEffect).map(effect =>
+              option(effect, EVO_EFFECT_LABELS[effect]))}
+            onChange={(selected: any) => updateEvo(request => {
+              request.lighting.effect = selected.data;
+            })} />
+          </PanelSectionRow>
+
+          {evoDraft.lighting.effect === "static" && <>
+            <PanelSectionRow><DropdownItem label="Layout" bottomSeparator="none"
+              disabled={lightingLocked}
+              selectedOption={evoDraft.lighting.layout_mode}
+              rgOptions={(Object.keys(LAYOUT_LABELS) as RgbEvoLayoutMode[]).map(layout =>
+                option(layout, LAYOUT_LABELS[layout]))}
+              onChange={(selected: any) => updateEvo(request => {
+                const layout = selected.data as RgbEvoLayoutMode;
+                setEvoTargetIndex(layout === "per-stick" && evoTargetIndex >= 4 ? 4 : 0);
+                return setEvoLayoutMode(request, layout, evoTargetIndex);
+              })} />
+            </PanelSectionRow>
+            {evoDraft.lighting.layout_mode === "both" && <PanelSectionRow><Field
+              label="Target" description="Both stick rings" bottomSeparator="none" />
+            </PanelSectionRow>}
+            {evoDraft.lighting.layout_mode === "per-stick" && <PanelSectionRow><DropdownItem
+              label="Target" bottomSeparator="none" disabled={lightingLocked}
+              selectedOption={evoTargetIndex < 4 ? "left" : "right"}
+              rgOptions={[option("left", "Left stick"), option("right", "Right stick")]}
+              onChange={(selected: any) => setEvoTargetIndex(selected.data === "right" ? 4 : 0)} />
+            </PanelSectionRow>}
+            {evoDraft.lighting.layout_mode === "quadrants" && <>
+              <PanelSectionRow><DropdownItem label="Stick" bottomSeparator="none"
+                disabled={lightingLocked}
+                selectedOption={evoTargetIndex < 4 ? "left" : "right"}
+                rgOptions={[option("left", "Left stick"), option("right", "Right stick")]}
+                onChange={(selected: any) => setEvoTargetIndex(
+                  (selected.data === "right" ? 4 : 0) + evoTargetIndex % 4,
+                )} />
+              </PanelSectionRow>
+              <PanelSectionRow><DropdownItem label="Quadrant" bottomSeparator="none"
+                disabled={lightingLocked}
+                selectedOption={String(evoTargetIndex % 4)}
+                rgOptions={QUADRANT_LABELS.map((label, index) => option(String(index), label))}
+                onChange={(selected: any) => setEvoTargetIndex(
+                  (evoTargetIndex < 4 ? 0 : 4) + Number(selected.data),
+                )} />
+              </PanelSectionRow>
+            </>}
+            {selectedZone && <ColourEditor color={selectedZone.color}
+              brightness={selectedZone.brightness} maxBrightness={maxBrightness}
+              disabled={lightingLocked}
+              onColorChange={color => updateEvo(request =>
+                setEvoStaticGroup(request, evoTargetIndex, { color }))}
+              onBrightnessChange={brightness => updateEvo(request =>
+                setEvoStaticGroup(request, evoTargetIndex, { brightness }))} />}
+          </>}
+
+          {evoDraft.lighting.effect === "breath" && <ColourEditor
+            color={evoDraft.lighting.color} brightness={evoDraft.lighting.brightness}
+            maxBrightness={maxBrightness} disabled={lightingLocked}
+            onColorChange={color => updateEvo(request => {
+              request.lighting.color = color;
+            })}
+            onBrightnessChange={brightness => updateEvo(request => {
+              request.lighting.brightness = brightness;
+            })} />}
+
+          {evoDraft.lighting.effect === "rgb-breath" && <PanelSectionRow><SliderField
+            label={<ValueLabel name="Brightness"
+              value={`${Math.round(evoDraft.lighting.brightness * 100 / maxBrightness)}%`} />}
+            bottomSeparator="none" disabled={lightingLocked}
+            value={evoDraft.lighting.brightness} min={0} max={maxBrightness} step={1}
+            minimumDpadGranularity={1}
+            onChange={brightness => updateEvo(request => {
+              request.lighting.brightness = brightness;
+            })} />
+          </PanelSectionRow>}
+
+          {evoDraft.lighting.effect === "rainbow" && <PanelSectionRow><Field
+            label="MCU-controlled effect" bottomSeparator="none"
+            description="Rainbow is generated by the controller and has no adjustable settings." />
+          </PanelSectionRow>}
+
+          {evoDraft.lighting.effect === "reactive" && <>
+            <PanelSectionRow><DropdownItem label="Reactive colour" bottomSeparator="none"
+              disabled={lightingLocked} selectedOption={reactiveTarget}
+              rgOptions={[option("idle", "Idle"), option("active", "Active")]}
+              onChange={(selected: any) => setReactiveTarget(selected.data)} />
+            </PanelSectionRow>
+            <ColourEditor
+              color={reactiveTarget === "idle"
+                ? evoDraft.lighting.idle_color : evoDraft.lighting.active_color}
+              brightness={evoDraft.lighting.brightness} maxBrightness={maxBrightness}
+              disabled={lightingLocked}
+              onColorChange={color => updateEvo(request => {
+                if (reactiveTarget === "idle") request.lighting.idle_color = color;
+                else request.lighting.active_color = color;
+              })}
+              onBrightnessChange={brightness => updateEvo(request => {
+                request.lighting.brightness = brightness;
+              })} />
+          </>}
+        </>}
+        {calibrationDirty && <PanelSectionRow><Field label="Unsaved calibration changes"
+          description="Save calibration before changing or applying lighting."
+          bottomSeparator="none" />
+        </PanelSectionRow>}
+      </>}
+
+      {draft && <>
         <PanelSectionRow><ButtonItem layout="below" bottomSeparator="none"
-          disabled={busy || loading || !active || !status?.supported || !status.valid}
-          onClick={() => { void apply(); }}>Save &amp; Apply</ButtonItem></PanelSectionRow>
-        {dirty && <PanelSectionRow><Field label="Unsaved RGB changes"
+          disabled={Boolean(busy || loading || !active || calibrationDirty ||
+            !status?.supported || !status.valid || (evoDraft && !lightingDirty))}
+          onClick={() => { void applyLighting(); }}>Save &amp; Apply</ButtonItem></PanelSectionRow>
+        {lightingDirty && <PanelSectionRow><Field label="Unsaved RGB changes"
           bottomSeparator="none" /></PanelSectionRow>}
       </>}
+
+      {evoDraft && evoStatus && draftCalibration && <>
+        <Heading title="Colour calibration" />
+        <PanelSectionRow><Field label="Pocket EVO calibration"
+          description="Saved separately from lighting. Pure green, blue and cyan remain unchanged."
+          bottomSeparator="none" />
+        </PanelSectionRow>
+        <PanelSectionRow><Field label="Saved calibration override"
+          description={evoStatus.calibration_override
+            ? `${evoStatus.calibration_override.green_percent}% green · ${evoStatus.calibration_override.blue_percent}% blue`
+            : "None — the kernel default is used after reboot."}
+          bottomSeparator="none" />
+        </PanelSectionRow>
+        <PanelSectionRow><SliderField
+          label={<ValueLabel name="Green in mixed colours"
+            value={`${draftCalibration.green_percent}%`} />}
+          bottomSeparator="none" disabled={calibrationLocked}
+          value={draftCalibration.green_percent} min={0} max={100} step={1}
+          minimumDpadGranularity={1}
+          onChange={green_percent => {
+            setMessage("");
+            setDraftCalibration(current => current ? { ...current, green_percent } : current);
+          }} />
+        </PanelSectionRow>
+        <PanelSectionRow><SliderField
+          label={<ValueLabel name="Blue in mixed colours"
+            value={`${draftCalibration.blue_percent}%`} />}
+          bottomSeparator="none" disabled={calibrationLocked}
+          value={draftCalibration.blue_percent} min={0} max={100} step={1}
+          minimumDpadGranularity={1}
+          onChange={blue_percent => {
+            setMessage("");
+            setDraftCalibration(current => current ? { ...current, blue_percent } : current);
+          }} />
+        </PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" bottomSeparator="none"
+          disabled={Boolean(calibrationLocked || !calibrationNeedsSave)}
+          onClick={() => { void applyCalibration("save"); }}>Save calibration</ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" bottomSeparator="none"
+          disabled={calibrationLocked}
+          onClick={() => { void applyCalibration("reset"); }}>Reset calibration</ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow><ButtonItem layout="below" bottomSeparator="none"
+          disabled={calibrationLocked}
+          onClick={() => { void applyCalibration("raw"); }}>Use raw RGB</ButtonItem>
+        </PanelSectionRow>
+        {lightingDirty && <PanelSectionRow><Field label="Unsaved lighting changes"
+          description="Save lighting before changing calibration."
+          bottomSeparator="none" />
+        </PanelSectionRow>}
+      </>}
+
       {message && <div className="rke-rgb-notice"><PanelSectionRow><Field
         label={message} bottomSeparator="none" /></PanelSectionRow></div>}
       {error && <div className="rke-rgb-error"><PanelSectionRow><Field
-        label="RGB control unavailable" description={error}
+        label={draft ? "RGB change not saved" : "RGB control unavailable"}
+        description={error}
         bottomSeparator="none" /></PanelSectionRow>
         <PanelSectionRow><ButtonItem layout="below" bottomSeparator="none"
-          disabled={busy || loading || !active}
+          disabled={Boolean(busy || loading || !active)}
           onClick={reload}>Reload current RGB state</ButtonItem></PanelSectionRow>
       </div>}
     </PanelSection>

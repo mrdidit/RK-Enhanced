@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -31,6 +32,8 @@ class PluginLifecycleTests(unittest.IsolatedAsyncioTestCase):
         plugin.lifecycle_active_path = None
         plugin.lifecycle_heartbeat_path = None
         plugin.lifecycle_ready_path = None
+        plugin.lifecycle_guard_unit = ""
+        plugin.lifecycle_guard_identity = None
         return plugin
 
     async def test_guard_lease_uses_exact_owner_and_loader_identities(self):
@@ -46,12 +49,16 @@ class PluginLifecycleTests(unittest.IsolatedAsyncioTestCase):
             loader = {
                 "pid": 222, "start_time_ticks": 2222, "parent_pid": 1,
             }
+            guard = {
+                "pid": 333, "start_time_ticks": 3333, "parent_pid": 1,
+            }
             commands = []
 
             def fake_run(command, check=True, timeout=15):
                 commands.append((command, check, timeout))
                 if command[:2] == ["systemctl", "show"]:
-                    return "222"
+                    return ("222" if command[-1] == main.PLUGIN_LOADER_SERVICE
+                            else "333")
                 if command[0] == "systemd-run":
                     (run_root / (
                         "plugin-lifecycle-" + "a" * 32 + ".ready")
@@ -71,7 +78,7 @@ class PluginLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(main, "LIFECYCLE_LOCK", lifecycle_lock), \
                     mock.patch.object(
                         main, "_process_identity",
-                        side_effect=[owner, loader]), \
+                        side_effect=[owner, loader, guard]), \
                     mock.patch.object(main.os, "getpid", return_value=111), \
                     mock.patch.object(main.secrets, "token_hex", return_value="a" * 32), \
                     mock.patch.object(main, "_read", side_effect=fake_read), \
@@ -94,7 +101,18 @@ class PluginLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     stat.S_IMODE(plugin.plugin_loader_recovery_path.stat().st_mode),
                     0o755,
                 )
+                self.assertEqual(
+                    plugin.lifecycle_guard_unit,
+                    "rke-plugin-lifecycle-guard-111-aaaaaaaa")
+                self.assertEqual(plugin.lifecycle_guard_identity, guard)
+                systemd_run = next(
+                    command for command in commands
+                    if command[0][0] == "systemd-run")
                 self.assertEqual(commands[-1], ([
+                    "systemctl", "show", "--property=MainPID", "--value",
+                    "rke-plugin-lifecycle-guard-111-aaaaaaaa",
+                ], True, 3))
+                self.assertEqual(systemd_run, ([
                     "systemd-run",
                     "--unit=rke-plugin-lifecycle-guard-111-aaaaaaaa",
                     "--collect",
@@ -111,6 +129,8 @@ class PluginLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(heartbeat_path.exists())
                 self.assertFalse(ready_path.exists())
                 self.assertFalse(current.exists())
+                self.assertEqual(plugin.lifecycle_guard_unit, "")
+                self.assertIsNone(plugin.lifecycle_guard_identity)
 
     async def test_clean_unload_tombstones_guard_before_restore_handoff(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -595,6 +615,21 @@ class ProcessIdentityTests(unittest.TestCase):
     def test_invalid_or_missing_pid_is_rejected(self):
         self.assertIsNone(main._process_identity(0))
         self.assertIsNone(main._process_identity(999999999))
+
+    def test_guard_identity_lookup_is_bounded_and_diagnostic_only(self):
+        unit = "rke-plugin-lifecycle-guard-123-abcdef12"
+        for failure in (
+                OSError("systemctl unavailable"),
+                subprocess.TimeoutExpired(["systemctl"], 3)):
+            with self.subTest(failure=type(failure).__name__), \
+                 mock.patch.object(main, "_run", side_effect=failure) as run, \
+                 mock.patch.object(main.time, "sleep"):
+                self.assertIsNone(main._guard_unit_identity(unit))
+                self.assertEqual(run.call_count, 3)
+
+        with mock.patch.object(main, "_run") as run:
+            self.assertIsNone(main._guard_unit_identity("other.service"))
+        run.assert_not_called()
 
 
 class AutomaticRecoveryFocusTests(unittest.IsolatedAsyncioTestCase):

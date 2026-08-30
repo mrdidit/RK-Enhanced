@@ -30,6 +30,8 @@ export const styles = `
   .rke-rgb-error .${gamepadDialogClasses.FieldDescription} { color: #ff5b5b !important; opacity: 1 !important; }
   .rke-rgb-notice .${gamepadDialogClasses.Field},
   .rke-rgb-notice .${gamepadDialogClasses.FieldDescription} { color: #69b9ff !important; opacity: 1 !important; }
+  .rke-rgb-warning .${gamepadDialogClasses.Field},
+  .rke-rgb-warning .${gamepadDialogClasses.FieldDescription} { color: #fed330 !important; opacity: 1 !important; }
   .rke-rgb-colour-value { display: flex; align-items: center; justify-content: flex-end; gap: 9px; width: 100%; color: rgba(255,255,255,.78); font-variant-numeric: tabular-nums; font-weight: 600; }
   .rke-rgb-swatch { display: block; width: 30px; height: 30px; flex: 0 0 30px; box-sizing: border-box; border: 1px solid rgba(255,255,255,.5); border-radius: 8px; box-shadow: inset 0 0 0 1px rgba(0,0,0,.22); }
   .rke-monitor-heading-row { display: flex; align-items: center; gap: 7px; box-sizing: border-box; width: 100%; padding: 7px 7px 4px; }
@@ -49,6 +51,17 @@ export const styles = `
   .rke-content .${gamepadDialogClasses.WithStandardPadding},
   .rke-content .${gamepadDialogClasses.StandardPadding} { padding-top: 7px !important; padding-bottom: 7px !important; }
   .rke-content .${gamepadDialogClasses.StandardSpacing} { margin-top: 3px !important; margin-bottom: 3px !important; }
+  .rke-install-blocker { box-sizing: border-box; position: fixed; width: 306px; height: 95%; margin-top: -12px; padding: 10px 8px 30px 10px; overflow-x: hidden; overflow-y: auto; background: #0d141c; }
+  .rke-install-phases { box-sizing: border-box; width: calc(100% - 18px); margin: 6px 8px 10px 10px; padding: 8px 10px; border: 1px solid rgba(255,255,255,.18); border-radius: 12px; background: rgba(255,255,255,.045); }
+  .rke-install-phase { display: flex; align-items: center; gap: 9px; min-height: 25px; color: rgba(255,255,255,.43); font-size: 13px; line-height: 18px; }
+  .rke-install-phase-mark { width: 16px; flex: 0 0 16px; text-align: center; font-variant-numeric: tabular-nums; }
+  .rke-install-phase-current { color: #69b9ff; font-weight: 700; }
+  .rke-install-phase-done { color: rgba(255,255,255,.82); }
+  .rke-install-success .rke-install-phase-current { color: #45d483; }
+  .rke-install-failed .rke-install-phase-current { color: #ff5b5b; }
+  .rke-conflict-warning .${gamepadDialogClasses.Field},
+  .rke-conflict-warning .${gamepadDialogClasses.FieldDescription} { color: #ff5b5b !important; opacity: 1 !important; }
+  .rke-experimental-utils { margin-top: 16px; padding-top: 8px; }
   .rke-tabs [role="tabpanel"] > div { min-width: 0; width: 100%; }
   .rke-tabs * { min-width: 0; }
 `;

@@ -21,6 +21,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm test:install-progress-model
+      - run: pnpm test:rgb-model
       - run: pnpm build
       - run: pnpm verify:frontend
       - run: python3 -m py_compile main.py charging.py rgb.py runtime-restore.py plugin_loader_recovery.py
@@ -42,6 +44,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: release/RK-Enhanced.zip
-          name: RK-Enhanced ${{ github.ref_name }} — Compatible Decky installation
+          name: RK-Enhanced ${{ github.ref_name }} — Installer safety and Pocket EVO RGB
           body_path: RELEASE_NOTES.md
           prerelease: ${{ contains(github.ref_name, '-') }}

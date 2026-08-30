@@ -1,11 +1,13 @@
 """Strict RK-Enhanced boundary for native ROCKNIX RGB controls."""
 
 from contextlib import contextmanager
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
+import stat
 import threading
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -15,17 +17,33 @@ LED_CONTROL = Path("/usr/bin/ledcontrol")
 ANALOG_STICKS_LED_CONTROL = Path("/usr/bin/analog_sticks_ledcontrol")
 LED_PATH = Path("/sys/class/leds/konkr:rgb:joysticks")
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+EVO_LEDS_ROOT = Path("/sys/class/leds")
 RGB_MODES = ("off", "battery", "rgb")
 RGB_EFFECTS = ("static", "breath", "rainbow")
 ANIMATED_EFFECTS = ("breath", "rainbow")
 PREFERENCES_FILE = "rgb-settings.json"
-PREFERENCES_VERSION = 2
+PREFERENCES_VERSION = 3
+LEGACY_PREFERENCES_VERSION = 2
 DEFAULT_COLOR = (255, 255, 255)
 DEFAULT_BRIGHTNESS = 255
 PROVIDER_SYSFS_EFFECTS = "sysfs-effects"
 PROVIDER_ANALOG_STATIC = "analog-static"
+PROVIDER_POCKET_EVO_V3 = "pocket-evo-v3"
 PROVIDER_NONE = "none"
 ANALOG_STICKS_CAPABILITY = "DEVICE_ANALOG_STICKS_LED_CONTROL"
+EVO_ZONE_INDEX = (
+    "left-270", "left-0", "left-90", "left-180",
+    "right-270", "right-0", "right-90", "right-180",
+)
+EVO_EFFECTS = ("static", "breath", "rgb-breath", "rainbow", "reactive")
+EVO_ATTRIBUTES = (
+    "abi_version", "zone_index", "zone_layout", "available_effects",
+    "effect", "calibration", "enabled",
+)
+EVO_WRITABLE_ATTRIBUTES = ("zone_layout", "effect", "calibration", "enabled")
+EVO_LAYOUT_MODES = ("both", "per-stick", "quadrants")
+EVO_DEFAULT_CALIBRATION = (15, 20)
+EVO_RAW_CALIBRATION = (100, 100)
 
 
 @contextmanager
@@ -126,6 +144,90 @@ def _parse_effect(raw):
     return None
 
 
+def _decimal_values(raw, count, *, maximum=255):
+    values = raw.split()
+    if (len(values) != count or
+            any(re.fullmatch(r"[0-9]+", value) is None for value in values)):
+        return None
+    parsed = tuple(int(value) for value in values)
+    if any(value > maximum for value in parsed):
+        return None
+    return parsed
+
+
+def _parse_evo_effect(raw):
+    """Parse exactly one Pocket EVO ABI 3 effect command."""
+    fields = raw.split()
+    if fields == ["static"]:
+        return {"effect": "static"}
+    if fields == ["rainbow"]:
+        return {"effect": "rainbow"}
+    grammars = {
+        "breath": 4,
+        "rgb-breath": 1,
+        "reactive": 7,
+    }
+    if not fields or fields[0] not in grammars:
+        return None
+    values = _decimal_values(" ".join(fields[1:]), grammars[fields[0]])
+    if values is None:
+        return None
+    if fields[0] == "breath":
+        brightness, red, green, blue = values
+        return {
+            "effect": "breath",
+            "brightness": brightness,
+            "color": (red, green, blue),
+        }
+    if fields[0] == "rgb-breath":
+        return {"effect": "rgb-breath", "brightness": values[0]}
+    brightness, *colors = values
+    return {
+        "effect": "reactive",
+        "brightness": brightness,
+        "idle_color": tuple(colors[:3]),
+        "active_color": tuple(colors[3:]),
+    }
+
+
+def _evo_effect_command(lighting):
+    effect = lighting["effect"]
+    if effect == "static":
+        return "static"
+    if effect == "rainbow":
+        return "rainbow"
+    if effect == "breath":
+        return " ".join((
+            "breath", str(lighting["brightness"]),
+            *(str(value) for value in lighting["color"]),
+        ))
+    if effect == "rgb-breath":
+        return f"rgb-breath {lighting['brightness']}"
+    if effect == "reactive":
+        return " ".join((
+            "reactive", str(lighting["brightness"]),
+            *(str(value) for value in lighting["idle_color"]),
+            *(str(value) for value in lighting["active_color"]),
+        ))
+    raise ValueError("unsupported Pocket EVO RGB effect")
+
+
+def _evo_layout_values(zones):
+    values = []
+    for zone in zones:
+        values.extend((*zone["color"], zone["brightness"]))
+    return tuple(values)
+
+
+def _layout_mode(zones):
+    values = tuple((tuple(zone["color"]), zone["brightness"]) for zone in zones)
+    if len(set(values)) == 1:
+        return "both"
+    if len(set(values[:4])) == 1 and len(set(values[4:])) == 1:
+        return "per-stick"
+    return "quadrants"
+
+
 class RGBController:
     """Validate and serialize access to ROCKNIX's shared-zone RGB ABI.
 
@@ -138,7 +240,7 @@ class RGBController:
                  get_runtime_capability=None,
                  led_control=LED_CONTROL, led_path=LED_PATH,
                  analog_sticks_led_control=ANALOG_STICKS_LED_CONTROL,
-                 boot_id_path=BOOT_ID):
+                 boot_id_path=BOOT_ID, evo_leds_root=EVO_LEDS_ROOT):
         self.settings_dir = Path(settings_dir)
         self.preferences_path = self.settings_dir / PREFERENCES_FILE
         self.lock_path = self.settings_dir / "rgb-control.lock"
@@ -151,7 +253,82 @@ class RGBController:
         self.analog_sticks_led_control = Path(analog_sticks_led_control)
         self.led_path = Path(led_path)
         self.boot_id_path = Path(boot_id_path)
+        self.evo_leds_root = Path(evo_leds_root)
         self.thread_lock = threading.RLock()
+
+    @staticmethod
+    def _readable_attribute(path):
+        try:
+            mode = Path(path).stat().st_mode
+        except OSError:
+            return False
+        return bool(
+            stat.S_ISREG(mode) and
+            mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH) and
+            os.access(path, os.R_OK)
+        )
+
+    @staticmethod
+    def _writable_attribute(path):
+        try:
+            mode = Path(path).stat().st_mode
+        except OSError:
+            return False
+        return bool(
+            stat.S_ISREG(mode) and
+            mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) and
+            os.access(path, os.W_OK)
+        )
+
+    def _discover_evo(self):
+        """Return ``(status, path, effects, error)`` for ABI 3 discovery.
+
+        An entirely absent ABI is a normal fallback case (notably an
+        unpatched Pocket EVO-S). Once an ABI-looking path exists, however, a
+        malformed or partial interface fails closed rather than falling into
+        the generic helper provider and discarding its per-zone state.
+        """
+        pattern = "rgb:joystick-backlight-*/device/rgb"
+        try:
+            matches = list(self.evo_leds_root.glob(pattern))
+        except OSError:
+            matches = []
+        if not matches:
+            return "absent", None, (), ""
+
+        canonical = set()
+        try:
+            for match in matches:
+                canonical.add(match.resolve(strict=True))
+        except OSError:
+            return "invalid", None, (), "Pocket EVO RGB interface is incomplete"
+        if len(canonical) != 1:
+            return "invalid", None, (), "Pocket EVO RGB interface is ambiguous"
+        path = next(iter(canonical))
+        if not path.is_dir():
+            return "invalid", None, (), "Pocket EVO RGB interface is unavailable"
+        if not all(self._readable_attribute(path / name)
+                   for name in EVO_ATTRIBUTES):
+            return "invalid", path, (), "Pocket EVO RGB ABI 3 attributes are incomplete"
+        if not all(self._writable_attribute(path / name)
+                   for name in EVO_WRITABLE_ATTRIBUTES):
+            return "invalid", path, (), "Pocket EVO RGB controls are not writable"
+        try:
+            abi_version = (path / "abi_version").read_text().strip()
+            zone_index = tuple((path / "zone_index").read_text().split())
+            available = tuple((path / "available_effects").read_text().split())
+        except (OSError, UnicodeError):
+            return "invalid", path, (), "Pocket EVO RGB ABI 3 is unreadable"
+        if abi_version != "3":
+            return "invalid", path, (), "Unsupported Pocket EVO RGB ABI"
+        if zone_index != EVO_ZONE_INDEX:
+            return "invalid", path, (), "Pocket EVO RGB zone order is unsupported"
+        if not set(EVO_EFFECTS).issubset(available):
+            return "invalid", path, (), "Pocket EVO RGB effects are incomplete"
+        # Unknown future tokens are deliberately ignored. Their presence does
+        # not extend the request parser or writer.
+        effects = tuple(effect for effect in EVO_EFFECTS if effect in available)
+        return "valid", path, effects, ""
 
     def _native_modes(self):
         if not self.led_control.is_file() or not os.access(self.led_control, os.X_OK):
@@ -197,6 +374,22 @@ class RGBController:
         )
 
     def capabilities(self):
+        evo_status, _evo_path, evo_effects, evo_error = self._discover_evo()
+        if evo_status == "valid":
+            return self._provider_capabilities(
+                PROVIDER_POCKET_EVO_V3,
+                evo_effects=evo_effects,
+            )
+        if evo_status == "invalid":
+            return {
+                "available": False,
+                "provider": PROVIDER_POCKET_EVO_V3,
+                "modes": [],
+                "effects": [],
+                "shared_zone": False,
+                "max_brightness": 0,
+                "error": evo_error,
+            }
         if self._sysfs_effects_available():
             provider = PROVIDER_SYSFS_EFFECTS
         elif self._analog_static_available():
@@ -213,7 +406,19 @@ class RGBController:
 
         return self._provider_capabilities(provider)
 
-    def _provider_capabilities(self, provider):
+    def _provider_capabilities(self, provider, *, evo_effects=()):
+        if provider == PROVIDER_POCKET_EVO_V3:
+            return {
+                "available": True,
+                "provider": provider,
+                "modes": ["off", "rgb"],
+                "effects": list(evo_effects),
+                "shared_zone": False,
+                "max_brightness": 255,
+                "zone_ids": list(EVO_ZONE_INDEX),
+                "layout_modes": list(EVO_LAYOUT_MODES),
+                "error": "",
+            }
         modes = (
             list(RGB_MODES)
             if provider == PROVIDER_SYSFS_EFFECTS else ["off", "rgb"])
@@ -232,7 +437,7 @@ class RGBController:
 
     def _default_preferences(self):
         return {
-            "version": PREFERENCES_VERSION,
+            "version": LEGACY_PREFERENCES_VERSION,
             "provider": PROVIDER_NONE,
             "source_color": list(DEFAULT_COLOR),
             "brightness": DEFAULT_BRIGHTNESS,
@@ -249,6 +454,15 @@ class RGBController:
             candidate = json.loads(self.preferences_path.read_text())
             if not isinstance(candidate, dict):
                 return defaults
+            # ABI 3 keeps its provider record at the top level. If a device
+            # temporarily falls back to the legacy provider, its independent
+            # preference record lives alongside (rather than replacing) the
+            # dormant EVO editor/calibration state.
+            if (candidate.get("version") == PREFERENCES_VERSION and
+                    candidate.get("provider") == PROVIDER_POCKET_EVO_V3):
+                candidate = candidate.get("legacy_preferences")
+                if not isinstance(candidate, dict):
+                    return defaults
             # Version-1 preferences predate multiple providers and therefore
             # belong only to the original strict sysfs-effects ABI.
             version = candidate.get("version")
@@ -281,7 +495,7 @@ class RGBController:
             if not isinstance(native_signature, str) or not isinstance(last_boot, str):
                 raise ValueError
             return {
-                "version": PREFERENCES_VERSION,
+                "version": LEGACY_PREFERENCES_VERSION,
                 "provider": provider,
                 "source_color": list(color),
                 "brightness": brightness,
@@ -295,7 +509,201 @@ class RGBController:
             return defaults
 
     def _save_preferences(self, preferences):
-        _atomic_json(self.preferences_path, preferences)
+        value = dict(preferences)
+        try:
+            existing = json.loads(self.preferences_path.read_text())
+        except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
+            existing = None
+
+        saving_evo = (
+            value.get("version") == PREFERENCES_VERSION and
+            value.get("provider") == PROVIDER_POCKET_EVO_V3)
+        existing_evo = (
+            isinstance(existing, dict) and
+            existing.get("version") == PREFERENCES_VERSION and
+            existing.get("provider") == PROVIDER_POCKET_EVO_V3)
+        if saving_evo:
+            legacy = (
+                existing.get("legacy_preferences")
+                if existing_evo else existing)
+            legacy_version = (
+                legacy.get("version") if isinstance(legacy, dict) else None)
+            if (isinstance(legacy, dict) and
+                    not isinstance(legacy_version, bool) and
+                    legacy_version in (1, 2)):
+                # Preserve the original legacy object exactly; its own loader
+                # remains responsible for validating it before presentation.
+                value["legacy_preferences"] = legacy
+        elif (existing_evo and
+                not isinstance(value.get("version"), bool) and
+                value.get("version") in (1, 2)):
+            combined = dict(existing)
+            combined["legacy_preferences"] = value
+            value = combined
+        _atomic_json(self.preferences_path, value)
+
+    @staticmethod
+    def _default_evo_lighting():
+        return {
+            "effect": "static",
+            "layout_mode": "both",
+            "zones": [
+                {
+                    "id": zone_id,
+                    "color": list(DEFAULT_COLOR),
+                    "brightness": DEFAULT_BRIGHTNESS,
+                }
+                for zone_id in EVO_ZONE_INDEX
+            ],
+            "color": list(DEFAULT_COLOR),
+            "brightness": DEFAULT_BRIGHTNESS,
+            "idle_color": list(DEFAULT_COLOR),
+            "active_color": [0, 0, 255],
+        }
+
+    def _parse_evo_lighting_preference(self, value):
+        try:
+            return self._validated_evo_lighting(value, EVO_EFFECTS)
+        except (TypeError, ValueError):
+            return None
+
+    def _default_evo_preferences(self):
+        return {
+            "version": PREFERENCES_VERSION,
+            "provider": PROVIDER_POCKET_EVO_V3,
+            "lighting": None,
+            "native_lighting_revision": "",
+            "resume_lighting": None,
+            "calibration_override": None,
+            "last_calibration_boot_id": "",
+        }
+
+    def _load_evo_preferences(self):
+        defaults = self._default_evo_preferences()
+        try:
+            candidate = json.loads(self.preferences_path.read_text())
+            if (not isinstance(candidate, dict) or
+                    candidate.get("version") != PREFERENCES_VERSION or
+                    candidate.get("provider") != PROVIDER_POCKET_EVO_V3):
+                return defaults
+            lighting = candidate.get("lighting")
+            if lighting is not None:
+                lighting = self._parse_evo_lighting_preference(lighting)
+                if lighting is None:
+                    raise ValueError
+            resume = candidate.get("resume_lighting")
+            if resume is not None:
+                resume = self._parse_evo_lighting_preference(resume)
+                if resume is None:
+                    raise ValueError
+            native_lighting_revision = candidate.get(
+                "native_lighting_revision", "")
+            if not isinstance(native_lighting_revision, str):
+                raise ValueError
+            calibration_override = candidate.get("calibration_override")
+            if calibration_override is not None:
+                if not isinstance(calibration_override, dict):
+                    raise ValueError
+                calibration_override = {
+                    "green_percent": _bounded_integer(
+                        calibration_override.get("green_percent"),
+                        "green calibration", 100),
+                    "blue_percent": _bounded_integer(
+                        calibration_override.get("blue_percent"),
+                        "blue calibration", 100),
+                }
+            last_boot = candidate.get("last_calibration_boot_id", "")
+            if not isinstance(last_boot, str):
+                raise ValueError
+            return {
+                "version": PREFERENCES_VERSION,
+                "provider": PROVIDER_POCKET_EVO_V3,
+                "lighting": lighting,
+                "native_lighting_revision": native_lighting_revision,
+                "resume_lighting": resume,
+                "calibration_override": calibration_override,
+                "last_calibration_boot_id": last_boot,
+            }
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+            return defaults
+
+    @staticmethod
+    def _evo_snapshot_revision(snapshot):
+        return _state_revision(
+            PROVIDER_POCKET_EVO_V3,
+            " ".join(str(value) for value in snapshot["zone_layout"]),
+            _evo_effect_command(snapshot["effect"]),
+            " ".join(str(value) for value in snapshot["calibration"]),
+            snapshot["enabled"],
+        )
+
+    @staticmethod
+    def _evo_snapshot_lighting_revision(snapshot):
+        """Identify both selected effect and its cached Static layout."""
+        return _state_revision(
+            PROVIDER_POCKET_EVO_V3,
+            " ".join(str(value) for value in snapshot["zone_layout"]),
+            _evo_effect_command(snapshot["effect"]),
+        )
+
+    def _read_evo_snapshot_once(self, path):
+        try:
+            layout = _decimal_values((path / "zone_layout").read_text(), 32)
+            effect = _parse_evo_effect((path / "effect").read_text())
+            calibration = _decimal_values(
+                (path / "calibration").read_text(), 2, maximum=100)
+            enabled = _decimal_values(
+                (path / "enabled").read_text(), 1, maximum=1)
+        except (OSError, UnicodeError):
+            return None
+        if None in (layout, effect, calibration, enabled):
+            return None
+        return {
+            "zone_layout": layout,
+            "effect": effect,
+            "calibration": calibration,
+            "enabled": enabled[0],
+        }
+
+    def _stable_evo_snapshot(self, path):
+        first = self._read_evo_snapshot_once(path)
+        second = self._read_evo_snapshot_once(path)
+        if first is None or second is None or first != second:
+            return None
+        return second
+
+    @staticmethod
+    def _zones_from_layout(layout):
+        return [
+            {
+                "id": zone_id,
+                "color": list(layout[index:index + 3]),
+                "brightness": layout[index + 3],
+            }
+            for zone_id, index in zip(EVO_ZONE_INDEX, range(0, 32, 4))
+        ]
+
+    def _lighting_from_snapshot(self, snapshot):
+        zones = self._zones_from_layout(snapshot["zone_layout"])
+        effect = snapshot["effect"]
+        lighting = self._default_evo_lighting()
+        lighting.update({
+            "effect": effect["effect"],
+            "layout_mode": _layout_mode(zones),
+            "zones": zones,
+        })
+        for name in ("color", "brightness", "idle_color", "active_color"):
+            if name in effect:
+                value = effect[name]
+                lighting[name] = list(value) if isinstance(value, tuple) else value
+        return lighting
+
+    @staticmethod
+    def _evo_calibration_value(pair):
+        return {
+            "green_percent": pair[0],
+            "blue_percent": pair[1],
+        }
 
     def _effect_state(self, capabilities, raw_effect=None):
         if "breath" not in capabilities["effects"]:
@@ -309,6 +717,69 @@ class RGBController:
 
     def _get_state_locked(self, capabilities=None):
         capabilities = capabilities or self.capabilities()
+        if capabilities["provider"] == PROVIDER_POCKET_EVO_V3:
+            preferences = self._load_evo_preferences()
+            base = {
+                "supported": capabilities["available"],
+                "valid": False,
+                "provider": PROVIDER_POCKET_EVO_V3,
+                "revision": "",
+                "modes": capabilities["modes"],
+                "effects": capabilities["effects"],
+                "shared_zone": False,
+                "max_brightness": capabilities["max_brightness"],
+                "mode": "unknown",
+                "temporarily_gated": False,
+                "lighting": self._default_evo_lighting(),
+                "resume_lighting": None,
+                "calibration": {
+                    "green_percent": EVO_DEFAULT_CALIBRATION[0],
+                    "blue_percent": EVO_DEFAULT_CALIBRATION[1],
+                },
+                "calibration_override": preferences["calibration_override"],
+                "error": capabilities.get("error", ""),
+            }
+            if not capabilities["available"]:
+                return base
+            evo_status, evo_path, _effects, evo_error = self._discover_evo()
+            if evo_status != "valid":
+                base["supported"] = False
+                base["error"] = evo_error or "Pocket EVO RGB interface disappeared"
+                return base
+            snapshot = self._stable_evo_snapshot(evo_path)
+            if snapshot is None:
+                base["error"] = "Pocket EVO RGB state is unstable or malformed"
+                return base
+            lighting = self._lighting_from_snapshot(snapshot)
+            saved_lighting = preferences["lighting"]
+            if (saved_lighting is not None and
+                    preferences["native_lighting_revision"] and
+                    preferences["native_lighting_revision"] ==
+                    self._evo_snapshot_lighting_revision(snapshot)):
+                # The exact native lighting command still matches RKE's saved
+                # request. Preserve editor-only metadata such as Static scope,
+                # cached zones under an advanced effect, and inactive effect
+                # colours. A different native command remains authoritative.
+                lighting = self._validated_evo_lighting(
+                    saved_lighting, EVO_EFFECTS)
+            is_off = (
+                lighting["effect"] == "static" and
+                all(value == 0 for value in snapshot["zone_layout"])
+            )
+            base.update({
+                "valid": True,
+                "revision": self._evo_snapshot_revision(snapshot),
+                "mode": "off" if is_off else "rgb",
+                "temporarily_gated": snapshot["enabled"] == 0,
+                "lighting": lighting,
+                "resume_lighting": (
+                    preferences["resume_lighting"] if is_off else None),
+                "calibration": self._evo_calibration_value(
+                    snapshot["calibration"]),
+                "error": "",
+            })
+            return base
+
         preferences = self._load_preferences()
         preferences_current = preferences["provider"] == capabilities["provider"]
         visible_preferences = (
@@ -328,7 +799,7 @@ class RGBController:
             "color": list(visible_preferences["source_color"]),
             "brightness": visible_preferences["brightness"],
             "correction": visible_preferences["correction"],
-            "error": "",
+            "error": capabilities.get("error", ""),
         }
         if not capabilities["available"]:
             return base
@@ -415,6 +886,258 @@ class RGBController:
         with self.thread_lock, _exclusive_lock(self.lock_path):
             return self._get_state_locked()
 
+    def _validated_evo_lighting(self, value, available_effects):
+        if not isinstance(value, dict):
+            raise ValueError("Pocket EVO lighting must be an object")
+        effect = value.get("effect")
+        if effect not in EVO_EFFECTS or effect not in available_effects:
+            raise ValueError("unsupported Pocket EVO RGB effect")
+        layout_mode = value.get("layout_mode")
+        if layout_mode not in EVO_LAYOUT_MODES:
+            raise ValueError("invalid Pocket EVO Static editing layout")
+        source_zones = value.get("zones")
+        if not isinstance(source_zones, list) or len(source_zones) != 8:
+            raise ValueError("Pocket EVO Static layout must contain eight zones")
+        zones = []
+        for expected_id, source in zip(EVO_ZONE_INDEX, source_zones):
+            if not isinstance(source, dict) or source.get("id") != expected_id:
+                raise ValueError("Pocket EVO Static zones are out of order")
+            zones.append({
+                "id": expected_id,
+                "color": list(_source_color(source.get("color"))),
+                "brightness": _bounded_integer(
+                    source.get("brightness"), "zone brightness"),
+            })
+        # The provider carries a complete editor draft, including values not
+        # used by the selected effect. Only the selected effect's exact native
+        # grammar is emitted.
+        color = list(_source_color(value.get("color")))
+        brightness = _bounded_integer(
+            value.get("brightness"), "RGB brightness")
+        idle_color = list(_source_color(value.get("idle_color")))
+        active_color = list(_source_color(value.get("active_color")))
+        return {
+            "effect": effect,
+            "layout_mode": layout_mode,
+            "zones": zones,
+            "color": color,
+            "brightness": brightness,
+            "idle_color": idle_color,
+            "active_color": active_color,
+        }
+
+    def _validated_evo_request(self, request, capabilities, current):
+        if not isinstance(request, dict):
+            raise ValueError("RGB request must be an object")
+        if request.get("provider") != PROVIDER_POCKET_EVO_V3:
+            raise ValueError("RGB provider changed; refresh before applying")
+        if request.get("revision") != current["revision"]:
+            raise ValueError("RGB state changed; refresh before applying")
+        mode = request.get("mode")
+        if mode not in ("off", "rgb"):
+            raise ValueError("Pocket EVO RGB mode must be Off or RGB")
+        lighting = self._validated_evo_lighting(
+            request.get("lighting"), capabilities["effects"])
+        return mode, lighting
+
+    @staticmethod
+    def _write_evo_attribute(path, value):
+        """Emit one validated ABI command through exactly one ``os.write``."""
+        payload = (value + "\n").encode("ascii")
+        descriptor = None
+        try:
+            descriptor = os.open(
+                path, os.O_WRONLY | os.O_CLOEXEC | os.O_TRUNC)
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise OSError("short Pocket EVO RGB sysfs write")
+        except OSError as reason:
+            if reason.errno == errno.EBUSY:
+                raise RuntimeError(
+                    "Pocket EVO RGB transport is suspended; retry after resume") from reason
+            if reason.errno in (errno.ENOENT, errno.ENODEV):
+                raise RuntimeError(
+                    "Pocket EVO RGB interface disappeared; refresh and retry") from reason
+            raise RuntimeError(
+                f"unable to apply Pocket EVO RGB state: {reason}") from reason
+        except UnicodeError as reason:
+            raise RuntimeError(
+                f"unable to apply Pocket EVO RGB state: {reason}") from reason
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _evo_selected_native(snapshot):
+        effect = snapshot["effect"]
+        if effect["effect"] == "static":
+            return "zone_layout", " ".join(
+                str(value) for value in snapshot["zone_layout"])
+        return "effect", _evo_effect_command(effect)
+
+    @staticmethod
+    def _evo_lighting_native(lighting):
+        if lighting["effect"] == "static":
+            return "zone_layout", " ".join(
+                str(value) for value in _evo_layout_values(lighting["zones"]))
+        return "effect", _evo_effect_command(lighting)
+
+    def _evo_snapshot_matches_command(self, snapshot, attribute, command):
+        if snapshot is None:
+            return False
+        selected_attribute, selected_command = self._evo_selected_native(snapshot)
+        return selected_attribute == attribute and selected_command == command
+
+    @staticmethod
+    def _evo_expected_snapshot(previous, attribute, command):
+        """Return the exact native state one successful lighting write owns."""
+        expected = {
+            "zone_layout": previous["zone_layout"],
+            "effect": previous["effect"],
+            "calibration": previous["calibration"],
+            "enabled": previous["enabled"],
+        }
+        if attribute == "zone_layout":
+            layout = _decimal_values(command, 32)
+            if layout is None:
+                raise ValueError("invalid Pocket EVO Static layout command")
+            expected["zone_layout"] = layout
+            expected["effect"] = {"effect": "static"}
+            return expected
+        if attribute == "effect":
+            effect = _parse_evo_effect(command)
+            if effect is None or effect["effect"] == "static":
+                raise ValueError("invalid Pocket EVO effect command")
+            expected["effect"] = effect
+            return expected
+        raise ValueError("invalid Pocket EVO lighting attribute")
+
+    def _evo_preferences_after_lighting(
+            self, previous, lighting, mode, native_snapshot):
+        result = dict(previous)
+        result.update({
+            "version": PREFERENCES_VERSION,
+            "provider": PROVIDER_POCKET_EVO_V3,
+            "lighting": lighting,
+            "native_lighting_revision":
+                self._evo_snapshot_lighting_revision(native_snapshot),
+        })
+        if mode == "rgb":
+            result["resume_lighting"] = lighting
+        return result
+
+    def _guarded_evo_lighting_rollback(
+            self, path, applied_snapshot, previous_snapshot):
+        current = self._stable_evo_snapshot(path)
+        if current != applied_snapshot:
+            return False
+
+        previous_layout = " ".join(
+            str(value) for value in previous_snapshot["zone_layout"])
+        try:
+            # ``zone_layout`` is cached even while an advanced effect is
+            # selected. Restore it first so a failed advanced -> Static Save
+            # cannot leak the rejected Static draft the next time another
+            # client selects Static.
+            if current["zone_layout"] != previous_snapshot["zone_layout"]:
+                self._write_evo_attribute(
+                    path / "zone_layout", previous_layout)
+                current = self._stable_evo_snapshot(path)
+                if (current is None or
+                        current["zone_layout"] !=
+                        previous_snapshot["zone_layout"] or
+                        current["effect"] != {"effect": "static"} or
+                        current["calibration"] !=
+                        previous_snapshot["calibration"] or
+                        current["enabled"] != previous_snapshot["enabled"]):
+                    return False
+
+            attribute, command = self._evo_selected_native(previous_snapshot)
+            if not self._evo_snapshot_matches_command(
+                    current, attribute, command):
+                self._write_evo_attribute(path / attribute, command)
+        except RuntimeError:
+            return False
+        restored = self._stable_evo_snapshot(path)
+        return restored == previous_snapshot
+
+    def _set_evo_state_locked(self, request, capabilities, current):
+        mode, requested_lighting = self._validated_evo_request(
+            request, capabilities, current)
+        evo_status, path, _effects, evo_error = self._discover_evo()
+        if evo_status != "valid":
+            raise RuntimeError(
+                evo_error or "Pocket EVO RGB interface disappeared")
+        previous_snapshot = self._stable_evo_snapshot(path)
+        if (previous_snapshot is None or
+                self._evo_snapshot_revision(previous_snapshot) !=
+                current["revision"]):
+            raise ValueError("RGB state changed; refresh before applying")
+        preferences = self._load_evo_preferences()
+
+        if mode == "off":
+            # Preserve the complete validated editor draft for explicit On.
+            # Under an advanced effect the native ``zone_layout`` is hidden
+            # cache and can be all-zero after an earlier Off cycle; the
+            # revision-bound request retains the intended Static zones and
+            # any edits the user made before selecting Off.
+            if current["mode"] != "off":
+                preferences["resume_lighting"] = requested_lighting
+            applied_lighting = self._default_evo_lighting()
+            applied_lighting["zones"] = [
+                {"id": zone_id, "color": [0, 0, 0], "brightness": 0}
+                for zone_id in EVO_ZONE_INDEX
+            ]
+            applied_lighting["layout_mode"] = "both"
+            attribute = "zone_layout"
+            command = " ".join("0" for _ in range(32))
+        else:
+            applied_lighting = requested_lighting
+            # A plain On request made from the native all-zero Off state uses
+            # the saved last non-off state. An edited nonzero draft remains
+            # authoritative and is applied directly.
+            if (current["mode"] == "off" and
+                    requested_lighting["effect"] == "static" and
+                    all(value == 0 for value in
+                        _evo_layout_values(requested_lighting["zones"])) and
+                    preferences["resume_lighting"] is not None):
+                applied_lighting = preferences["resume_lighting"]
+            attribute, command = self._evo_lighting_native(applied_lighting)
+        expected_snapshot = self._evo_expected_snapshot(
+            previous_snapshot, attribute, command)
+
+        if self._evo_snapshot_matches_command(
+                previous_snapshot, attribute, command):
+            new_preferences = self._evo_preferences_after_lighting(
+                preferences, applied_lighting, mode, previous_snapshot)
+            self._save_preferences(new_preferences)
+            return self._get_state_locked(capabilities)
+
+        try:
+            self._write_evo_attribute(path / attribute, command)
+        except RuntimeError:
+            # A transport error can occur after some LEDs visibly changed.
+            # Reconcile every ABI component before releasing RKE's queue.
+            self._stable_evo_snapshot(path)
+            raise
+        applied_snapshot = self._stable_evo_snapshot(path)
+        if applied_snapshot != expected_snapshot:
+            # Reconcile before returning an error. Do not claim the requested
+            # state or persist it when any native component differs. This
+            # also detects another client changing the hidden Static layout
+            # and then re-selecting the same advanced effect before readback.
+            self._stable_evo_snapshot(path)
+            raise RuntimeError("Pocket EVO RGB native readback did not match")
+        new_preferences = self._evo_preferences_after_lighting(
+            preferences, applied_lighting, mode, applied_snapshot)
+        try:
+            self._save_preferences(new_preferences)
+        except Exception:
+            self._guarded_evo_lighting_rollback(
+                path, applied_snapshot, previous_snapshot)
+            raise
+        return self._get_state_locked(capabilities)
+
     def _validated_request(self, request, capabilities, current_revision):
         if not isinstance(request, dict):
             raise ValueError("RGB request must be an object")
@@ -440,7 +1163,7 @@ class RGBController:
     def _preferences(self, provider, source, brightness, correction, effect,
                      animation_active, signature, boot_id=""):
         return {
-            "version": PREFERENCES_VERSION,
+            "version": LEGACY_PREFERENCES_VERSION,
             "provider": provider,
             "source_color": list(source),
             "brightness": brightness,
@@ -511,6 +1234,9 @@ class RGBController:
             current = self._get_state_locked(capabilities)
             if not current["valid"]:
                 raise RuntimeError(current["error"] or "RGB state is unavailable")
+            if capabilities["provider"] == PROVIDER_POCKET_EVO_V3:
+                return self._set_evo_state_locked(
+                    request, capabilities, current)
             mode, effect, source, brightness, correction = (
                 self._validated_request(
                     request, capabilities, current["revision"]))
@@ -630,9 +1356,140 @@ class RGBController:
                 effect in ANIMATED_EFFECTS, native, boot_id))
             return self._get_state_locked(capabilities)
 
+    def _guarded_evo_calibration_rollback(
+            self, path, applied_snapshot, previous_pair):
+        current = self._stable_evo_snapshot(path)
+        if current != applied_snapshot:
+            return False
+        command = f"{previous_pair[0]} {previous_pair[1]}"
+        try:
+            self._write_evo_attribute(path / "calibration", command)
+        except RuntimeError:
+            return False
+        restored = self._stable_evo_snapshot(path)
+        return bool(
+            restored is not None and
+            restored["calibration"] == previous_pair and
+            restored["zone_layout"] == applied_snapshot["zone_layout"] and
+            restored["effect"] == applied_snapshot["effect"] and
+            restored["enabled"] == applied_snapshot["enabled"]
+        )
+
+    def set_calibration(self, request):
+        """Save, reset, or select raw ABI 3 native colour calibration."""
+        with self.thread_lock, _exclusive_lock(self.lock_path):
+            capabilities = self.capabilities()
+            if (not capabilities["available"] or
+                    capabilities["provider"] != PROVIDER_POCKET_EVO_V3):
+                raise RuntimeError(
+                    "Pocket EVO RGB calibration is unsupported on this device")
+            current = self._get_state_locked(capabilities)
+            if not current["valid"]:
+                raise RuntimeError(current["error"] or "RGB state is unavailable")
+            if not isinstance(request, dict):
+                raise ValueError("calibration request must be an object")
+            if request.get("provider") != PROVIDER_POCKET_EVO_V3:
+                raise ValueError("RGB provider changed; refresh before applying")
+            if request.get("revision") != current["revision"]:
+                raise ValueError("RGB state changed; refresh before applying")
+            action = request.get("action")
+            if action == "save":
+                target = (
+                    _bounded_integer(
+                        request.get("green_percent"), "green calibration", 100),
+                    _bounded_integer(
+                        request.get("blue_percent"), "blue calibration", 100),
+                )
+                override = self._evo_calibration_value(target)
+            elif action == "reset":
+                target = EVO_DEFAULT_CALIBRATION
+                override = None
+            elif action == "raw":
+                target = EVO_RAW_CALIBRATION
+                override = self._evo_calibration_value(target)
+            else:
+                raise ValueError("calibration action must be Save, Reset, or Raw")
+
+            evo_status, path, _effects, evo_error = self._discover_evo()
+            if evo_status != "valid":
+                raise RuntimeError(
+                    evo_error or "Pocket EVO RGB interface disappeared")
+            previous_snapshot = self._stable_evo_snapshot(path)
+            if (previous_snapshot is None or
+                    self._evo_snapshot_revision(previous_snapshot) !=
+                    current["revision"]):
+                raise ValueError("RGB state changed; refresh before applying")
+            previous_pair = previous_snapshot["calibration"]
+            command = f"{target[0]} {target[1]}"
+            try:
+                self._write_evo_attribute(path / "calibration", command)
+            except RuntimeError:
+                self._stable_evo_snapshot(path)
+                raise
+            applied_snapshot = self._stable_evo_snapshot(path)
+            if (applied_snapshot is None or
+                    applied_snapshot["calibration"] != target):
+                self._stable_evo_snapshot(path)
+                raise RuntimeError(
+                    "Pocket EVO RGB calibration readback did not match")
+
+            preferences = self._load_evo_preferences()
+            native_lighting = self._lighting_from_snapshot(applied_snapshot)
+            if preferences["lighting"] is None:
+                preferences["lighting"] = native_lighting
+                preferences["native_lighting_revision"] = (
+                    self._evo_snapshot_lighting_revision(applied_snapshot))
+            if (current["mode"] != "off" and
+                    preferences["resume_lighting"] is None):
+                preferences["resume_lighting"] = native_lighting
+            preferences["calibration_override"] = override
+            preferences["last_calibration_boot_id"] = (
+                _read(self.boot_id_path) if override is not None else "")
+            try:
+                self._save_preferences(preferences)
+            except Exception:
+                self._guarded_evo_calibration_rollback(
+                    path, applied_snapshot, previous_pair)
+                raise
+            return self._get_state_locked(capabilities)
+
     def reapply_startup(self):
         """Reapply a persisted animation once per boot, without polling."""
         with self.thread_lock, _exclusive_lock(self.lock_path):
+            evo_status, evo_path, _evo_effects, _evo_error = self._discover_evo()
+            if evo_status == "invalid":
+                return False
+            if evo_status == "valid":
+                preferences = self._load_evo_preferences()
+                override = preferences["calibration_override"]
+                if override is None:
+                    return False
+                boot_id = _read(self.boot_id_path)
+                if (not boot_id or
+                        boot_id == preferences["last_calibration_boot_id"]):
+                    return False
+                previous_snapshot = self._stable_evo_snapshot(evo_path)
+                if previous_snapshot is None:
+                    return False
+                target = (
+                    override["green_percent"],
+                    override["blue_percent"],
+                )
+                # Tombstone this boot before touching the volatile native
+                # value. If an external writer wins between our write and
+                # verification, a later Decky restart must not retry and
+                # overwrite that now-authoritative calibration.
+                preferences["last_calibration_boot_id"] = boot_id
+                self._save_preferences(preferences)
+                self._write_evo_attribute(
+                    evo_path / "calibration", f"{target[0]} {target[1]}")
+                applied_snapshot = self._stable_evo_snapshot(evo_path)
+                if (applied_snapshot is None or
+                        applied_snapshot["calibration"] != target):
+                    return False
+                # The caller can distinguish this from legacy animation
+                # restoration and log the operation accurately.
+                return "calibration"
             # Generic static devices require explicit Save only. Return before
             # their capability flag or persisted seven-field state is read.
             if not self._sysfs_effects_available():
