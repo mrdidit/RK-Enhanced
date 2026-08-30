@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.2.0-beta.11 — 2026-08-30
+
+### Installation safety and visibility
+
+- Adds a persistent, blocking installation view with honest download,
+  validation, backup, install, Decky-reload, verification, completion, and
+  rollback phases. RK-Enhanced mutations stay disabled during a transaction,
+  and progress resumes after Decky reloads or Quick Access is reopened.
+- Appends the same phases, source and target releases, Decky version, failures,
+  and rollback result to a size-limited installer journal included in Utils
+  logs. Both the SSH installer and in-plugin updater use the same record.
+- Distinguishes the previous published GitHub release from local installation
+  history, and offers a distinct last-installed release when completed local
+  cross-version history differs from the previous-published option.
+- Detects the exact normalized **ROCKNIX Control** manifest identity shared by
+  the original plugin and Rocknix Control Enhanced. Installation blocks by
+  default; explicit removal revalidates and permanently deletes only the exact
+  non-symlink plugin directory, then restores native `fancontrol.service`.
+- Adds the same conflict as a runtime mutation gate, keeping Monitor, Logs,
+  Utils, and conflict removal available without allowing competing preset or
+  hardware writes.
+- Adds **Clean old RK-E backups**, which retains the newest ordinary rollback
+  snapshot and excludes symlinks, recovery artifacts, unknown directories,
+  other plugins, and Decky's Loader rollback file.
+
+### Interface cleanup
+
+- Places **Remove conflicting plugin** directly on Monitor whenever the runtime
+  conflict gate is active, with the permanent-removal warning beside it.
+- Removes the PC-side SSH trust-reset hint from Utils.
+- Moves the ROCKNIX Custom fan-curve editor to the bottom of Fan Curves.
+- Shortens that editor's visible heading to **Rocknix Fan Curve** while keeping
+  its protected ROCKNIX Custom purpose clear inside the section.
+- Places backup cleanup directly below the downgrade warning and moves the
+  Experimental controls block and its explanation to the bottom of Utils.
+
+### Runtime diagnostics
+
+- Adds severity-coloured combined `RK-E CPU Load` to Monitor's Runtime section,
+  using the existing serialized telemetry request with no new poller.
+- Normalizes the displayed value to the same whole-device scale as Monitor's
+  main CPU load, so `7.5%` RK-E load can be compared directly with `15%` total
+  load on an eight-core device.
+- Combines the RK-Enhanced backend, its exact child/helper process tree, the
+  exact PluginLoader lifecycle guard, and the exact runtime-restoration guard;
+  cumulative child counters retain short helper work, while per-root process
+  generations prevent guard changes from causing false spikes. Decky, other
+  plugins, and native ROCKNIX services remain excluded. An unresolved expected
+  guard makes the metric explicitly unavailable instead of silently partial.
+
+### Pocket EVO RGB ABI 3
+
+- Adds a dedicated, capability-detected Pocket EVO provider ahead of the
+  existing FIT and generic Static providers. The advanced interface is exposed
+  only after the complete ABI version 3 contract validates.
+- Keeps unpatched Pocket EVO-S devices on their existing generic Static path;
+  no product-name or SoC allowlist is introduced.
+- Keeps Static as the default native effect and adds both-ring, per-stick, and
+  eight-quadrant editing over one complete ordered layout.
+- Adds native Breath, RGB Breath, Rainbow, and Reactive controls together with
+  driver-owned green/blue calibration, Reset, and Raw actions.
+- Serializes potentially slow sysfs transactions in the backend, performs one
+  complete write per command, verifies cached native readback, and rejects
+  stale or unstable state before mutation.
+- Reconciles the complete native state after failed writes, keeps an
+  active-but-unsaved result visible and saveable, and uses guarded rollback
+  without overwriting a newer external change.
+- Preserves dormant Pocket EVO layout/calibration preferences if an unpatched
+  kernel temporarily exposes only the generic Static provider.
+- Respects ROCKNIX's temporary output gate, never opens the RGB UART, never
+  applies the legacy 80% correction to ABI 3, and never restores an EVO
+  lighting layout or effect automatically at startup.
+
 ## v0.2.0-beta.10 — 2026-08-30
 
 ### Compatible Decky installation
