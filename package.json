@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "rollup -c && node scripts/frontend-integrity.mjs stamp",
+    "test:frontend-lightweight": "node scripts/test-frontend-lightweight.mjs",
     "test:install-progress-model": "node scripts/test-install-progress-model.mjs",
     "test:rgb-model": "node scripts/test-rgb-model.mjs",
     "verify:frontend": "node scripts/frontend-integrity.mjs verify",

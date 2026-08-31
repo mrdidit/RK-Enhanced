@@ -66,6 +66,12 @@ FAN_CONFIG = Path("/storage/.config/fancontrol.conf")
 CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
 KGSL_GPU_ROOT = Path("/sys/class/kgsl/kgsl-3d0")
+THERMAL_ROOT = Path("/sys/class/thermal")
+STEAM_SCOPE_CGROUPS = (
+    Path("/sys/fs/cgroup/systemd/system.slice/steam-bigpicture.scope/cgroup.procs"),
+    Path("/sys/fs/cgroup/unified/system.slice/steam-bigpicture.scope/cgroup.procs"),
+    Path("/sys/fs/cgroup/pids/system.slice/steam-bigpicture.scope/cgroup.procs"),
+)
 LIFECYCLE_RUN_ROOT = Path("/run/rk-enhanced")
 LIFECYCLE_CURRENT = LIFECYCLE_RUN_ROOT / "plugin-lifecycle-current.json"
 AUTO_RECOVERY_FOCUS_REQUEST = (
@@ -89,7 +95,11 @@ INSTALL_PROGRESS_OUTCOMES = {
     "idle", "running", "succeeded", "failed", "rolled-back", "blocked",
     "unavailable",
 }
+LOG_ENTRY_LIMIT = 400
 INSTALL_PROGRESS_STALE_SECONDS = 15 * 60
+TELEMETRY_DISCOVERY_RETRY_SECONDS = 10.0
+GPU_FDINFO_REFRESH_SECONDS = 10.0
+RKE_CPU_SAMPLE_SECONDS = 2.0
 
 
 def _read(path, default=""):
@@ -858,6 +868,9 @@ class Plugin:
         self.gamescope_pid = None
         self.gpu_fdinfo_paths = []
         self.gpu_fdinfo_refresh = 0.0
+        self.telemetry_sample_lock = threading.Lock()
+        self.telemetry_topology_epoch = 0
+        self.telemetry_topology_cache = None
         self.monitor_lock = threading.RLock()
         self.monitor_session = ""
         self.monitor_generation = 0
@@ -865,11 +878,13 @@ class Plugin:
         self.monitor_bypass_active = False
         self.monitor_charging_valid = None
         self.last_rke_cpu_sample = None
+        self.last_rke_cpu_percent = None
         self.backend_identity = _process_identity(os.getpid())
         self.battery_discharge_ema = None
         self.battery_discharge_samples = 0
         self.battery_discharge_last_sample = 0.0
         self.log_offsets = {}
+        self.log_file_cache = {}
         self.latest_release_cache = (0.0, [])
         self.session_lock = threading.RLock()
         self.charging = ChargingController(self.settings_dir)
@@ -2177,44 +2192,48 @@ class Plugin:
             if (target == self.active_appid and preset == self.active_preset and
                     not needs_runtime_apply and not needs_fan_apply):
                 return {"applied": False, "preset": self.active_preset}
+            self._apply(data["presets"][preset])
+            # active_appid is the frontend's commit marker. Publish it only
+            # after all hardware writes succeed, and publish the matching
+            # preset first so get_state can never expose a new AppID with the
+            # previous preset.
+            self.active_preset = preset
             self.active_appid = target
             self.gpu_fdinfo_paths = []
             self.gpu_fdinfo_refresh = 0.0
             self.last_gpu_sample = None
-            self._apply(data["presets"][preset])
-            self.active_preset = preset
             return {"applied": True, "preset": preset}
         return await asyncio.to_thread(self._run_hardware_mutation, work)
 
-    def _steam_scope_active(self):
-        cgroups = (
-            Path("/sys/fs/cgroup/systemd/system.slice/steam-bigpicture.scope/cgroup.procs"),
-            Path("/sys/fs/cgroup/unified/system.slice/steam-bigpicture.scope/cgroup.procs"),
-            Path("/sys/fs/cgroup/pids/system.slice/steam-bigpicture.scope/cgroup.procs"),
-        )
-        return any(_read(cgroup) for cgroup in cgroups if cgroup.exists())
-
-    def _detect_steam_app(self):
-        cgroups = (
-            Path("/sys/fs/cgroup/systemd/system.slice/steam-bigpicture.scope/cgroup.procs"),
-            Path("/sys/fs/cgroup/unified/system.slice/steam-bigpicture.scope/cgroup.procs"),
-            Path("/sys/fs/cgroup/pids/system.slice/steam-bigpicture.scope/cgroup.procs"),
-        )
+    def _steam_scope_pids(self):
         pids = []
-        for cgroup in cgroups:
-            if cgroup.exists():
-                pids = _read(cgroup).splitlines()
-                break
+        for cgroup in STEAM_SCOPE_CGROUPS:
+            if not cgroup.exists():
+                continue
+            for value in _read(cgroup).splitlines():
+                try:
+                    pid = int(value)
+                except ValueError:
+                    continue
+                if pid > 0:
+                    pids.append(pid)
+        return tuple(sorted(set(pids)))
+
+    def _steam_scope_active(self):
+        return bool(self._steam_scope_pids())
+
+    def _detect_steam_app(self, pids=None):
+        pids = self._steam_scope_pids() if pids is None else tuple(pids)
         ignored = (
             "pw-audio-namesp", "network.cr", "steamwebhelper", "pressure-vessel",
             "reaper", "wineserver", "services.exe", "explorer.exe", "rpcss.exe",
             "plugplay.exe", "svchost.exe", "conhost.exe",
         )
         candidates = {}
-        for value in pids:
+        for pid in pids:
             try:
-                pid = int(value)
-                process = Path("/proc") / value
+                pid = int(pid)
+                process = Path("/proc") / str(pid)
                 comm = _read(process / "comm").lower()
                 if not comm or any(comm.startswith(name) for name in ignored):
                     continue
@@ -2323,8 +2342,28 @@ class Plugin:
     async def _game_watch_loop(self):
         pending, confirmations = None, 0
         steam_was_active = False
+        detected = ""
+        detected_scope_pids = None
+        detected_at = 0.0
         while True:
             try:
+                scope_pids = await asyncio.to_thread(self._steam_scope_pids)
+                steam_active = bool(scope_pids)
+                if not steam_active and not getattr(
+                        self, "startup_rgb_pending", False):
+                    # With no Steam session and no deferred one-shot RGB work,
+                    # there is nothing to mutate. Avoid rereading installer
+                    # state and every plugin manifest on each idle tick; every
+                    # mutation still performs its own fresh conflict check.
+                    steam_was_active = False
+                    pending, confirmations = None, 0
+                    detected = ""
+                    detected_scope_pids = None
+                    detected_at = 0.0
+                    self.active_appid = ""
+                    self.active_preset = DEFAULT_PRESET
+                    await asyncio.sleep(2)
+                    continue
                 install_status = await asyncio.to_thread(self._install_status)
                 if install_status["active"]:
                     pending, confirmations = None, 0
@@ -2352,15 +2391,23 @@ class Plugin:
                             f"Unable to apply deferred RGB startup state: {reason}")
                     finally:
                         self.startup_rgb_pending = False
-                steam_active = await asyncio.to_thread(self._steam_scope_active)
                 if not steam_active:
                     steam_was_active = False
                     pending, confirmations = None, 0
+                    detected = ""
+                    detected_scope_pids = None
+                    detected_at = 0.0
                     self.active_appid = ""
                     self.active_preset = DEFAULT_PRESET
                     await asyncio.sleep(2)
                     continue
-                detected = await asyncio.to_thread(self._detect_steam_app)
+                now = time.monotonic()
+                if (scope_pids != detected_scope_pids or
+                        now < detected_at or now - detected_at >= 10):
+                    detected = await asyncio.to_thread(
+                        self._detect_steam_app, scope_pids)
+                    detected_scope_pids = scope_pids
+                    detected_at = now
                 if not steam_was_active:
                     steam_was_active = True
                     pending, confirmations = detected, 2
@@ -2450,7 +2497,8 @@ class Plugin:
 
     def _gpu_engine_time(self):
         now = time.monotonic()
-        if now - self.gpu_fdinfo_refresh >= 10 or not self.gpu_fdinfo_paths:
+        if (self.gpu_fdinfo_refresh <= 0 or
+                now - self.gpu_fdinfo_refresh >= GPU_FDINFO_REFRESH_SECONDS):
             self._refresh_gpu_fdinfo_paths()
         total = 0
         for info in self.gpu_fdinfo_paths:
@@ -2462,6 +2510,257 @@ class Plugin:
             except (OSError, ValueError, IndexError):
                 continue
         return total
+
+    def _invalidate_telemetry_topology_locked(self):
+        """Invalidate cached sysfs discovery for a new Monitor activation."""
+        self.telemetry_topology_epoch = (
+            getattr(self, "telemetry_topology_epoch", 0) + 1)
+        self.telemetry_topology_cache = None
+        # DRM clients are session-sensitive rather than boot-stable.
+        self.gpu_fdinfo_paths = []
+        self.gpu_fdinfo_refresh = 0.0
+
+    @staticmethod
+    def _telemetry_topology_paths_valid(topology):
+        for policy in topology["cpu"]:
+            path = policy["path"]
+            if (not path.is_dir() or not all((path / name).exists() for name in (
+                    "scaling_cur_freq", "scaling_min_freq",
+                    "scaling_max_freq", "scaling_governor"))):
+                return False
+        gpu = topology["gpu"]
+        if gpu is not None:
+            path = gpu["path"]
+            if (not path.is_dir() or not all((path / name).exists() for name in (
+                    "cur_freq", "min_freq", "max_freq", "governor"))):
+                return False
+        if any(not (item["path"] / "temp").exists()
+               for item in topology["thermal"]):
+            return False
+        if any(not (item["path"] / "cur_state").exists()
+               for item in topology["cooling"]):
+            return False
+        fan_path = topology["fan_pwm_path"]
+        return fan_path is None or fan_path.is_file()
+
+    def _discover_telemetry_topology(self):
+        """Discover boot-stable sensor/control layout, not live values."""
+        cpu = []
+        discovery_incomplete = False
+        policies = list(CPU_ROOT.glob("policy*"))
+        try:
+            policies.sort(key=lambda item: int(item.name[6:]))
+        except ValueError:
+            policies.sort(key=lambda item: item.name)
+        for policy in policies:
+            if not all((policy / name).exists() for name in (
+                    "scaling_cur_freq", "scaling_min_freq",
+                    "scaling_max_freq", "scaling_governor")):
+                discovery_incomplete = True
+                continue
+            frequencies = _read_ints(
+                policy / "scaling_available_frequencies")
+            boost_frequencies = _read_ints(
+                policy / "scaling_boost_frequencies")
+            cpuinfo_minimum = _read_int(policy / "cpuinfo_min_freq")
+            cpuinfo_maximum = _read_int(policy / "cpuinfo_max_freq")
+            if not frequencies:
+                frequencies = sorted({value for value in (
+                    cpuinfo_minimum, cpuinfo_maximum) if value})
+            if not frequencies:
+                discovery_incomplete = True
+                continue
+            cpu.append({
+                "id": policy.name[6:],
+                "path": policy,
+                "cpus": _read(
+                    policy / "affected_cpus", policy.name[6:]).split(),
+                "frequencies": frequencies,
+                "boost_frequencies": boost_frequencies,
+                "cpuinfo_maximum": cpuinfo_maximum,
+            })
+
+        gpu = None
+        gpu_path = _gpu_path()
+        if (gpu_path is not None and all(
+                (gpu_path / name).exists() for name in (
+                    "cur_freq", "min_freq", "max_freq", "governor"))):
+            gpu = {
+                "path": gpu_path,
+                "frequencies": _read_ints(
+                    gpu_path / "available_frequencies"),
+            }
+
+        thermal = []
+        for zone in THERMAL_ROOT.glob("thermal_zone*"):
+            kind = _read(zone / "type").lower().replace("_", "-")
+            category = ""
+            primary = False
+            if kind.startswith("cpuss"):
+                category = "cpu-package"
+            elif kind.startswith("cpu"):
+                category = "cpu-core"
+            elif kind.startswith(("gpu", "gpuss")):
+                category = "gpu"
+                primary = bool(
+                    kind.startswith("gpuss0-") or
+                    kind in ("gpuss0", "gpu-thermal"))
+            if category:
+                if not (zone / "temp").exists():
+                    discovery_incomplete = True
+                    continue
+                thermal.append({
+                    "path": zone, "category": category,
+                    "primary": primary,
+                })
+
+        cooling = []
+        for device in THERMAL_ROOT.glob("cooling_device*"):
+            kind = _read(device / "type").lower()
+            category = (
+                "cpu" if kind.startswith("cpufreq-") else
+                "gpu" if kind.startswith("devfreq-") or "gpu" in kind else
+                "")
+            if category:
+                if not (device / "cur_state").exists():
+                    discovery_incomplete = True
+                    continue
+                cooling.append({"path": device, "category": category})
+
+        fan_pwm_path = _fan_pwm_path()
+        incomplete = bool(
+            discovery_incomplete or not cpu or gpu is None or not thermal or
+            not cooling or fan_pwm_path is None)
+        return {
+            "cpu": tuple(cpu),
+            "gpu": gpu,
+            "thermal": tuple(thermal),
+            "cooling": tuple(cooling),
+            "fan_pwm_path": fan_pwm_path,
+            "incomplete": incomplete,
+        }
+
+    def _telemetry_topology(self, force=False):
+        now = time.monotonic()
+        with self.monitor_lock:
+            epoch = getattr(self, "telemetry_topology_epoch", 0)
+            cached = getattr(self, "telemetry_topology_cache", None)
+        if (not force and cached is not None and
+                cached["epoch"] == epoch and
+                self._telemetry_topology_paths_valid(cached) and
+                (not cached["incomplete"] or now < cached["retry_at"])):
+            return cached
+
+        discovered = self._discover_telemetry_topology()
+        discovered.update({
+            "epoch": epoch,
+            "retry_at": (
+                now + TELEMETRY_DISCOVERY_RETRY_SECONDS
+                if discovered["incomplete"] else math.inf),
+        })
+        # A new Monitor activation may overtake discovery.  The old request can
+        # finish against its local snapshot, but must not populate the new
+        # activation's cache.
+        with self.monitor_lock:
+            if getattr(self, "telemetry_topology_epoch", 0) == epoch:
+                self.telemetry_topology_cache = discovered
+        return discovered
+
+    @staticmethod
+    def _cpu_telemetry(topology):
+        result = []
+        root_boost = _read_int(CPU_ROOT / "boost")
+        for static in topology["cpu"]:
+            path = static["path"]
+            boost_enabled = bool(_read_int(path / "boost", root_boost))
+            boost_frequencies = list(static["boost_frequencies"])
+            cpuinfo_maximum = static["cpuinfo_maximum"]
+            if (boost_enabled and cpuinfo_maximum and
+                    cpuinfo_maximum > max(static["frequencies"])):
+                boost_frequencies = sorted(set(
+                    boost_frequencies + [cpuinfo_maximum]))
+            maximum_frequencies = sorted(set(
+                static["frequencies"] +
+                (boost_frequencies if boost_enabled else [])))
+            result.append({
+                "id": static["id"],
+                "cpus": list(static["cpus"]),
+                "frequencies": list(static["frequencies"]),
+                "boost_frequencies": boost_frequencies,
+                "boost_enabled": boost_enabled,
+                "maximum_frequencies": maximum_frequencies,
+                "current": _read_int(path / "scaling_cur_freq"),
+                "minimum": _read_int(path / "scaling_min_freq"),
+                "maximum": _read_int(path / "scaling_max_freq"),
+                "effective_maximum": max(maximum_frequencies),
+                "governor": _read(path / "scaling_governor"),
+            })
+        return result
+
+    @staticmethod
+    def _gpu_telemetry(topology):
+        static = topology["gpu"]
+        if static is None:
+            return {
+                "available": False, "current": 0, "minimum": 0,
+                "maximum": 0, "frequency_maximum": 0, "governor": "",
+            }
+        path = static["path"]
+        return {
+            "available": True,
+            "current": _read_int(path / "cur_freq"),
+            "minimum": _read_int(path / "min_freq"),
+            "maximum": _read_int(path / "max_freq"),
+            "frequency_maximum": max(static["frequencies"], default=0),
+            "governor": _read(path / "governor"),
+        }
+
+    @staticmethod
+    def _temperature_telemetry(topology):
+        cpu_package, cpu_core, gpu, primary_gpu = [], [], [], []
+        for sensor in topology["thermal"]:
+            value = _read_int(sensor["path"] / "temp")
+            if not 0 < value < 150000:
+                continue
+            if sensor["category"] == "cpu-package":
+                cpu_package.append(value)
+            elif sensor["category"] == "cpu-core":
+                cpu_core.append(value)
+            else:
+                gpu.append(value)
+                if sensor["primary"]:
+                    primary_gpu.append(value)
+        return cpu_package, cpu_core, gpu, primary_gpu
+
+    @staticmethod
+    def _cooling_telemetry(topology):
+        cpu = gpu = False
+        for device in topology["cooling"]:
+            if _read_int(device["path"] / "cur_state") <= 0:
+                continue
+            if device["category"] == "cpu":
+                cpu = True
+            else:
+                gpu = True
+        return cpu, gpu
+
+    @staticmethod
+    def _fan_status_from_topology(topology):
+        path = topology["fan_pwm_path"]
+        pwm = _read_int(path) if path else 0
+        return {
+            "fan_pwm": pwm,
+            "fan_percent": round(pwm * 100 / 255),
+            "cooling_profile": _get_setting("cooling.profile", ""),
+        }
+
+    def _fan_status(self):
+        lock = getattr(self, "telemetry_sample_lock", None)
+        if lock is None:
+            lock = self.telemetry_sample_lock = threading.Lock()
+        with lock:
+            return self._fan_status_from_topology(
+                self._telemetry_topology())
 
     @staticmethod
     def _monitor_identity(monitor_session, monitor_generation):
@@ -2522,8 +2821,24 @@ class Plugin:
 
     def _sample_rke_cpu_percent(self, monitor_session, monitor_generation):
         """Return top-style combined RK-E CPU load for the Monitor epoch."""
-        cpu_snapshot = self._rke_cpu_snapshot()
         sampled_at = time.monotonic()
+        with self.monitor_lock:
+            if not self._monitor_current_locked(
+                    monitor_session, monitor_generation):
+                return None
+            previous = self.last_rke_cpu_sample
+            if (previous is not None and
+                    previous[0] == monitor_session and
+                    previous[1] == monitor_generation and
+                    0 <= sampled_at - previous[3] < getattr(
+                        self, "rke_cpu_sample_interval",
+                        RKE_CPU_SAMPLE_SECONDS)):
+                return getattr(self, "last_rke_cpu_percent", None)
+
+        # Walking the exact backend/guard process trees is intentionally less
+        # frequent than the visible Monitor refresh. Intermediate UI samples
+        # reuse the last complete result rather than manufacturing a new rate.
+        cpu_snapshot = self._rke_cpu_snapshot()
         with self.monitor_lock:
             if not self._monitor_current_locked(
                     monitor_session, monitor_generation):
@@ -2534,6 +2849,7 @@ class Plugin:
             if (previous is None or previous[0] != monitor_session or
                     previous[1] != monitor_generation):
                 self.last_rke_cpu_sample = current
+                self.last_rke_cpu_percent = None
                 return None
             elapsed = sampled_at - previous[3]
             shared = cpu_snapshot.keys() & previous[2].keys()
@@ -2544,15 +2860,23 @@ class Plugin:
                 # reads. Never install that transiently regressed aggregate as
                 # the next baseline or its rebound would become a false spike.
                 self.last_rke_cpu_sample = None
+                self.last_rke_cpu_percent = None
                 return None
             self.last_rke_cpu_sample = current
             if not shared:
+                self.last_rke_cpu_percent = None
                 return None
             cpu_delta = sum(deltas)
         # Match top-style process accounting: 100% is one fully occupied
         # logical core. Do not divide by the number of device CPUs because the
         # purpose of this row is to reveal expensive plugin work.
-        return cpu_delta * 100 / elapsed
+        result = cpu_delta * 100 / elapsed
+        with self.monitor_lock:
+            if self._monitor_current_locked(
+                    monitor_session, monitor_generation):
+                self.last_rke_cpu_percent = result
+                return result
+        return None
 
     def _reset_bypass_estimate_locked(self):
         self.battery_discharge_ema = None
@@ -2608,6 +2932,15 @@ class Plugin:
             return battery_seconds, battery_estimate_ready
 
     def _telemetry(self, monitor_session=None, monitor_generation=None):
+        lock = getattr(self, "telemetry_sample_lock", None)
+        if lock is None:
+            lock = self.telemetry_sample_lock = threading.Lock()
+        with lock:
+            return self._telemetry_sample(
+                monitor_session, monitor_generation)
+
+    def _telemetry_sample(
+            self, monitor_session=None, monitor_generation=None):
         monitor_request = (
             monitor_session is not None or monitor_generation is not None)
         if monitor_request:
@@ -2623,8 +2956,9 @@ class Plugin:
             monitor_generation = 0
             monitor_revision = 0
             bypass_charging = False
-        cpu = _cpu_capabilities()
-        governors = [_read(CPU_ROOT / f"policy{item['id']}" / "scaling_governor") for item in cpu]
+        topology = self._telemetry_topology()
+        cpu = self._cpu_telemetry(topology)
+        governors = [item["governor"] for item in cpu]
         counters = []
         try:
             counters = [int(value) for value in Path("/proc/stat").read_text().splitlines()[0].split()[1:]]
@@ -2658,32 +2992,16 @@ class Plugin:
                 if elapsed > 0 and busy >= 0:
                     gpu_percent = min(100.0, busy * 100 / elapsed)
             self.last_gpu_sample = (gpu_engine_ns, now_ns)
-        cpu_package_temps, cpu_core_temps, gpu_temps = [], [], []
-        primary_gpu_temps = []
-        # /sys/devices/virtual/thermal and /sys/class/thermal expose the same
-        # zones. Scan the class path once so each sensor has equal weight.
-        for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
-            kind = _read(zone / "type").lower().replace("_", "-")
-            value = _read_int(zone / "temp")
-            if not 0 < value < 150000:
-                continue
-            if kind.startswith("cpuss"):
-                cpu_package_temps.append(value)
-            elif kind.startswith("cpu"):
-                cpu_core_temps.append(value)
-            elif kind.startswith(("gpu", "gpuss")):
-                gpu_temps.append(value)
-                if kind.startswith("gpuss0-") or kind in ("gpuss0", "gpu-thermal"):
-                    primary_gpu_temps.append(value)
+        (cpu_package_temps, cpu_core_temps, gpu_temps,
+         primary_gpu_temps) = self._temperature_telemetry(topology)
         mem_total = mem_available = 0
         for line in _read("/proc/meminfo").splitlines():
             if line.startswith("MemTotal:"):
                 mem_total = int(line.split()[1])
             elif line.startswith("MemAvailable:"):
                 mem_available = int(line.split()[1])
-        gpu, gpu_path = _gpu_capability(), _gpu_path()
-        pwm_path = _fan_pwm_path()
-        fan_pwm = _read_int(pwm_path) if pwm_path else 0
+        gpu = self._gpu_telemetry(topology)
+        fan_status = self._fan_status_from_topology(topology)
         battery = Path("/sys/class/power_supply/battery")
         battery_status = _read(battery / "status")
         battery_power_available, battery_flow_watts, current_ua = (
@@ -2699,14 +3017,7 @@ class Plugin:
             load = [float(value) for value in _read("/proc/loadavg").split()[:3]]
         except ValueError:
             load = []
-        throttled_cpu = throttled_gpu = False
-        for cooling in Path("/sys/class/thermal").glob("cooling_device*"):
-            kind = _read(cooling / "type").lower()
-            active = _read_int(cooling / "cur_state") > 0
-            if active and kind.startswith("cpufreq-"):
-                throttled_cpu = True
-            elif active and (kind.startswith("devfreq-") or "gpu" in kind):
-                throttled_gpu = True
+        throttled_cpu, throttled_gpu = self._cooling_telemetry(topology)
         thermal_limit = ("CPU + GPU" if throttled_cpu and throttled_gpu else
                          "CPU" if throttled_cpu else "GPU" if throttled_gpu else "Clear")
         if monitor_request:
@@ -2748,10 +3059,10 @@ class Plugin:
             "cpu_clocks": [{"id": item["id"], "cpus": item["cpus"], "frequency": item["current"],
                             "minimum": item["minimum"], "maximum": item["effective_maximum"]} for item in cpu],
             "cpu_governor": governors[0] if len(set(governors)) == 1 else "Mixed",
-            "gpu_frequency": gpu["current"], "gpu_frequency_max": max(gpu["frequencies"], default=0),
-            "gpu_governor": _read(gpu_path / "governor") if gpu_path else "",
-            "fan_pwm": fan_pwm, "fan_percent": round(fan_pwm * 100 / 255),
-            "cooling_profile": _get_setting("cooling.profile", ""),
+            "gpu_frequency": gpu["current"],
+            "gpu_frequency_max": gpu["frequency_maximum"],
+            "gpu_governor": gpu["governor"],
+            **fan_status,
             "scheduler": "lavd" if _read("/sys/kernel/sched_ext/state") == "enabled" else "kernel",
             "memory_percent": round((mem_total - mem_available) * 100 / mem_total, 1) if mem_total else 0,
             "memory_used_mb": round((mem_total - mem_available) / 1024) if mem_total else 0,
@@ -2778,6 +3089,8 @@ class Plugin:
             self.monitor_session = monitor_session
             self.monitor_generation = monitor_generation
             self.last_rke_cpu_sample = None
+            self.last_rke_cpu_percent = None
+            self._invalidate_telemetry_topology_locked()
             self._invalidate_current_monitor_locked(force=True)
             # The new activation has not observed a charging status yet. Its
             # first invalid result must invalidate any telemetry that raced it,
@@ -2793,12 +3106,14 @@ class Plugin:
                 self._invalidate_current_monitor_locked(force=True)
                 self.monitor_session = ""
                 self.last_rke_cpu_sample = None
+                self.last_rke_cpu_percent = None
             elif monitor_generation > self.monitor_generation:
                 # Tombstone an end which overtakes its begin RPC, so that the
                 # delayed activation cannot resurrect a hidden Monitor tab.
                 self.monitor_generation = monitor_generation
                 self.monitor_session = ""
                 self.last_rke_cpu_sample = None
+                self.last_rke_cpu_percent = None
                 self._invalidate_current_monitor_locked(force=True)
             return self._monitor_epoch_locked()
 
@@ -2816,6 +3131,9 @@ class Plugin:
     async def get_telemetry(self, monitor_session=None, monitor_generation=None):
         return await asyncio.to_thread(
             self._telemetry, monitor_session, monitor_generation)
+
+    async def get_fan_status(self):
+        return await asyncio.to_thread(self._fan_status)
 
     async def get_charging_status(
             self, monitor_session=None, monitor_generation=None):
@@ -3117,28 +3435,53 @@ class Plugin:
         else:
             log_dir = self.settings_dir.parent.parent / "logs" / "RK-Enhanced"
         try:
-            logs = sorted(
-                log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime)
+            log_records = sorted(
+                ((path, path.stat()) for path in log_dir.glob("*.log")),
+                key=lambda item: item[1].st_mtime)
         except OSError:
-            logs = []
-        if not logs:
+            log_records = []
+        cache = getattr(self, "log_file_cache", None)
+        if cache is None:
+            cache = self.log_file_cache = {}
+        present_paths = {str(path) for path, _status in log_records}
+        for cached_path in tuple(cache):
+            if cached_path not in present_paths:
+                cache.pop(cached_path, None)
+        if not log_records:
             return "No RK-Enhanced log file found."
         entries = []
         errors = []
         timestamp_pattern = re.compile(
             r"^\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})"
             r"(?:,\d+)?\]?")
-        for log_path in logs:
+        for log_path, status in log_records:
+            cache_key = str(log_path)
+            signature = (
+                status.st_dev, status.st_ino, status.st_size,
+                status.st_mtime_ns, status.st_ctime_ns)
+            requested_offset = self.log_offsets.get(cache_key, 0)
+            cached = cache.get(cache_key)
+            if (cached is not None and cached[0] == signature and
+                    cached[1] == requested_offset):
+                entries.extend(cached[2])
+                continue
             try:
                 lines = log_path.read_text(errors="replace").splitlines()
-                modified = log_path.stat().st_mtime
+                final_status = log_path.stat()
             except OSError as reason:
                 errors.append(f"Could not read {log_path.name}: {reason}")
+                cache.pop(cache_key, None)
                 continue
-            offset = self.log_offsets.get(str(log_path), 0)
+            final_signature = (
+                final_status.st_dev, final_status.st_ino,
+                final_status.st_size, final_status.st_mtime_ns,
+                final_status.st_ctime_ns)
+            modified = final_status.st_mtime
+            offset = requested_offset
             if offset > len(lines):
                 offset = 0
             visible = lines[offset:]
+            file_entries = []
             for index, line in enumerate(visible):
                 match = timestamp_pattern.match(line)
                 timestamp = modified + index / max(1, len(visible))
@@ -3154,9 +3497,17 @@ class Plugin:
                         display = (
                             "[" + match.group(1).replace("T", " ") + "]" +
                             line[match.end():])
-                entries.append((timestamp, str(log_path), index, display))
+                file_entries.append((timestamp, cache_key, index, display))
+            file_entries.sort(key=lambda item: item[:3])
+            file_entries = file_entries[-LOG_ENTRY_LIMIT:]
+            entries.extend(file_entries)
+            if signature == final_signature:
+                cache[cache_key] = (
+                    final_signature, requested_offset, tuple(file_entries))
+            else:
+                cache.pop(cache_key, None)
         entries.sort(key=lambda item: item[:3])
-        merged = [entry[3] for entry in entries[-400:]]
+        merged = [entry[3] for entry in entries[-LOG_ENTRY_LIMIT:]]
         if errors:
             merged.extend(errors)
         return "\n".join(merged) if merged else "Log is empty."
@@ -3175,6 +3526,7 @@ class Plugin:
             for path in logs:
                 try:
                     self.log_offsets[str(path)] = len(path.read_text(errors="replace").splitlines())
+                    getattr(self, "log_file_cache", {}).pop(str(path), None)
                 except OSError:
                     pass
             return True

@@ -6,15 +6,16 @@ import {
 import { useQuickAccessVisible as useLoaderQuickAccessVisible } from "@decky/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode, Ref } from "react";
-import { acknowledgeInstallStatus, activateGame, assignGame, cleanOldBackups, deletePreset, getBackupCleanupInfo, getDeviceNetworkInfo, getInstallStatus, getPluginConflict, getState, getTelemetry, getUpdateInfo, installRelease, lockExperimental, removePluginConflict, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
+import { acknowledgeInstallStatus, assignGame, cleanOldBackups, deletePreset, getBackupCleanupInfo, getDeviceNetworkInfo, getFanStatus, getInstallStatus, getPluginConflict, getState, getUpdateInfo, installRelease, lockExperimental, removePluginConflict, renamePreset, restoreSteamDefault, savePreset, saveSystemFanCurve, setSteamDefault, unassignGame, unlockExperimental } from "./backend";
 import { Experimental } from "./Experimental";
+import { canAcceptBackendState, canAcceptGameState, isCurrentGeneration, safeAcceptedRefreshMode, sameFanStatus, sameGame, shouldPollInstallProgress, shouldRefreshGameState, startCompletionPoll, stateRefreshMode } from "./frontendLightweight";
 import { currentGame } from "./game";
 import { chooseInstallProgress, isNewInstallTransaction } from "./installProgressModel";
 import { Monitor } from "./Monitor";
 import { RGB } from "./RGB";
 import { Logs } from "./Logs";
 import { styles } from "./styles";
-import type { BackupCleanupInfo, DeviceNetworkInfo, GameRef, HardwareProfile, InstallProgress, PluginConflictStatus, State, Telemetry, UpdateInfo } from "./types";
+import type { BackupCleanupInfo, DeviceNetworkInfo, FanStatus, GameRef, HardwareProfile, InstallProgress, PluginConflictStatus, State, UpdateInfo } from "./types";
 
 const DEFAULT = "RK-E Default";
 const useQuickAccessVisibleCompat =
@@ -26,6 +27,10 @@ const cpuMhz = (khz: number) => `${Math.round(khz / 1000)} MHz`;
 const gpuMhz = (hz: number) => `${Math.round(hz / 1_000_000)} MHz`;
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
 const emptyConflict: PluginConflictStatus = { blocked: false, conflicts: [], message: "" };
+// Cover the backend watcher's bounded 10-second stable-cgroup rescan without
+// turning state reconciliation into a permanent hidden poll.
+const STATE_SYNC_ATTEMPTS = 6;
+const STATE_SYNC_DELAY = 2200;
 const formatBytes = (bytes: number) => {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
@@ -165,13 +170,14 @@ export function Content() {
   const [state, setState] = useState<State | null>(null);
   const [selected, setSelected] = useState(DEFAULT);
   const [draft, setDraft] = useState<HardwareProfile | null>(null);
-  const [game, setGame] = useState<GameRef | null>(currentGame());
+  const [game, setGame] = useState<GameRef | null>(() => currentGame());
+  const observedGameRef = useRef<GameRef | null>(game);
   const [message, setMessage] = useState("Loading RK-Enhanced…");
   const [busy, setBusy] = useState(false);
   const [newName, setNewName] = useState("");
   const [renameName, setRenameName] = useState("");
   const [presetForm, setPresetForm] = useState<"new" | "rename" | null>(null);
-  const [live, setLive] = useState<Telemetry | null>(null);
+  const [fanStatus, setFanStatus] = useState<FanStatus | null>(null);
   const [systemCurve, setSystemCurve] = useState<HardwareProfile["fan_curve"]>([]);
   const [utility, setUtility] = useState<"Fan" | null>(null);
   const [deviceNetwork, setDeviceNetwork] = useState<DeviceNetworkInfo | null>(null);
@@ -191,7 +197,13 @@ export function Content() {
   const fanTopRef = useRef<HTMLDivElement>(null);
   const installProgressRef = useRef<InstallProgress | null>(null);
   const installRefreshRef = useRef<Promise<InstallProgress> | null>(null);
+  const stateRequestRef = useRef<Promise<State> | null>(null);
+  const stateHydratedRef = useRef(false);
+  const stateSyncGenerationRef = useRef(0);
+  const fanStatusGenerationRef = useRef(0);
+  const fanStatusRef = useRef<FanStatus | null>(null);
   const installState = useCallback((next: State, preferred?: string) => {
+    stateHydratedRef.current = true;
     setState(next);
     if (next.plugin_conflict) setPluginConflict(next.plugin_conflict);
     const wanted = preferred && next.presets[preferred] ? preferred
@@ -201,23 +213,55 @@ export function Content() {
     setSystemCurve(clone(next.system_fan_curve));
   }, [selected]);
 
-  const load = useCallback(async () => {
+  const requestState = useCallback(() => {
+    if (stateRequestRef.current) return stateRequestRef.current;
+    const request = getState();
+    stateRequestRef.current = request;
+    const clear = () => {
+      if (stateRequestRef.current === request) stateRequestRef.current = null;
+    };
+    void request.then(clear, clear);
+    return request;
+  }, []);
+  const acceptStateMetadata = useCallback((next: State) => {
+    setState(next);
+    if (next.plugin_conflict) setPluginConflict(next.plugin_conflict);
+    setMessage("");
+  }, []);
+  const acceptStateFull = useCallback((next: State) => {
+    stateHydratedRef.current = true;
+    acceptStateMetadata(next);
+    const wanted = next.presets[next.active_preset] ? next.active_preset : DEFAULT;
+    setSelected(wanted);
+    setDraft(clone(next.presets[wanted]));
+    setSystemCurve(clone(next.system_fan_curve));
+  }, [acceptStateMetadata]);
+  const loadState = useCallback(async (
+    expectedActiveAppid: string,
+    mode: "full" | "metadata",
+    requestIsCurrent: () => boolean,
+  ) => {
     try {
-      const next = await getState();
-      setState(next);
-      if (next.plugin_conflict) setPluginConflict(next.plugin_conflict);
-      const wanted = next.presets[next.active_preset] ? next.active_preset : DEFAULT;
-      setSelected(wanted);
-      setDraft(clone(next.presets[wanted]));
-      setSystemCurve(clone(next.system_fan_curve));
-      setGame(currentGame());
-      setMessage("");
+      const next = await requestState();
+      const running = currentGame();
+      const appidMatched = canAcceptGameState(
+        running, expectedActiveAppid, next.active_appid
+      );
+      if (!requestIsCurrent() || !canAcceptBackendState(
+        running, expectedActiveAppid, next.active_appid,
+        Boolean(next.plugin_conflict?.blocked), Boolean(next.mutations_blocked),
+      )) return false;
+      const acceptedMode = safeAcceptedRefreshMode(
+        mode, stateHydratedRef.current, appidMatched
+      );
+      if (acceptedMode === "full") acceptStateFull(next);
+      else acceptStateMetadata(next);
       return true;
     } catch (error) {
-      setMessage(String(error));
+      if (requestIsCurrent()) setMessage(String(error));
       return false;
     }
-  }, [selected]);
+  }, [acceptStateFull, acceptStateMetadata, requestState]);
 
   const refreshInstallProgress = useCallback(() => {
     if (installRefreshRef.current) return installRefreshRef.current;
@@ -265,44 +309,115 @@ export function Content() {
 
   useEffect(() => {
     let cancelled = false;
-    const boot = async () => {
+    let retryTimer: number | null = null;
+    const generation = ++stateSyncGenerationRef.current;
+    const isCurrent = () => isCurrentGeneration(
+      generation, stateSyncGenerationRef.current, cancelled
+    );
+    const hydrate = async (attempt: number) => {
+      if (!isCurrent()) return;
       const running = currentGame();
-      let progress: InstallProgress | null = null;
-      let conflict = emptyConflict;
-      try { progress = await refreshInstallProgress(); } catch (_) {}
-      try { conflict = await refreshConflict(); } catch (_) {}
-      if (!progress?.active && !conflict.blocked) {
-        try { await activateGame(running?.appid || ""); } catch (_) {}
-      }
-      for (let attempt = 0; attempt < 45 && !cancelled; attempt += 1) {
-        if (await load()) return;
-        if (attempt < 44)
-          await new Promise(resolve => window.setTimeout(resolve, 1000));
-      }
+      const expectedAppid = running?.appid ?? "";
+      observedGameRef.current = running;
+      setGame(previous => sameGame(previous, running) ? previous : running);
+      if (await loadState(expectedAppid, "full", isCurrent)) return;
+      if (!isCurrent() || attempt + 1 >= STATE_SYNC_ATTEMPTS) return;
+      retryTimer = window.setTimeout(() => { void hydrate(attempt + 1); }, STATE_SYNC_DELAY);
+    };
+    const boot = async () => {
+      try { await refreshInstallProgress(); } catch (_) {}
+      try { await refreshConflict(); } catch (_) {}
+      void hydrate(0);
     };
     void boot();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (stateSyncGenerationRef.current === generation)
+        stateSyncGenerationRef.current += 1;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
   }, []);
   useEffect(() => {
-    let appid = game?.appid || "";
-    const timer = window.setInterval(() => {
-      const running = currentGame();
-      const next = running?.appid || "";
-      if (next === appid) return;
-      appid = next;
-      setGame(running);
-      if (mutationBlocked) return;
-      void activateGame(next).then(() => load()).catch(error => setMessage(String(error)));
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [game?.appid, load, mutationBlocked]);
-  useEffect(() => {
-    if (!panelVisible || tab !== "Fan" || progressBlocksUi) return;
+    if (!panelVisible) return;
     let cancelled = false;
-    const refresh = () => getTelemetry().then(value => { if (!cancelled) setLive(value); }).catch(() => {});
-    void refresh();
-    const timer = window.setInterval(refresh, 2000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    let generation = 0;
+    let retryTimer: number | null = null;
+    const reconcile = (running: GameRef | null, mode: "full" | "metadata") => {
+      generation = ++stateSyncGenerationRef.current;
+      const token = generation;
+      const expectedAppid = running?.appid ?? "";
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      const isCurrent = () => isCurrentGeneration(
+        token, stateSyncGenerationRef.current, cancelled
+      );
+      const attempt = async (attemptNumber: number) => {
+        if (!isCurrent()) return;
+        if (await loadState(expectedAppid, mode, isCurrent)) return;
+        if (!isCurrent() || attemptNumber + 1 >= STATE_SYNC_ATTEMPTS) return;
+        retryTimer = window.setTimeout(
+          () => { void attempt(attemptNumber + 1); }, STATE_SYNC_DELAY
+        );
+      };
+      void attempt(0);
+    };
+    const observe = (activation = false) => {
+      const running = currentGame();
+      const observed = observedGameRef.current;
+      const transition = shouldRefreshGameState(observed, running);
+      if (!sameGame(observed, running)) {
+        observedGameRef.current = running;
+        setGame(running);
+      }
+      if (activation || transition)
+        reconcile(running, stateRefreshMode(stateHydratedRef.current, observed, running));
+    };
+    observe(true);
+    const timer = window.setInterval(() => observe(false), 2000);
+    return () => {
+      cancelled = true;
+      stateSyncGenerationRef.current += 1;
+      window.clearInterval(timer);
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [loadState, panelVisible]);
+  useEffect(() => {
+    if (!panelVisible || tab !== "Fan" || progressBlocksUi) {
+      fanStatusRef.current = null;
+      setFanStatus(null);
+      return;
+    }
+    let cancelled = false;
+    const generation = ++fanStatusGenerationRef.current;
+    const isCurrent = () => isCurrentGeneration(
+      generation, fanStatusGenerationRef.current, cancelled
+    );
+    fanStatusRef.current = null;
+    setFanStatus(null);
+    const stop = startCompletionPoll(async () => {
+      try {
+        const value = await getFanStatus();
+        if (isCurrent() && !sameFanStatus(fanStatusRef.current, value)) {
+          fanStatusRef.current = value;
+          setFanStatus(value);
+        }
+      } catch (_) {
+        if (isCurrent()) {
+          fanStatusRef.current = null;
+          setFanStatus(null);
+        }
+      }
+    }, 2000);
+    return () => {
+      cancelled = true;
+      if (fanStatusGenerationRef.current === generation)
+        fanStatusGenerationRef.current += 1;
+      stop();
+      fanStatusRef.current = null;
+      setFanStatus(null);
+    };
   }, [panelVisible, progressBlocksUi, tab]);
   useEffect(() => {
     if (tab === "Experimental" && state && !state.experimental_unlocked)
@@ -326,9 +441,10 @@ export function Content() {
     let cancelled = false;
     const refresh = () => refreshInstallProgress().catch(() => null);
     void refresh();
-    const timer = window.setInterval(() => {
-      if (!cancelled && (installLaunching || installProgress?.active)) void refresh();
-    }, 1000);
+    if (!shouldPollInstallProgress(
+      panelVisible, installLaunching, Boolean(installProgress?.active)
+    )) return () => { cancelled = true; };
+    const timer = window.setInterval(() => { if (!cancelled) void refresh(); }, 1000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [installLaunching, installProgress?.active, panelVisible, refreshInstallProgress]);
   useEffect(() => {
@@ -401,7 +517,14 @@ export function Content() {
       if (!await acknowledgeInstallStatus(transactionId))
         throw new Error("Backend did not acknowledge this installer result.");
       setDismissedTransaction(transactionId);
-      await load();
+      const running = currentGame();
+      const expectedAppid = running?.appid ?? "";
+      observedGameRef.current = running;
+      setGame(running);
+      const generation = ++stateSyncGenerationRef.current;
+      if (!await loadState(expectedAppid, "full", () =>
+        generation === stateSyncGenerationRef.current))
+        throw new Error("Backend preset state is still changing; try Continue again.");
       await refreshConflict();
     }} />;
   if (!state || !draft) return <PanelSection title="RK-Enhanced"><Field label={message} /></PanelSection>;
@@ -411,8 +534,9 @@ export function Content() {
   const assigned = game ? state.game_profiles[game.appid] : undefined;
   const dirty = JSON.stringify(draft) !== JSON.stringify(state.presets[selected]);
   const valid = cpuPolicies.length > 0;
-  const effectiveCooling = live?.cooling_profile || state.effective_cooling_profile;
-  const fanCanApply = effectiveCooling === "custom";
+  const effectiveCooling = fanStatus?.cooling_profile || "";
+  const fanCanApply = fanStatus?.cooling_profile === "custom";
+  const fanCurveActuallyActive = fanCanApply && state.fan_curve_active;
   const boostPolicies = cpuPolicies.filter(policy =>
     policy.boost_enabled && policy.boost_frequencies.length > 0);
   const selectedBoostLimits = boostPolicies
@@ -430,8 +554,10 @@ export function Content() {
     <PanelSectionRow><ButtonItem layout="below" disabled={busy || mutationBlocked || !valid || (fanOnly && !fanCanApply)}
       bottomSeparator={noSeparators ? "none" : undefined}
       onClick={() => void saveAndApply()}>Save &amp; Apply</ButtonItem></PanelSectionRow>
-    <PanelSectionRow><Field label={fanOnly && !fanCanApply
-      ? "Unavailable until ROCKNIX cooling is set to Custom."
+    <PanelSectionRow><Field label={fanOnly && !fanStatus
+      ? "Checking current ROCKNIX cooling profile…"
+      : fanOnly && !fanCanApply
+        ? "Unavailable until ROCKNIX cooling is set to Custom."
       : `Saves and applies changes to ${selected}.`}
       bottomSeparator={noSeparators ? "none" : undefined} /></PanelSectionRow>
   </div>;
@@ -734,8 +860,12 @@ export function Content() {
       {state.capabilities.fan_available && <>
         <div className={!fanCanApply ? "rke-fan-warning" : ""}><PanelSectionRow><Field
           bottomSeparator="none"
-          label={state.fan_curve_active ? "Preset fan curve active" : fanCanApply ? "Preset fan curve ready" : "Preset fan curve inactive"}
-          description={state.fan_curve_active
+          label={!fanStatus ? "Checking cooling profile"
+            : fanCurveActuallyActive ? "Preset fan curve active"
+              : fanCanApply ? "Preset fan curve ready" : "Preset fan curve inactive"}
+          description={!fanStatus
+            ? "Reading the current ROCKNIX cooling profile. Save & Apply remains unavailable until this completes."
+            : fanCurveActuallyActive
             ? "ROCKNIX native fancontrol is running this preset curve."
             : fanCanApply
               ? "ROCKNIX Custom is active. Press Save & Apply to install this preset curve."
@@ -758,7 +888,7 @@ export function Content() {
       </>}
       <PanelSectionRow><Field label="Live fan PWM" bottomSeparator="none">
         <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
-          {live ? `${live.fan_pwm} PWM · ${live.fan_percent}%` : "Reading…"}
+          {fanStatus ? `${fanStatus.fan_pwm} PWM · ${fanStatus.fan_percent}%` : "Reading…"}
         </span>
       </Field></PanelSectionRow>
     </PanelSection>

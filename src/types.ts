@@ -221,6 +221,12 @@ export interface Telemetry {
   thermal_limit: string;
 }
 
+export interface FanStatus {
+  fan_pwm: number;
+  fan_percent: number;
+  cooling_profile: string;
+}
+
 export interface ChargingCommandResult {
   command: string[];
   started: boolean;

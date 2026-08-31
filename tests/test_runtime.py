@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import importlib.util
 import json
 import re
 import shutil
@@ -17,6 +18,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RuntimeRestoreTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "rke_runtime_restore", ROOT / "runtime-restore.py")
+        cls.restore_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.restore_module)
+
     def run_restore(self, root, control=None, gpu=None, legacy_charging=None,
                     fan_applied=False, boot_id=None):
         marker = root / "runtime-session.active"
@@ -120,6 +128,27 @@ class RuntimeRestoreTests(unittest.TestCase):
                 (root / "fancontrol.conf").read_text(),
                 "SPEEDS=(255 0)\nTEMPS=(85000 0)\n")
 
+    def test_fan_restore_reloads_custom_profile_without_get_setting_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / "canonical-fancontrol.conf"
+            target = root / "fancontrol.conf"
+            config = root / "system.cfg"
+            canonical.write_text("SPEEDS=(255 0)\nTEMPS=(85000 0)\n")
+            target.write_text("SPEEDS=(51 0)\nTEMPS=(55000 0)\n")
+            config.write_text("audio.volume=80\ncooling.profile=custom\n")
+
+            with mock.patch.object(
+                    self.restore_module, "SYSTEM_CONFIG", config), \
+                    mock.patch.object(
+                        self.restore_module.shutil, "which", return_value=None), \
+                    mock.patch.object(
+                        self.restore_module, "reload_fancontrol") as reload_fan:
+                self.restore_module.restore_fan_curve(canonical, target)
+
+            self.assertEqual(target.read_text(), canonical.read_text())
+            reload_fan.assert_called_once_with()
+
     def test_skips_runtime_sysfs_values_from_an_older_boot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -176,7 +205,7 @@ class GameWatchRuntimeSessionTests(unittest.IsolatedAsyncioTestCase):
         plugin._plugin_conflict_state = mock.Mock(return_value={
             "blocked": False,
         })
-        plugin._steam_scope_active = mock.Mock(return_value=True)
+        plugin._steam_scope_pids = mock.Mock(return_value=(100, 101))
         plugin._detect_steam_app = mock.Mock(return_value=appid)
         return plugin, profile
 
@@ -216,6 +245,83 @@ class GameWatchRuntimeSessionTests(unittest.IsolatedAsyncioTestCase):
             "applied": False, "preset": self.main.DEFAULT_PRESET,
         })
         plugin._apply.assert_not_called()
+
+    async def test_new_appid_is_published_only_after_successful_apply(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, _ = self.plugin(Path(temporary), appid="123")
+            plugin.active_preset = "Old"
+            plugin.gpu_fdinfo_paths = [Path("/proc/fake/fdinfo/4")]
+            plugin.gpu_fdinfo_refresh = 42.0
+            plugin.last_gpu_sample = (10, 20)
+            old_profile = {"profile": "old"}
+            new_profile = {"profile": "new"}
+            plugin._load.return_value = {
+                "presets": {"Old": old_profile, "New": new_profile},
+                "steam_default": "Old",
+                "game_profiles": {"456": "New"},
+            }
+            observed_during_apply = []
+
+            def apply(_profile):
+                observed_during_apply.append(
+                    (plugin.active_appid, plugin.active_preset,
+                     list(plugin.gpu_fdinfo_paths)))
+                return True
+
+            plugin._apply.side_effect = apply
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            with mock.patch.object(
+                    self.main, "_get_setting", return_value="quiet"), \
+                    mock.patch.object(
+                        self.main.asyncio, "to_thread", new=inline_to_thread):
+                result = await plugin.activate_game("456")
+
+        self.assertEqual(observed_during_apply, [
+            ("123", "Old", [Path("/proc/fake/fdinfo/4")]),
+        ])
+        self.assertEqual(result, {"applied": True, "preset": "New"})
+        self.assertEqual(plugin.active_appid, "456")
+        self.assertEqual(plugin.active_preset, "New")
+        self.assertEqual(plugin.gpu_fdinfo_paths, [])
+        self.assertEqual(plugin.gpu_fdinfo_refresh, 0.0)
+        self.assertIsNone(plugin.last_gpu_sample)
+
+    async def test_failed_apply_does_not_publish_new_appid_or_reset_gpu_sample(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, _ = self.plugin(Path(temporary), appid="123")
+            plugin.active_preset = "Old"
+            plugin.gpu_fdinfo_paths = [Path("/proc/fake/fdinfo/4")]
+            plugin.gpu_fdinfo_refresh = 42.0
+            plugin.last_gpu_sample = (10, 20)
+            plugin._load.return_value = {
+                "presets": {
+                    "Old": {"profile": "old"},
+                    "New": {"profile": "new"},
+                },
+                "steam_default": "Old",
+                "game_profiles": {"456": "New"},
+            }
+            plugin._apply.side_effect = RuntimeError("apply failed")
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            with mock.patch.object(
+                    self.main, "_get_setting", return_value="quiet"), \
+                    mock.patch.object(
+                        self.main.asyncio, "to_thread", new=inline_to_thread):
+                with self.assertRaisesRegex(RuntimeError, "apply failed"):
+                    await plugin.activate_game("456")
+
+        self.assertEqual(plugin.active_appid, "123")
+        self.assertEqual(plugin.active_preset, "Old")
+        self.assertEqual(
+            plugin.gpu_fdinfo_paths, [Path("/proc/fake/fdinfo/4")])
+        self.assertEqual(plugin.gpu_fdinfo_refresh, 42.0)
+        self.assertEqual(plugin.last_gpu_sample, (10, 20))
 
     async def test_watcher_reapplies_same_appid_after_marker_disappears(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -265,6 +371,75 @@ class GameWatchRuntimeSessionTests(unittest.IsolatedAsyncioTestCase):
                     await plugin._game_watch_loop()
 
         plugin._apply.assert_called_once_with(profile)
+        self.assertEqual(plugin.active_appid, "")
+        self.assertEqual(plugin.active_preset, self.main.DEFAULT_PRESET)
+
+    async def test_watcher_reuses_detection_while_scope_pids_are_stable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, _ = self.plugin(Path(temporary))
+            plugin.runtime_marker.write_text("active\n")
+            sleep_calls = 0
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            async def stop_after_second_tick(_seconds):
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls >= 2:
+                    raise asyncio.CancelledError
+
+            with mock.patch.object(
+                    self.main, "_get_setting", return_value="quiet"), \
+                    mock.patch.object(
+                        self.main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        self.main.asyncio, "sleep", new=stop_after_second_tick):
+                with self.assertRaises(asyncio.CancelledError):
+                    await plugin._game_watch_loop()
+
+        self.assertEqual(plugin._steam_scope_pids.call_count, 2)
+        plugin._detect_steam_app.assert_called_once_with((100, 101))
+
+    def test_steam_scope_pids_unions_all_available_cgroup_hierarchies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            systemd = root / "systemd.procs"
+            unified = root / "unified.procs"
+            pids = root / "pids.procs"
+            systemd.write_text("")
+            unified.write_text("202\ninvalid\n")
+            pids.write_text("101\n202\n")
+            plugin = self.main.Plugin.__new__(self.main.Plugin)
+
+            with mock.patch.object(
+                    self.main, "STEAM_SCOPE_CGROUPS",
+                    (systemd, unified, pids)):
+                result = plugin._steam_scope_pids()
+
+        self.assertEqual(result, (101, 202))
+
+    async def test_steam_closed_idle_tick_skips_install_and_manifest_scans(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, _ = self.plugin(Path(temporary))
+            plugin._steam_scope_pids.return_value = ()
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            async def stop_after_idle_tick(_seconds):
+                raise asyncio.CancelledError
+
+            with mock.patch.object(
+                    self.main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        self.main.asyncio, "sleep", new=stop_after_idle_tick):
+                with self.assertRaises(asyncio.CancelledError):
+                    await plugin._game_watch_loop()
+
+        plugin._install_status.assert_not_called()
+        plugin._plugin_conflict_state.assert_not_called()
+        plugin._detect_steam_app.assert_not_called()
         self.assertEqual(plugin.active_appid, "")
         self.assertEqual(plugin.active_preset, self.main.DEFAULT_PRESET)
 
@@ -324,6 +499,8 @@ class RkeCpuTelemetryTests(unittest.TestCase):
         plugin.battery_discharge_samples = 0
         plugin.battery_discharge_last_sample = 0.0
         plugin.last_rke_cpu_sample = None
+        plugin.last_rke_cpu_percent = None
+        plugin.rke_cpu_sample_interval = 0
         plugin.lifecycle_guard_unit = ""
         plugin.lifecycle_guard_identity = None
         plugin.runtime_guard_unit = ""
@@ -376,6 +553,26 @@ class RkeCpuTelemetryTests(unittest.TestCase):
                 plugin._sample_rke_cpu_percent("monitor-a", 1))
             self.assertAlmostEqual(
                 plugin._sample_rke_cpu_percent("monitor-a", 1), 25.0)
+
+    def test_process_tree_snapshot_is_sampled_at_two_second_cadence(self):
+        plugin = self.plugin()
+        plugin.rke_cpu_sample_interval = 2.0
+        with mock.patch.object(
+                plugin, "_rke_cpu_snapshot", side_effect=[
+                    {(999, 9999): 1.0}, {(999, 9999): 1.2},
+                ]) as snapshot, mock.patch.object(
+                    self.main.time, "monotonic",
+                    side_effect=[10.0, 11.0, 12.0, 13.0]):
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertIsNone(
+                plugin._sample_rke_cpu_percent("monitor-a", 1))
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 10.0)
+            self.assertAlmostEqual(
+                plugin._sample_rke_cpu_percent("monitor-a", 1), 10.0)
+
+        self.assertEqual(snapshot.call_count, 2)
 
     def test_usage_combines_exact_lifecycle_and_runtime_guards(self):
         plugin = self.plugin()
@@ -644,6 +841,7 @@ class RkeCpuTelemetryTests(unittest.TestCase):
         self.assertEqual(plugin.monitor_session, "monitor-new")
         self.assertEqual(plugin.monitor_generation, 2)
         self.assertIsNone(plugin.last_rke_cpu_sample)
+        self.assertIsNone(plugin.last_rke_cpu_percent)
 
         plugin.last_rke_cpu_sample = (
             "monitor-new", 2, {(999, 9999): 6.0}, 41.0)
@@ -651,6 +849,7 @@ class RkeCpuTelemetryTests(unittest.TestCase):
 
         self.assertEqual(plugin.monitor_session, "")
         self.assertIsNone(plugin.last_rke_cpu_sample)
+        self.assertIsNone(plugin.last_rke_cpu_percent)
 
 
 class BatteryPowerTelemetryTests(unittest.TestCase):
@@ -1982,32 +2181,45 @@ class FrontendLifecycleContractTests(unittest.TestCase):
 
         # The visible panel keeps its independent bounded hydration retry, but
         # install success no longer depends on this React tree mounting.
-        load = content.index("const load = useCallback(async () => {")
-        load_end = content.index("}, [selected]);", load)
+        request_state = content.index("const requestState = useCallback(() => {")
+        panel_get_state = content.index("const request = getState();", request_state)
+        metadata = content.index("const acceptStateMetadata", panel_get_state)
+        full = content.index("const acceptStateFull", metadata)
+        load = content.index("const loadState = useCallback(async (", full)
+        load_end = content.index(
+            "}, [acceptStateFull, acceptStateMetadata, requestState]);", load)
         load_source = content[load:load_end]
-        panel_get_state = content.index("const next = await getState();", load)
-        set_state = content.index("setState(next);", panel_get_state)
-        set_draft = content.index("setDraft(clone(next.presets[wanted]));", set_state)
-        self.assertLess(panel_get_state, set_state)
-        self.assertLess(set_state, set_draft)
+        metadata_source = content[metadata:full]
+        full_source = content[full:load]
+        self.assertIn("setState(next);", metadata_source)
+        self.assertNotIn("setDraft", metadata_source)
+        self.assertIn("setDraft(clone(next.presets[wanted]));", full_source)
+        self.assertIn("const next = await requestState();", load_source)
+        self.assertIn("canAcceptGameState(", load_source)
         self.assertIn("return true;", load_source)
         self.assertIn("return false;", load_source)
 
-        boot_effect = content.index("useEffect(() => {", load_end)
+        boot_effect = content.index(
+            "useEffect(() => {", content.index("const installActionBlocked"))
         boot_end = content.index("}, []);", boot_effect)
         boot_source = content[boot_effect:boot_end]
         self.assertIn("let cancelled = false;", boot_source)
         self.assertIn(
-            "for (let attempt = 0; attempt < 45 && !cancelled; attempt += 1)",
+            "const hydrate = async (attempt: number)",
             boot_source,
         )
-        self.assertIn("if (await load()) return;", boot_source)
-        self.assertIn("if (attempt < 44)", boot_source)
         self.assertIn(
-            "await new Promise(resolve => window.setTimeout(resolve, 1000));",
+            'if (await loadState(expectedAppid, "full", isCurrent)) return;',
             boot_source,
         )
-        self.assertIn("return () => { cancelled = true; };", boot_source)
+        self.assertIn(
+            "attempt + 1 >= STATE_SYNC_ATTEMPTS", boot_source)
+        self.assertIn(
+            "window.setTimeout(() => { void hydrate(attempt + 1); }, STATE_SYNC_DELAY)",
+            boot_source,
+        )
+        self.assertIn("cancelled = true;", boot_source)
+        self.assertIn("window.clearTimeout(retryTimer);", boot_source)
         self.assertIn(
             'import { frontendBundleId } from "./frontendIntegrity";',
             readiness,

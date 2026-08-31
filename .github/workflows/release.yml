@@ -21,6 +21,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm test:frontend-lightweight
       - run: pnpm test:install-progress-model
       - run: pnpm test:rgb-model
       - run: pnpm build

@@ -1,7 +1,8 @@
 import { ConfirmModal, Focusable } from "@decky/ui";
 import type { CSSProperties } from "react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getLog } from "./backend";
+import { formatLogContent, startCompletionPoll } from "./frontendLightweight";
 
 const logViewportStyle: CSSProperties = {
   boxSizing: "border-box",
@@ -35,27 +36,32 @@ const logTextStyle: CSSProperties = {
   userSelect: "text",
 };
 
-const compactTimestamp = (line: string) => line.replace(
-  /^\[\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2}):\d{2}(?:,\d+)?\]/,
-  "[$1]",
-);
-
 export function Logs({ closeModal }: { closeModal?: () => void }) {
   const [content, setContent] = useState("Loading log…");
   const [error, setError] = useState("");
+  const contentRef = useRef(content);
+  const errorRef = useRef(error);
   const refresh = useCallback(async () => {
     try {
-      const log = (await getLog()).trimEnd();
-      setContent(log ? log.split("\n").reverse().map(compactTimestamp).join("\n") : "");
-      setError("");
+      const next = formatLogContent(await getLog());
+      if (contentRef.current !== next) {
+        contentRef.current = next;
+        setContent(next);
+      }
+      if (errorRef.current) {
+        errorRef.current = "";
+        setError("");
+      }
     } catch (reason) {
-      setError(String(reason));
+      const next = String(reason);
+      if (errorRef.current !== next) {
+        errorRef.current = next;
+        setError(next);
+      }
     }
   }, []);
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(refresh, 2000);
-    return () => window.clearInterval(timer);
+    return startCompletionPoll(refresh, 2000);
   }, [refresh]);
 
   return <ConfirmModal

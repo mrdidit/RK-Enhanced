@@ -1,5 +1,5 @@
 import { call } from "@decky/api";
-import type { BackupCleanupInfo, BatteryLimit, ChargingStatus, ConflictRemovalResult, DeviceNetworkInfo, HardwareProfile, InstallProgress, MonitorEpoch, PluginConflictStatus, RgbCalibrationRequest, RgbRequest, RgbState, State, Telemetry, UpdateInfo } from "./types";
+import type { BackupCleanupInfo, BatteryLimit, ChargingStatus, ConflictRemovalResult, DeviceNetworkInfo, FanStatus, HardwareProfile, InstallProgress, MonitorEpoch, PluginConflictStatus, RgbCalibrationRequest, RgbRequest, RgbState, State, Telemetry, UpdateInfo } from "./types";
 
 export const getState = () => call<[], State>("get_state");
 export const consumeAutomaticRecoveryFocusRequest = () =>
@@ -18,6 +18,7 @@ export const invalidateMonitorChargingStatus = (session: string, generation: num
 export const getTelemetry = (monitorSession?: string, monitorGeneration?: number) => monitorSession === undefined
   ? call<[], Telemetry>("get_telemetry")
   : call<[string, number], Telemetry>("get_telemetry", monitorSession, monitorGeneration!);
+export const getFanStatus = () => call<[], FanStatus>("get_fan_status");
 export const getChargingStatus = (monitorSession?: string, monitorGeneration?: number) => monitorSession === undefined
   ? call<[], ChargingStatus>("get_charging_status")
   : call<[string, number], ChargingStatus>("get_charging_status", monitorSession, monitorGeneration!);
@@ -54,4 +55,3 @@ export const assignGame = (appid: string, preset: string) => call<[string, strin
 export const setSteamDefault = (preset: string) => call<[string], State>("set_steam_default", preset);
 export const saveSystemFanCurve = (curve: HardwareProfile["fan_curve"]) => call<[HardwareProfile["fan_curve"]], State>("save_system_fan_curve", curve);
 export const unassignGame = (appid: string) => call<[string], State>("unassign_game", appid);
-export const activateGame = (appid: string) => call<[string], { applied: boolean; preset: string }>("activate_game", appid);

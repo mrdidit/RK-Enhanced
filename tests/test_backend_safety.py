@@ -55,6 +55,7 @@ class BackendSafetyBase:
         plugin.install_status_transaction_id = ""
         plugin.plugin_conflict_fingerprint = ""
         plugin.log_offsets = {}
+        plugin.log_file_cache = {}
         plugin.latest_release_cache = (0.0, [])
         plugin.lock = None
         plugin.rgb_lock = None
@@ -494,6 +495,99 @@ class CombinedLogAndReleaseTests(BackendSafetyBase, unittest.IsolatedAsyncioTest
             self.assertTrue(lines[0].startswith("[2026-08-30 12:00:00]"))
             self.assertIn("backend ready", lines[1])
             self.assertTrue(lines[2].startswith("[2026-08-30 12:00:02]"))
+
+    async def test_log_cache_reuses_unchanged_files_and_detects_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin = self.make_plugin(root)
+            log_dir = root / "logs"
+            log_dir.mkdir()
+            backend = log_dir / "backend.log"
+            installer = log_dir / "installer.log"
+            backend.write_text("[2026-08-30 12:00:01] backend ready\n")
+            installer.write_text("[2026-08-30 12:00:00] install started\n")
+            original_read_text = Path.read_text
+            reads = []
+
+            def tracked_read_text(path, *arguments, **keywords):
+                if path.suffix == ".log":
+                    reads.append(str(path))
+                return original_read_text(path, *arguments, **keywords)
+
+            with mock.patch.object(Path, "read_text", new=tracked_read_text), \
+                    mock.patch.dict(
+                        os.environ, {"DECKY_PLUGIN_LOG_DIR": str(log_dir)}):
+                first = await plugin.get_log()
+                second = await plugin.get_log()
+                self.assertEqual(second, first)
+                self.assertEqual(len(reads), 2)
+
+                with installer.open("a") as stream:
+                    stream.write(
+                        "[2026-08-30 12:00:02] install finished\n")
+                appended = await plugin.get_log()
+                self.assertIn("install finished", appended)
+                self.assertEqual(len(reads), 3)
+
+                installer.write_text(
+                    "[2026-08-30 12:00:03] truncated installer\n")
+                truncated = await plugin.get_log()
+                self.assertNotIn("install started", truncated)
+                self.assertIn("truncated installer", truncated)
+                self.assertEqual(len(reads), 4)
+
+                backend.rename(log_dir / "backend.old")
+                backend.write_text(
+                    "[2026-08-30 12:00:04] replacement backend\n")
+                replaced = await plugin.get_log()
+                self.assertNotIn("backend ready", replaced)
+                self.assertIn("replacement backend", replaced)
+                self.assertEqual(len(reads), 5)
+
+    async def test_log_cache_is_bounded_without_changing_last_400_lines(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin = self.make_plugin(root)
+            log_dir = root / "logs"
+            log_dir.mkdir()
+            log_path = log_dir / "backend.log"
+            log_path.write_text("".join(
+                f"untimestamped line {index}\n" for index in range(450)))
+
+            with mock.patch.dict(
+                    os.environ, {"DECKY_PLUGIN_LOG_DIR": str(log_dir)}):
+                result = await plugin.get_log()
+
+            lines = result.splitlines()
+            self.assertEqual(len(lines), main.LOG_ENTRY_LIMIT)
+            self.assertEqual(lines[0], "untimestamped line 50")
+            self.assertEqual(lines[-1], "untimestamped line 449")
+            cached_entries = plugin.log_file_cache[str(log_path)][2]
+            self.assertEqual(len(cached_entries), main.LOG_ENTRY_LIMIT)
+
+    async def test_clear_log_invalidates_cache_and_only_shows_new_lines(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin = self.make_plugin(root)
+            log_dir = root / "logs"
+            log_dir.mkdir()
+            log_path = log_dir / "backend.log"
+            log_path.write_text(
+                "[2026-08-30 12:00:00] before clear\n")
+
+            with mock.patch.dict(
+                    os.environ, {"DECKY_PLUGIN_LOG_DIR": str(log_dir)}):
+                self.assertIn("before clear", await plugin.get_log())
+                self.assertTrue(plugin.log_file_cache)
+                await plugin.clear_log()
+                self.assertFalse(plugin.log_file_cache)
+                self.assertEqual(await plugin.get_log(), "Log is empty.")
+                with log_path.open("a") as stream:
+                    stream.write("[2026-08-30 12:00:01] after clear\n")
+                result = await plugin.get_log()
+
+            self.assertNotIn("before clear", result)
+            self.assertIn("after clear", result)
 
     async def test_previous_published_and_actual_last_installed_are_distinct(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -12,6 +12,9 @@ import time
 from pathlib import Path
 
 
+SYSTEM_CONFIG = Path("/storage/.config/system/configs/system.cfg")
+
+
 def read(path, default=""):
     try:
         return Path(path).read_text().strip()
@@ -35,6 +38,21 @@ def clean_environment():
         else:
             environment.pop(variable, None)
     return environment
+
+
+def get_setting(name, default=""):
+    """Read one ROCKNIX setting with the same fallback used by the backend."""
+    command = shutil.which("get_setting")
+    if command:
+        result = subprocess.run(
+            [command, name], check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, env=clean_environment())
+        return result.stdout.strip() or default
+    for line in read(SYSTEM_CONFIG).splitlines():
+        if line.startswith(name + "="):
+            return line.split("=", 1)[1]
+    return default
 
 
 def service_active(unit):
@@ -132,6 +150,14 @@ def reload_fancontrol():
     raise RuntimeError("native fancontrol did not restart within 5 seconds")
 
 
+def restore_fan_curve(canonical_fan, target_fan):
+    if not canonical_fan.is_file():
+        raise RuntimeError("protected ROCKNIX Custom curve is missing")
+    shutil.copy2(canonical_fan, target_fan)
+    if get_setting("cooling.profile", "") == "custom":
+        reload_fancontrol()
+
+
 def main():
     if len(sys.argv) != 5:
         raise SystemExit(
@@ -156,20 +182,8 @@ def main():
         fan = controls.get("fan", {})
         if fan.get("applied"):
             try:
-                if not canonical_fan.is_file():
-                    raise RuntimeError("protected ROCKNIX Custom curve is missing")
-                shutil.copy2(canonical_fan, target_fan)
+                restore_fan_curve(canonical_fan, target_fan)
                 changes.append("ROCKNIX Custom fan curve")
-                get_setting = shutil.which("get_setting")
-                cooling = ""
-                if get_setting:
-                    result = subprocess.run(
-                        [get_setting, "cooling.profile"], check=False, text=True,
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        timeout=10, env=clean_environment())
-                    cooling = result.stdout.strip()
-                if cooling == "custom":
-                    reload_fancontrol()
             except Exception as reason:
                 errors.append(f"fan: {reason}")
 
