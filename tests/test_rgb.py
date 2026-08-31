@@ -787,6 +787,31 @@ class Htr3212RGBControllerTests(unittest.TestCase):
     def brightness(self, name):
         return int((self.leds / name / "brightness").read_text())
 
+    def write_htr_snapshot(self, snapshot):
+        for (side, zone), values in zip(
+                rgb.HTR3212_ZONE_CHANNELS, snapshot):
+            for color, value in zip(("r", "g", "b"), values):
+                (self.leds / f"{side}:{color}{zone}" / "brightness").write_text(
+                    f"{value}\n")
+
+    def htr_snapshot(self):
+        return tuple(
+            tuple(self.brightness(f"{side}:{color}{zone}")
+                  for color in ("r", "g", "b"))
+            for side, zone in rgb.HTR3212_ZONE_CHANNELS
+        )
+
+    def saved_active_htr_state(self, controller):
+        state = controller.get_state()
+        lighting = state["lighting"]
+        lighting["layout_mode"] = "quadrants"
+        for index, zone in enumerate(lighting["zones"]):
+            zone["color"] = [20 + index, 40 + index, 60 + index]
+            zone["brightness"] = 255
+        applied = controller.set_state(self.request(
+            state, mode="rgb", lighting=lighting))
+        return applied, controller._htr3212_snapshot_from_lighting(lighting)
+
     def test_exact_odin3_abi_is_read_only_and_wins_over_generic(self):
         controller = self.controller()
 
@@ -825,6 +850,29 @@ class Htr3212RGBControllerTests(unittest.TestCase):
         self.assertEqual(capabilities["provider"], "htr3212-static")
         self.assertFalse(capabilities["available"])
         self.assertIn("incomplete", capabilities["error"])
+
+    def test_exact_odin_with_absent_htr_abi_never_falls_through(self):
+        for path in tuple(self.leds.iterdir()):
+            path.unlink()
+        controller = self.controller()
+        controller._sysfs_effects_available = mock.Mock(return_value=True)
+        controller._load_preferences = mock.Mock(return_value={
+            "provider": rgb.PROVIDER_SYSFS_EFFECTS,
+            "animation_active": True,
+            "effect": "rainbow",
+            "last_applied_boot_id": "boot-old",
+        })
+        controller._write_effect = mock.Mock()
+
+        capabilities = controller.capabilities()
+        self.assertEqual(capabilities["provider"], rgb.PROVIDER_HTR3212_STATIC)
+        self.assertFalse(capabilities["available"])
+        self.assertIn("unavailable", capabilities["error"])
+        self.assertFalse(controller.reapply_startup())
+        controller._sysfs_effects_available.assert_not_called()
+        controller._load_preferences.assert_not_called()
+        controller._write_effect.assert_not_called()
+        self.assertEqual(controller.htr_writes, [])
 
     def test_duplicate_channel_alias_and_wrong_driver_fail_closed(self):
         original = self.leds / "l:r1"
@@ -955,6 +1003,8 @@ class Htr3212RGBControllerTests(unittest.TestCase):
         migrated = controller.get_state()
         self.assertEqual(
             migrated["resume_lighting"]["layout_mode"], "per-stick")
+        self.assertEqual(
+            controller._load_htr3212_preferences()["mode"], "off")
         self.assertNotIn("correction", migrated)
 
         candidate["correction"] = True
@@ -962,6 +1012,25 @@ class Htr3212RGBControllerTests(unittest.TestCase):
         rejected = controller.get_state()
         self.assertIsNone(rejected["resume_lighting"])
         self.assertNotIn("correction", rejected)
+
+    def test_v2_active_preferences_restore_and_migrate_on_new_boot(self):
+        controller = self.controller()
+        _active, target = self.saved_active_htr_state(controller)
+        legacy = json.loads(controller.htr_preferences_path.read_text())
+        legacy["version"] = 2
+        legacy.pop("mode")
+        controller.htr_preferences_path.write_text(json.dumps(legacy))
+        self.write_htr_snapshot(tuple((0, 0, 0) for _zone in target))
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+
+        self.assertEqual(
+            restarted.reapply_startup(), rgb.PROVIDER_HTR3212_STATIC)
+        self.assertEqual(self.htr_snapshot(), target)
+        migrated = json.loads(restarted.htr_preferences_path.read_text())
+        self.assertEqual(migrated["version"], rgb.HTR3212_PREFERENCE_VERSION)
+        self.assertEqual(migrated["mode"], "rgb")
+        self.assertEqual(migrated["last_applied_boot_id"], "boot-b")
 
     def test_off_then_backend_only_on_restores_complete_saved_layout(self):
         controller = self.controller()
@@ -1037,6 +1106,11 @@ class Htr3212RGBControllerTests(unittest.TestCase):
         self.assertEqual(self.brightness("l:g4"), 0)
         self.assertFalse(controller.htr_preferences_path.exists())
 
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+        self.assertFalse(restarted.reapply_startup())
+        self.assertEqual(restarted.htr_writes, [])
+
     def test_observed_external_divergence_skips_cached_rollback(self):
         controller = self.controller()
         state = controller.get_state()
@@ -1102,17 +1176,228 @@ class Htr3212RGBControllerTests(unittest.TestCase):
                 for side in ("l", "r") for color in ("r", "g", "b")
                 for zone in range(1, 5))))
 
-    def test_startup_never_reapplies_htr3212_preferences(self):
+    def test_startup_restores_complete_htr3212_state_once_on_new_boot(self):
         controller = self.controller()
-        state = controller.get_state()
-        controller.set_state(self.request(state, mode="off"))
-        saved = controller.htr_preferences_path.read_text()
-        controller.htr_writes.clear()
+        _active, target = self.saved_active_htr_state(controller)
+        self.write_htr_snapshot(tuple((0, 0, 0) for _zone in target))
         self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+
+        self.assertEqual(
+            restarted.reapply_startup(), rgb.PROVIDER_HTR3212_STATIC)
+        self.assertEqual(self.htr_snapshot(), target)
+        self.assertEqual(len(restarted.htr_writes), 24)
+        saved = json.loads(restarted.htr_preferences_path.read_text())
+        self.assertEqual(saved["mode"], "rgb")
+        self.assertEqual(saved["last_applied_boot_id"], "boot-b")
+
+        reloaded = self.controller()
+        self.assertFalse(reloaded.reapply_startup())
+        self.assertEqual(reloaded.htr_writes, [])
+        self.assertEqual(self.events, [])
+
+    def test_startup_restores_saved_off_state_once(self):
+        controller = self.controller()
+        active, _target = self.saved_active_htr_state(controller)
+        controller.set_state(self.request(active, mode="off"))
+        self.write_htr_snapshot(tuple((7, 8, 9) for _zone in range(8)))
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+
+        self.assertEqual(
+            restarted.reapply_startup(), rgb.PROVIDER_HTR3212_STATIC)
+        self.assertEqual(
+            self.htr_snapshot(), tuple((0, 0, 0) for _zone in range(8)))
+        self.assertEqual(len(restarted.htr_writes), 24)
+        saved = json.loads(restarted.htr_preferences_path.read_text())
+        self.assertEqual(saved["mode"], "off")
+        reloaded = self.controller()
+        self.assertFalse(reloaded.reapply_startup())
+        self.assertEqual(reloaded.htr_writes, [])
+
+    def test_startup_same_boot_or_already_matching_target_never_writes(self):
+        controller = self.controller()
+        _active, target = self.saved_active_htr_state(controller)
+        controller.htr_writes.clear()
 
         self.assertFalse(controller.reapply_startup())
         self.assertEqual(controller.htr_writes, [])
-        self.assertEqual(controller.htr_preferences_path.read_text(), saved)
+
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+        self.assertEqual(self.htr_snapshot(), target)
+        self.assertFalse(restarted.reapply_startup())
+        self.assertEqual(restarted.htr_writes, [])
+        saved = json.loads(restarted.htr_preferences_path.read_text())
+        self.assertEqual(saved["last_applied_boot_id"], "boot-b")
+
+    def test_same_boot_reload_preserves_newer_external_htr3212_state(self):
+        controller = self.controller()
+        self.saved_active_htr_state(controller)
+        external = list(list(zone) for zone in self.htr_snapshot())
+        external[0][0] = 199
+        external = tuple(tuple(zone) for zone in external)
+        self.write_htr_snapshot(external)
+        saved = controller.htr_preferences_path.read_bytes()
+        restarted = self.controller()
+
+        self.assertFalse(restarted.reapply_startup())
+        self.assertEqual(restarted.htr_writes, [])
+        self.assertEqual(self.htr_snapshot(), external)
+        self.assertEqual(restarted.htr_preferences_path.read_bytes(), saved)
+
+    def test_startup_rejects_corrupt_or_inconsistent_htr3212_state(self):
+        controller = self.controller()
+        _active, target = self.saved_active_htr_state(controller)
+        valid = json.loads(controller.htr_preferences_path.read_text())
+        signatures = {
+            "short": "1 2 3",
+            "malformed": "x " + " ".join("0" for _index in range(23)),
+            "out-of-range": "256 " + " ".join("0" for _index in range(23)),
+            "lighting-mismatch": self.controller()._htr3212_signature((
+                (target[0][0] + 1, target[0][1], target[0][2]),
+                *target[1:],
+            )),
+        }
+        self.boot_id.write_text("boot-b\n")
+        for label, signature in signatures.items():
+            with self.subTest(label=label):
+                candidate = dict(valid)
+                candidate["native_signature"] = signature
+                candidate["last_applied_boot_id"] = "boot-a"
+                controller.htr_preferences_path.write_text(
+                    json.dumps(candidate))
+                self.write_htr_snapshot(
+                    tuple((0, 0, 0) for _zone in range(8)))
+                restarted = self.controller()
+
+                self.assertFalse(restarted.reapply_startup())
+                self.assertEqual(restarted.htr_writes, [])
+                persisted = json.loads(
+                    restarted.htr_preferences_path.read_text())
+                self.assertEqual(persisted["last_applied_boot_id"], "boot-a")
+
+        metadata_cases = {
+            "invalid-mode": {"mode": "battery"},
+            "off-with-nonzero-output": {"mode": "off"},
+            "wrong-provider": {"provider": "analog-static"},
+            "future-version": {"version": 999},
+        }
+        for label, updates in metadata_cases.items():
+            with self.subTest(label=label):
+                candidate = dict(valid)
+                candidate.update(updates)
+                candidate["last_applied_boot_id"] = "boot-a"
+                controller.htr_preferences_path.write_text(
+                    json.dumps(candidate))
+                self.write_htr_snapshot(
+                    tuple((0, 0, 0) for _zone in range(8)))
+                restarted = self.controller()
+
+                self.assertFalse(restarted.reapply_startup())
+                self.assertEqual(restarted.htr_writes, [])
+                self.assertEqual(
+                    json.loads(restarted.htr_preferences_path.read_text()),
+                    candidate)
+
+        controller.htr_preferences_path.write_text("{not-json")
+        restarted = self.controller()
+        self.assertFalse(restarted.reapply_startup())
+        self.assertEqual(restarted.htr_writes, [])
+        self.assertEqual(
+            restarted.htr_preferences_path.read_text(), "{not-json")
+
+    def test_startup_invalid_htr3212_abi_fails_closed(self):
+        controller = self.controller()
+        self.saved_active_htr_state(controller)
+        saved = controller.htr_preferences_path.read_bytes()
+        self.boot_id.write_text("boot-b\n")
+        (self.leds / "l:r1").unlink()
+        restarted = self.controller()
+
+        self.assertFalse(restarted.reapply_startup())
+        self.assertEqual(restarted.htr_writes, [])
+        self.assertEqual(self.events, [])
+        self.assertEqual(restarted.htr_preferences_path.read_bytes(), saved)
+
+    def test_failed_user_apply_never_replaces_startup_restore_target(self):
+        controller = self.controller()
+        active, target = self.saved_active_htr_state(controller)
+        saved = controller.htr_preferences_path.read_bytes()
+        rejected = active["lighting"]
+        for zone in rejected["zones"]:
+            zone["color"] = [210, 180, 150]
+            zone["brightness"] = 255
+        controller.htr_writes.clear()
+        controller.fail_on_write = 2
+
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            controller.set_state(self.request(
+                active, mode="rgb", lighting=rejected))
+        self.assertEqual(controller.htr_preferences_path.read_bytes(), saved)
+
+        self.write_htr_snapshot(tuple((0, 0, 0) for _zone in target))
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+        self.assertEqual(
+            restarted.reapply_startup(), rgb.PROVIDER_HTR3212_STATIC)
+        self.assertEqual(self.htr_snapshot(), target)
+
+    def test_failed_preference_save_preserves_prior_startup_restore_target(self):
+        controller = self.controller()
+        active, target = self.saved_active_htr_state(controller)
+        saved = controller.htr_preferences_path.read_bytes()
+        rejected = active["lighting"]
+        for zone in rejected["zones"]:
+            zone["color"] = [201, 171, 141]
+            zone["brightness"] = 255
+        controller.htr_writes.clear()
+        controller._save_htr3212_preferences = mock.Mock(
+            side_effect=OSError("preferences unavailable"))
+
+        with self.assertRaisesRegex(OSError, "preferences unavailable"):
+            controller.set_state(self.request(
+                active, mode="rgb", lighting=rejected))
+        self.assertEqual(controller.htr_preferences_path.read_bytes(), saved)
+        self.assertEqual(self.htr_snapshot(), target)
+
+        self.write_htr_snapshot(tuple((0, 0, 0) for _zone in target))
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+        self.assertEqual(
+            restarted.reapply_startup(), rgb.PROVIDER_HTR3212_STATIC)
+        self.assertEqual(self.htr_snapshot(), target)
+
+    def test_startup_tombstone_failure_writes_no_htr3212_state(self):
+        controller = self.controller()
+        _active, target = self.saved_active_htr_state(controller)
+        self.write_htr_snapshot(tuple((0, 0, 0) for _zone in target))
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+        restarted._save_htr3212_preferences = mock.Mock(
+            side_effect=OSError("preferences unavailable"))
+
+        with self.assertRaisesRegex(OSError, "preferences unavailable"):
+            restarted.reapply_startup()
+        self.assertEqual(restarted.htr_writes, [])
+        self.assertEqual(
+            self.htr_snapshot(), tuple((0, 0, 0) for _zone in target))
+
+    def test_startup_write_failure_is_tombstoned_and_never_retried(self):
+        controller = self.controller()
+        _active, target = self.saved_active_htr_state(controller)
+        self.write_htr_snapshot(tuple((0, 0, 0) for _zone in target))
+        self.boot_id.write_text("boot-b\n")
+        restarted = self.controller()
+        restarted.fail_on_write = 2
+
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            restarted.reapply_startup()
+        saved = json.loads(restarted.htr_preferences_path.read_text())
+        self.assertEqual(saved["last_applied_boot_id"], "boot-b")
+        reloaded = self.controller()
+        self.assertFalse(reloaded.reapply_startup())
+        self.assertEqual(reloaded.htr_writes, [])
 
     def test_production_writer_uses_one_ascii_sysfs_write(self):
         target = self.root / "brightness"

@@ -211,10 +211,19 @@ before each changed channel. If an operation or preference save fails,
 RK-Enhanced attempts guarded cached-state rollback only while the observed
 values still match, stopping when it sees divergence. The Linux LED class
 reports the driver's cached brightness after accepting an asynchronous HTR3212
-write; this ABI cannot read the physical I²C output back. No daemon, poller,
-animation loop, unload restoration, or automatic startup write is added. Other
-HTR3212 handhelds remain hidden from this mapped provider until their physical
-ring order is verified on hardware.
+write; this ABI cannot read the physical I²C output back.
+
+Because RK-Enhanced is the Odin 3 RGB owner, a successful Save & Apply stores
+the complete last-applied mode, eight-zone editor state, exact verified cached
+24-channel state, and current boot ID. On the first eligible RK-Enhanced startup
+of a new boot, RK-Enhanced validates the exact Odin 3 HTR3212 interface again and
+restores that saved state once. Saved **Off** remains Off. The new boot is marked
+handled before any channel write, so a failed restore cannot become a
+Decky-reload rewrite loop; later Decky reloads and same-boot external changes are
+left alone. If the cached channel state already matches, no channel is rewritten.
+This adds no daemon, poller, animation loop, suspend watcher, or unload
+restoration. Other HTR3212 handhelds remain hidden from this mapped provider
+until their physical ring order is verified on hardware.
 
 Pocket EVO kernels exposing the complete RGB ABI version 3 receive a dedicated
 provider ahead of both existing interfaces. Detection validates the ABI,

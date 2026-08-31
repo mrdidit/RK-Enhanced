@@ -129,6 +129,45 @@ class AtomicUpdaterStagingTests(unittest.TestCase):
 
 
 class PluginConflictTests(BackendSafetyBase, unittest.IsolatedAsyncioTestCase):
+    async def test_startup_logs_odin_rgb_restore_as_state_not_animation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plugin = self.make_plugin(root)
+            plugin.runtime_marker = root / "runtime-session.active"
+            plugin.legacy_fan_guard_marker = root / "legacy-fan.active"
+            plugin.lifecycle_heartbeat_task = None
+            plugin.game_watch_task = None
+            plugin.startup_rgb_pending = False
+            plugin.rgb = mock.Mock()
+            plugin.rgb.reapply_startup.return_value = (
+                main.ODIN3_RGB_STARTUP_ACTION)
+            plugin._start_plugin_lifecycle_guard = mock.Mock()
+            plugin._load = mock.Mock(return_value={})
+            plugin._restore_runtime_session = mock.Mock()
+            plugin._restore_legacy_system_fan_curve = mock.Mock()
+            plugin._publish_backend_install_health = mock.Mock()
+            plugin._install_status = mock.Mock(return_value={"active": False})
+            plugin._require_mutations_allowed = mock.Mock()
+            plugin._hardware_mutation_guard = mock.Mock(
+                return_value=main._exclusive_file_lock(
+                    Path(self._lock_temporary.name) / "rgb-startup.lock"))
+
+            async def completed_loop():
+                return None
+
+            plugin._lifecycle_heartbeat_loop = completed_loop
+            plugin._game_watch_loop = completed_loop
+            with mock.patch.object(main.decky.logger, "info") as info:
+                await plugin._main()
+                await asyncio.sleep(0)
+
+            plugin.rgb.reapply_startup.assert_called_once_with()
+            info.assert_any_call(
+                "Restored the saved Odin 3 RGB state for this boot")
+            self.assertFalse(any(
+                call.args == ("Reapplied the saved native RGB animation",)
+                for call in info.call_args_list))
+
     async def test_exact_normalized_manifest_detects_both_legacy_directories(self):
         with tempfile.TemporaryDirectory() as temporary:
             plugin = self.make_plugin(Path(temporary))

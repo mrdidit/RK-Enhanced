@@ -49,6 +49,7 @@ ChargingController = _charging_controller_class()
 RGBController = _rgb_controller_class()
 
 DEFAULT_PRESET = "RK-E Default"
+ODIN3_RGB_STARTUP_ACTION = "htr3212-static"
 LEGACY_DEFAULT_PRESETS = ("Rocknix Custom", "ROCKNIX Default", "Steam Default")
 SETTINGS_FILE = "settings.json"
 UPDATE_STATUS_FILE = "update-status.txt"
@@ -3335,6 +3336,9 @@ class Plugin:
                 if startup_rgb_action == "calibration":
                     decky.logger.info(
                         "Reapplied the saved native RGB calibration")
+                elif startup_rgb_action == ODIN3_RGB_STARTUP_ACTION:
+                    decky.logger.info(
+                        "Restored the saved Odin 3 RGB state for this boot")
                 elif startup_rgb_action:
                     decky.logger.info("Reapplied the saved native RGB animation")
             except Exception as reason:

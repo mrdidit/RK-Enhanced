@@ -62,7 +62,7 @@ HTR3212_ZONE_CHANNELS = (
     ("l", 4), ("l", 1), ("l", 2), ("l", 3),
     ("r", 1), ("r", 2), ("r", 3), ("r", 4),
 )
-HTR3212_PREFERENCE_VERSION = 2
+HTR3212_PREFERENCE_VERSION = 3
 
 
 @contextmanager
@@ -390,7 +390,10 @@ class RGBController:
         flat = tuple(path for zone in channels for path in zone)
         present = tuple(path.exists() for path in flat)
         if not any(present):
-            return "absent", (), ""
+            # The exact Odin identity has already matched. A missing ABI is a
+            # failed exact-provider validation, not permission to fall through
+            # to an unrelated generic RGB writer.
+            return "invalid", (), "Odin 3 RGB channel set is unavailable"
         if not all(present):
             return "invalid", (), "Odin 3 RGB channel set is incomplete"
 
@@ -817,6 +820,7 @@ class RGBController:
         return {
             "version": HTR3212_PREFERENCE_VERSION,
             "provider": PROVIDER_HTR3212_STATIC,
+            "mode": None,
             "lighting": None,
             "resume_lighting": None,
             "native_signature": "",
@@ -829,7 +833,7 @@ class RGBController:
             candidate = json.loads(self.htr_preferences_path.read_text())
             version = candidate.get("version") if isinstance(candidate, dict) else None
             if (not isinstance(candidate, dict) or
-                    version not in (1, HTR3212_PREFERENCE_VERSION) or
+                    version not in (1, 2, HTR3212_PREFERENCE_VERSION) or
                     candidate.get("provider") != PROVIDER_HTR3212_STATIC):
                 return defaults
             # The short-lived v1 test build offered EVO-style software colour
@@ -849,9 +853,24 @@ class RGBController:
             if (not isinstance(native_signature, str) or
                     not isinstance(last_boot, str)):
                 raise ValueError
+            native_snapshot = self._htr3212_snapshot_from_signature(
+                native_signature)
+            if native_signature and native_snapshot is None:
+                raise ValueError
+            mode = candidate.get("mode")
+            if version in (1, 2):
+                mode = (
+                    None if native_snapshot is None else
+                    "rgb" if any(value for zone in native_snapshot
+                                 for value in zone) else
+                    "off"
+                )
+            if mode not in (None, "off", "rgb"):
+                raise ValueError
             return {
                 "version": HTR3212_PREFERENCE_VERSION,
                 "provider": PROVIDER_HTR3212_STATIC,
+                "mode": mode,
                 "lighting": lighting,
                 "resume_lighting": resume,
                 "native_signature": native_signature,
@@ -867,6 +886,23 @@ class RGBController:
     def _htr3212_signature(snapshot):
         return " ".join(
             str(value) for zone in snapshot for value in zone)
+
+    @staticmethod
+    def _htr3212_snapshot_from_signature(signature):
+        if not isinstance(signature, str):
+            return None
+        tokens = signature.split()
+        if (len(tokens) != len(HTR3212_ZONE_INDEX) * 3 or
+                any(re.fullmatch(r"[0-9]+", token) is None
+                    for token in tokens)):
+            return None
+        values = tuple(int(token) for token in tokens)
+        if any(value > 255 for value in values):
+            return None
+        return tuple(
+            values[index:index + 3]
+            for index in range(0, len(values), 3)
+        )
 
     @staticmethod
     def _htr3212_revision(snapshot):
@@ -1627,6 +1663,7 @@ class RGBController:
         preferences.update({
             "version": HTR3212_PREFERENCE_VERSION,
             "provider": PROVIDER_HTR3212_STATIC,
+            "mode": mode,
             "lighting": lighting,
             "resume_lighting": lighting,
             "native_signature": self._htr3212_signature(applied_snapshot),
@@ -1960,7 +1997,7 @@ class RGBController:
             return self._get_state_locked(capabilities)
 
     def reapply_startup(self):
-        """Reapply a persisted animation once per boot, without polling."""
+        """Restore eligible persisted RGB state once per boot, without polling."""
         with self.thread_lock, _exclusive_lock(self.lock_path):
             evo_status, evo_path, _evo_effects, _evo_error = self._discover_evo()
             if evo_status == "invalid":
@@ -1996,6 +2033,46 @@ class RGBController:
                 # The caller can distinguish this from legacy animation
                 # restoration and log the operation accurately.
                 return "calibration"
+            htr_status, htr_channels, _htr_error = self._discover_htr3212()
+            if htr_status == "invalid":
+                return False
+            if htr_status == "valid":
+                preferences = self._load_htr3212_preferences()
+                mode = preferences["mode"]
+                lighting = preferences["lighting"]
+                boot_id = _read(self.boot_id_path)
+                if (mode not in ("off", "rgb") or lighting is None or
+                        not boot_id or
+                        boot_id == preferences["last_applied_boot_id"]):
+                    return False
+                target = self._htr3212_snapshot_from_signature(
+                    preferences["native_signature"])
+                if target is None:
+                    return False
+                # Off is an exact all-zero output while RGB must remain exactly
+                # reproducible from the complete validated editor state.
+                # Keeping the mode explicit prevents resume lighting from ever
+                # being mistaken for the last successfully applied state.
+                if ((mode == "off" and
+                     any(value for zone in target for value in zone)) or
+                        (mode == "rgb" and
+                         target != self._htr3212_snapshot_from_lighting(
+                             lighting))):
+                    return False
+                current = self._stable_htr3212_snapshot(htr_channels)
+                if current is None:
+                    return False
+                # Mark this boot handled before touching any volatile channel.
+                # A Decky reload must never turn a transient write failure into
+                # an automatic rewrite loop. Save & Apply remains the explicit
+                # retry path and records the current boot again on success.
+                preferences["last_applied_boot_id"] = boot_id
+                self._save_htr3212_preferences(preferences)
+                if current == target:
+                    return False
+                self._apply_htr3212_snapshot(
+                    htr_channels, current, target)
+                return PROVIDER_HTR3212_STATIC
             # Generic static devices require explicit Save only. Return before
             # their capability flag or persisted seven-field state is read.
             if not self._sysfs_effects_available():
