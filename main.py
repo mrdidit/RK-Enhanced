@@ -2173,8 +2173,9 @@ class Plugin:
                 _get_setting("cooling.profile", "") == "custom" and
                 not self._fan_session_active()
             )
+            needs_runtime_apply = not self.runtime_marker.exists()
             if (target == self.active_appid and preset == self.active_preset and
-                    not needs_fan_apply):
+                    not needs_runtime_apply and not needs_fan_apply):
                 return {"applied": False, "preset": self.active_preset}
             self.active_appid = target
             self.gpu_fdinfo_paths = []
@@ -2363,10 +2364,18 @@ class Plugin:
                 if not steam_was_active:
                     steam_was_active = True
                     pending, confirmations = detected, 2
-                elif detected == self.active_appid:
+                elif (detected == self.active_appid and
+                      self.runtime_marker.exists()):
                     pending, confirmations = None, 0
                     await asyncio.sleep(2)
                     continue
+                elif detected == self.active_appid:
+                    # The independent restoration guard may have completed a
+                    # genuine Steam exit between watcher samples. An unchanged
+                    # AppID is not proof that the RK-E runtime session still
+                    # exists, so reapply immediately and capture a fresh native
+                    # pre-session baseline through the common activation below.
+                    pending, confirmations = detected, 2
                 elif detected == pending:
                     confirmations += 1
                 else:

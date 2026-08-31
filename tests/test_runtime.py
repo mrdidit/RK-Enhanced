@@ -143,6 +143,132 @@ class RuntimeRestoreTests(unittest.TestCase):
             self.assertFalse(marker.exists())
 
 
+class GameWatchRuntimeSessionTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.modules.setdefault("decky", types.SimpleNamespace(
+            logger=types.SimpleNamespace(
+                info=lambda *_: None, warning=lambda *_: None,
+                error=lambda *_: None)))
+        import main
+        cls.main = main
+
+    def plugin(self, root, appid="123"):
+        plugin = self.main.Plugin.__new__(self.main.Plugin)
+        plugin.runtime_marker = root / "runtime-session.active"
+        plugin.active_appid = appid
+        plugin.active_preset = self.main.DEFAULT_PRESET
+        plugin.gpu_fdinfo_paths = []
+        plugin.gpu_fdinfo_refresh = 0.0
+        plugin.last_gpu_sample = None
+        plugin.startup_rgb_pending = False
+        profile = {"profile": "steam-default"}
+        plugin._load = mock.Mock(return_value={
+            "presets": {self.main.DEFAULT_PRESET: profile},
+            "steam_default": self.main.DEFAULT_PRESET,
+            "game_profiles": {},
+        })
+        plugin._apply = mock.Mock(return_value=True)
+        plugin._require_mutations_allowed = mock.Mock(return_value=True)
+        plugin._run_hardware_mutation = (
+            lambda function, *arguments: function(*arguments))
+        plugin._install_status = mock.Mock(return_value={"active": False})
+        plugin._plugin_conflict_state = mock.Mock(return_value={
+            "blocked": False,
+        })
+        plugin._steam_scope_active = mock.Mock(return_value=True)
+        plugin._detect_steam_app = mock.Mock(return_value=appid)
+        return plugin, profile
+
+    async def test_same_appid_reapplies_when_runtime_marker_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, profile = self.plugin(Path(temporary))
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            with mock.patch.object(
+                    self.main, "_get_setting", return_value="quiet"), \
+                    mock.patch.object(
+                        self.main.asyncio, "to_thread", new=inline_to_thread):
+                result = await plugin.activate_game("123")
+
+        self.assertEqual(result, {
+            "applied": True, "preset": self.main.DEFAULT_PRESET,
+        })
+        plugin._apply.assert_called_once_with(profile)
+
+    async def test_same_appid_skips_when_runtime_session_is_still_active(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, _ = self.plugin(Path(temporary))
+            plugin.runtime_marker.write_text("active\n")
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            with mock.patch.object(
+                    self.main, "_get_setting", return_value="quiet"), \
+                    mock.patch.object(
+                        self.main.asyncio, "to_thread", new=inline_to_thread):
+                result = await plugin.activate_game("123")
+
+        self.assertEqual(result, {
+            "applied": False, "preset": self.main.DEFAULT_PRESET,
+        })
+        plugin._apply.assert_not_called()
+
+    async def test_watcher_reapplies_same_appid_after_marker_disappears(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, profile = self.plugin(Path(temporary))
+            plugin.runtime_marker.write_text("active\n")
+            sleep_calls = 0
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            async def advance_then_stop(_seconds):
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls == 1:
+                    plugin.runtime_marker.unlink()
+                    return
+                raise asyncio.CancelledError
+
+            with mock.patch.object(
+                    self.main, "_get_setting", return_value="quiet"), \
+                    mock.patch.object(
+                        self.main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        self.main.asyncio, "sleep", new=advance_then_stop):
+                with self.assertRaises(asyncio.CancelledError):
+                    await plugin._game_watch_loop()
+
+        plugin._apply.assert_called_once_with(profile)
+
+    async def test_steam_transition_applies_default_when_appid_is_empty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin, profile = self.plugin(Path(temporary), appid="")
+
+            async def inline_to_thread(function, *arguments):
+                return function(*arguments)
+
+            async def stop_after_first_tick(_seconds):
+                raise asyncio.CancelledError
+
+            with mock.patch.object(
+                    self.main, "_get_setting", return_value="quiet"), \
+                    mock.patch.object(
+                        self.main.asyncio, "to_thread", new=inline_to_thread), \
+                    mock.patch.object(
+                        self.main.asyncio, "sleep", new=stop_after_first_tick):
+                with self.assertRaises(asyncio.CancelledError):
+                    await plugin._game_watch_loop()
+
+        plugin._apply.assert_called_once_with(profile)
+        self.assertEqual(plugin.active_appid, "")
+        self.assertEqual(plugin.active_preset, self.main.DEFAULT_PRESET)
+
+
 class CpuBoostDiscoveryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

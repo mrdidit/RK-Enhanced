@@ -613,9 +613,16 @@ repeatedly scanning the whole system.
 ### Runtime restoration
 
 Before the first preset is applied in a Steam session, RK-Enhanced captures the
-native CPU, GPU, and scheduler state. It records only controls RKE
+native CPU, GPU, and scheduler state. This native pre-session baseline normally
+represents the settled boot configuration while still preserving legitimate
+ROCKNIX changes made before Steam starts. RK-Enhanced records only controls RKE
 actually changes and restores their native values when Steam exits, the plugin
 unloads, or Decky/plugin workers terminate unexpectedly.
+
+The independent restoration guard requires three consecutive inactive Steam
+scope checks before treating a momentary transition as a complete exit. An
+explicit clean unload, plugin-worker death, or verified PluginLoader identity
+change bypasses that debounce and requests restoration immediately.
 
 Clean unload writes a one-shot restore request for the already-independent
 session guard before attempting an immediate detached restore. The request
