@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -38,16 +39,22 @@ class FakeSystemd:
         self.is_running = bool(main_pid)
         self.steam_is_running = True
         self.calls = []
+        self.main_pid_calls = 0
+        self.control_group_calls = 0
+        self.active_calls = 0
         self.on_stop = None
         self.on_start = None
 
     def main_pid(self):
+        self.main_pid_calls += 1
         return self.pid
 
     def control_group(self):
+        self.control_group_calls += 1
         return self.group
 
     def active(self):
+        self.active_calls += 1
         return self.is_running
 
     def steam_active(self):
@@ -119,12 +126,25 @@ class RecoveryFixture:
             arguments = ["/usr/bin/python3", "main.py"]
         (directory / "cmdline").write_bytes(
             b"\0".join(value.encode() for value in arguments) + b"\0")
+        task = directory / "task" / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        (task / "children").write_text("")
+        parent_children = (
+            self.proc / str(parent) / "task" / str(parent) / "children")
+        if parent_children.exists():
+            children = parent_children.read_text().split()
+            if str(pid) not in children:
+                parent_children.write_text(" ".join([*children, str(pid)]) + "\n")
 
     def remove(self, pid):
         directory = self.proc / str(pid)
-        for child in directory.iterdir():
-            child.unlink()
-        directory.rmdir()
+        for children_path in self.proc.glob("*/task/*/children"):
+            children = children_path.read_text().split()
+            if str(pid) in children:
+                children_path.write_text(
+                    " ".join(value for value in children if value != str(pid)) +
+                    ("\n" if len(children) > 1 else ""))
+        shutil.rmtree(directory)
 
     def group_pids(self, *pids):
         self.group_file.write_text(
@@ -544,6 +564,155 @@ class LifecycleGuardTests(unittest.TestCase):
         self.assertFalse(ready.exists())
         self.assertEqual(result["action"], "clean-unload")
         self.assertEqual(self.recording.restart_calls, 0)
+
+    def test_healthy_fast_path_avoids_full_proc_and_repeated_systemd_queries(self):
+        lease, _payload, active, _heartbeat = self.populate_generation()
+        self.guard.loader_verify_seconds = 30.0
+
+        def after_sleep(now):
+            if now >= 1004:
+                active.unlink(missing_ok=True)
+
+        self.fixture.clock.on_sleep = after_sleep
+        with mock.patch.object(
+                self.fixture.table, "all_identities",
+                side_effect=AssertionError("healthy guard scanned all of /proc")):
+            result = self.guard.run(lease)
+
+        self.assertEqual(result["action"], "clean-unload")
+        self.assertEqual(self.fixture.systemd.active_calls, 1)
+        self.assertEqual(self.fixture.systemd.main_pid_calls, 1)
+        self.assertEqual(self.fixture.systemd.control_group_calls, 1)
+
+    def test_healthy_fast_path_periodically_reverifies_loader_with_systemd(self):
+        lease, _payload, active, _heartbeat = self.populate_generation()
+        self.guard.loader_verify_seconds = 2.0
+
+        def after_sleep(now):
+            if now >= 1003:
+                active.unlink(missing_ok=True)
+
+        self.fixture.clock.on_sleep = after_sleep
+        result = self.guard.run(lease)
+
+        self.assertEqual(result["action"], "clean-unload")
+        self.assertEqual(self.fixture.systemd.active_calls, 2)
+        self.assertEqual(self.fixture.systemd.main_pid_calls, 2)
+        self.assertEqual(self.fixture.systemd.control_group_calls, 2)
+
+    def test_exact_loader_identity_change_forces_immediate_full_verification(self):
+        lease_path, _payload, _active, _heartbeat = self.populate_generation()
+        lease = self.guard._load_lease(lease_path)
+        self.assertTrue(self.guard._establish_readiness(lease))
+        (self.fixture.proc / "100" / "stat").write_text(
+            stat_text(100, 1, 9000, "PluginLoader"))
+
+        current = self.guard._current_loader_for_lease(lease)
+
+        self.assertEqual(current.start_time_ticks, 9000)
+        self.assertEqual(self.fixture.systemd.active_calls, 2)
+        self.assertEqual(self.fixture.systemd.main_pid_calls, 2)
+        self.assertEqual(self.fixture.systemd.control_group_calls, 2)
+
+    def test_incomplete_bounded_owner_tree_uses_conservative_full_scan(self):
+        lease_path, _payload, _active, _heartbeat = self.populate_generation()
+        lease = self.guard._load_lease(lease_path)
+        expected = self.fixture.table.identity(101)
+        with mock.patch.object(
+                self.fixture.table, "bounded_process_tree",
+                return_value=((expected,), False)), mock.patch.object(
+                    self.fixture.table, "all_identities",
+                    wraps=self.fixture.table.all_identities) as full_scan:
+            captured = self.guard._capture_owner_tree(lease)
+
+        self.assertEqual([item.pid for item in captured], [101])
+        full_scan.assert_called_once_with()
+
+    def test_fallback_rejects_owner_pid_reused_during_tree_capture(self):
+        lease_path, _payload, _active, _heartbeat = self.populate_generation()
+        lease = self.guard._load_lease(lease_path)
+        reused = recovery.ProcessIdentity(101, 9001, 1)
+        unrelated_child = recovery.ProcessIdentity(102, 9002, 101)
+        with mock.patch.object(
+                self.fixture.table, "bounded_process_tree",
+                return_value=((lease.owner,), False)), mock.patch.object(
+                    self.fixture.table, "all_identities",
+                    return_value={101: reused, 102: unrelated_child}):
+            captured = self.guard._capture_owner_tree(lease)
+
+        self.assertEqual(captured, ())
+
+    def test_different_unready_pointer_forces_immediate_loader_verification(self):
+        lease, _payload, _active, _heartbeat = self.populate_generation()
+        self.guard.loader_verify_seconds = 100.0
+        transitioned = False
+
+        def after_sleep(now):
+            nonlocal transitioned
+            if now >= 1001 and not transitioned:
+                transitioned = True
+                # Keep the old Loader and owner alive.  Only systemd and the
+                # unready CURRENT pointer expose this interrupted handoff.
+                self.populate_generation(
+                    self.NEXT_TOKEN, 200, 201,
+                    loader_started=2000, owner_started=2001,
+                    current=True, ready=False)
+
+        def send(pid, requested):
+            self.fixture.signals.append((pid, requested))
+            if requested == signal.SIGTERM and pid == 101:
+                self.fixture.remove(pid)
+
+        self.fixture.clock.on_sleep = after_sleep
+        self.fixture.table.send_signal = send
+        result = self.guard.run(lease)
+
+        self.assertTrue(transitioned)
+        self.assertEqual(result["action"], "restarted")
+        self.assertEqual(result["reason"], "replacement-not-ready")
+        self.assertGreaterEqual(self.fixture.systemd.active_calls, 2)
+
+    def test_maintenance_release_forces_immediate_loader_verification(self):
+        lease, _payload, _active, _heartbeat = self.populate_generation()
+        self.guard.loader_verify_seconds = 100.0
+        self.fixture.marker.parent.mkdir(parents=True, exist_ok=True)
+        self.fixture.marker.write_text("maintenance\n")
+        descriptor = os.open(
+            self.fixture.lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        transitioned = False
+
+        def after_sleep(now):
+            nonlocal transitioned
+            if now >= 1001 and not transitioned:
+                transitioned = True
+                # Keep the old generation alive while systemd moves to a new
+                # Loader, then end maintenance without publishing a lease.
+                self.fixture.process(200, 1, 2000, loader=True, fex=True)
+                self.fixture.group_pids(200)
+                self.fixture.systemd.pid = 200
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+        def send(pid, requested):
+            self.fixture.signals.append((pid, requested))
+            if requested == signal.SIGTERM and pid == 101:
+                self.fixture.remove(pid)
+
+        self.fixture.clock.on_sleep = after_sleep
+        self.fixture.table.send_signal = send
+        try:
+            result = self.guard.run(lease)
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(descriptor)
+
+        self.assertTrue(transitioned)
+        self.assertEqual(result["action"], "restarted")
+        self.assertEqual(result["reason"], "replacement-not-ready")
+        self.assertGreaterEqual(self.fixture.systemd.active_calls, 2)
 
     def test_new_loader_generation_cleans_only_stale_old_owner_tree(self):
         lease, _payload, _active, _heartbeat = self.populate_generation()

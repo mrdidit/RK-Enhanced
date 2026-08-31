@@ -46,12 +46,15 @@ KILL_SECONDS = 3.0
 START_SECONDS = 15.0
 POLL_SECONDS = 0.1
 GUARD_POLL_SECONDS = 2.0
+GUARD_LOADER_VERIFY_SECONDS = 15.0
 HEARTBEAT_STALE_SECONDS = 15.0
 HEARTBEAT_RECHECK_SECONDS = 6.0
 REPLACEMENT_WAIT_SECONDS = 20.0
 ACTIVATION_WAIT_SECONDS = 10.0
 OLD_OWNER_GRACE_SECONDS = 10.0
 AUTO_RECOVERY_COOLDOWN_SECONDS = 120.0
+OWNER_TREE_PROCESS_LIMIT = 256
+OWNER_TREE_TASK_LIMIT = 256
 
 LEASE_VERSION = 1
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}")
@@ -286,6 +289,85 @@ class ProcessTable:
             if identity is not None:
                 result[identity.pid] = identity
         return result
+
+    def bounded_process_tree(
+            self, root: ProcessIdentity, *,
+            process_limit: int = OWNER_TREE_PROCESS_LIMIT,
+            task_limit: int = OWNER_TREE_TASK_LIMIT,
+    ) -> tuple[tuple[ProcessIdentity, ...], bool]:
+        """Capture one exact process tree without scanning all of ``/proc``.
+
+        Linux exposes each thread's direct children through
+        ``/proc/<pid>/task/<tid>/children``.  Walking those files keeps the
+        healthy lifecycle guard proportional to RK-E's own process tree.  The
+        boolean is false when a fixed safety bound or an unreadable task tree
+        prevents a complete walk; callers can then use the conservative full
+        process-table snapshot as a rare slow path.
+        """
+        if process_limit <= 0 or task_limit <= 0:
+            return (), False
+        pending = [root]
+        visited: set[tuple[int, int]] = set()
+        captured: dict[int, ProcessIdentity] = {}
+        complete = True
+
+        while pending:
+            if len(captured) >= process_limit:
+                complete = False
+                break
+            expected = pending.pop()
+            key = (expected.pid, expected.start_time_ticks)
+            if key in visited:
+                continue
+            visited.add(key)
+            current = self.identity(expected.pid)
+            if (current is None or
+                    current.start_time_ticks != expected.start_time_ticks):
+                continue
+            captured[current.pid] = current
+
+            task_root = self.proc_root / str(current.pid) / "task"
+            try:
+                tasks = sorted(
+                    (path for path in task_root.iterdir()
+                     if path.name.isdigit()),
+                    key=lambda path: int(path.name),
+                )
+            except OSError:
+                complete = False
+                continue
+            if len(tasks) > task_limit:
+                complete = False
+                tasks = tasks[:task_limit]
+
+            child_pids = set()
+            for task in tasks:
+                try:
+                    values = (task / "children").read_text().split()
+                except FileNotFoundError:
+                    # A thread can exit between listing and reading its entry.
+                    # Fall back to the conservative full snapshot rather than
+                    # claiming that this sampled tree was complete.
+                    complete = False
+                    continue
+                except OSError:
+                    complete = False
+                    continue
+                for value in values:
+                    try:
+                        child_pid = int(value)
+                    except ValueError:
+                        continue
+                    if child_pid > 0:
+                        child_pids.add(child_pid)
+
+            for child_pid in sorted(child_pids, reverse=True):
+                child = self.identity(child_pid)
+                if child is not None and child.parent_pid == current.pid:
+                    pending.append(child)
+
+        return tuple(sorted(
+            captured.values(), key=lambda identity: identity.pid)), complete
 
     def matches_loader_binary(self, pid: int) -> bool:
         expected = str(PLUGIN_LOADER_BINARY)
@@ -613,6 +695,7 @@ class LifecycleGuard:
             monotonic_ns: Callable[[], int] = time.monotonic_ns,
             sleep: Callable[[float], None] = time.sleep,
             poll_seconds: float = GUARD_POLL_SECONDS,
+            loader_verify_seconds: float = GUARD_LOADER_VERIFY_SECONDS,
             heartbeat_stale_seconds: float = HEARTBEAT_STALE_SECONDS,
             heartbeat_recheck_seconds: float = HEARTBEAT_RECHECK_SECONDS,
             replacement_wait_seconds: float = REPLACEMENT_WAIT_SECONDS,
@@ -638,6 +721,9 @@ class LifecycleGuard:
         self.monotonic_ns = monotonic_ns
         self.sleep = sleep
         self.poll_seconds = poll_seconds
+        self.loader_verify_seconds = max(0.0, float(loader_verify_seconds))
+        self.last_loader_verification_at: float | None = None
+        self.last_verified_loader: ProcessIdentity | None = None
         self.heartbeat_stale_seconds = heartbeat_stale_seconds
         self.heartbeat_recheck_seconds = heartbeat_recheck_seconds
         self.replacement_wait_seconds = replacement_wait_seconds
@@ -986,25 +1072,67 @@ class LifecycleGuard:
             left.start_time_ticks == right.start_time_ticks)
 
     def _verified_current_loader(self) -> ProcessIdentity | None:
+        def finish(identity):
+            self.last_loader_verification_at = self.monotonic()
+            self.last_verified_loader = identity
+            return identity
+
         if not self.systemd.active():
-            return None
+            return finish(None)
         pid = self.systemd.main_pid()
         identity = self.processes.identity(pid) if pid else None
         if identity is None or not self.processes.matches_loader_binary(pid):
-            return None
+            return finish(None)
         try:
             control_group = RecoveryController._safe_control_group(
                 self.systemd.control_group())
         except RecoveryError:
-            return None
+            return finish(None)
         if pid not in self.recovery._cgroup_pids(control_group):
-            return None
-        return identity
+            return finish(None)
+        return finish(identity)
+
+    def _current_loader_for_lease(
+            self, lease: LifecycleLease, *, force_full=False
+    ) -> ProcessIdentity | None:
+        """Use exact proc identity on healthy polls, with bounded full checks.
+
+        Readiness performs a complete systemd/binary/cgroup verification.  A
+        healthy poll can then validate the immutable Loader PID generation and
+        fixed executable directly from ``/proc``.  Any anomaly, explicit slow
+        path, or elapsed verification interval repeats the complete check.
+        """
+        current = self.processes.identity(lease.loader.pid)
+        exact_loader = bool(
+            self._same_identity(current, lease.loader) and
+            self.processes.matches_loader_binary(lease.loader.pid))
+        now = self.monotonic()
+        last_checked = self.last_loader_verification_at
+        verification_due = bool(
+            last_checked is None or now < last_checked or
+            now - last_checked >= self.loader_verify_seconds)
+        cached_loader = self._same_identity(
+            self.last_verified_loader, lease.loader)
+        if (force_full or not exact_loader or not cached_loader or
+                verification_due):
+            return self._verified_current_loader()
+        return current
 
     def _capture_owner_tree(self, lease: LifecycleLease):
         if not self.processes.same_process(lease.owner):
             return ()
+        captured, complete = self.processes.bounded_process_tree(lease.owner)
+        if complete:
+            return captured
+        # Conservatively retain the original system-wide snapshot only when
+        # the bounded proc walk reports that it could not prove completeness.
         identities = self.processes.all_identities()
+        current_owner = identities.get(lease.owner.pid)
+        if not self._same_identity(current_owner, lease.owner):
+            # The owner exited or its numeric PID was reused between the
+            # bounded precheck and the slow snapshot.  Never anchor cleanup to
+            # that unrelated process generation.
+            return ()
         selected = self.processes.descendants(identities, (lease.owner.pid,))
         return tuple(
             sorted(
@@ -1013,22 +1141,28 @@ class LifecycleGuard:
             )
         )
 
-    def _replacement_lease(self, original: LifecycleLease):
+    def _replacement_lease_state(self, original: LifecycleLease):
         try:
             candidate = self._load_lease(self.current_lease_path, current=True)
         except RecoveryError:
-            return None
-        if (candidate.token == original.token or not self._active(candidate) or
-                not self._ready(candidate)):
-            return None
+            return None, False
+        if self._same_lease(candidate, original):
+            return None, True
+        if (candidate.token == original.token or
+                not self._active(candidate) or not self._ready(candidate)):
+            return None, False
         if not self.processes.same_process(candidate.owner):
-            return None
+            return None, False
         current_loader = self._verified_current_loader()
         if not self._same_identity(candidate.loader, current_loader):
-            return None
+            return None, False
         if not self._heartbeat_fresh(candidate):
-            return None
-        return candidate
+            return None, False
+        return candidate, False
+
+    def _replacement_lease(self, original: LifecycleLease):
+        replacement, _current_exact = self._replacement_lease_state(original)
+        return replacement
 
     def _wait_for_replacement(self, original: LifecycleLease):
         deadline = self.monotonic() + self.replacement_wait_seconds
@@ -1212,16 +1346,19 @@ class LifecycleGuard:
     def _run_lease(self, lease: LifecycleLease):
         captured_owner = self._capture_owner_tree(lease)
         stale_checked_at = None
+        maintenance_observed = False
 
         while True:
             if not self._active(lease):
                 return {"action": "clean-unload", "restarted": False}
             if self._maintenance_active():
                 stale_checked_at = None
+                maintenance_observed = True
                 self.sleep(self.poll_seconds)
                 continue
 
-            replacement = self._replacement_lease(lease)
+            replacement, current_pointer_exact = (
+                self._replacement_lease_state(lease))
             if replacement is not None:
                 return self._replacement_result(
                     lease, replacement, captured_owner)
@@ -1233,7 +1370,17 @@ class LifecycleGuard:
                 known.update({item.pid: item for item in refreshed})
                 captured_owner = tuple(sorted(
                     known.values(), key=lambda identity: identity.pid))
-            current_loader = self._verified_current_loader()
+            heartbeat_fresh = self._heartbeat_fresh(lease)
+            current_loader = self._current_loader_for_lease(
+                lease, force_full=(
+                    maintenance_observed or not current_pointer_exact or
+                    not owner_alive or not heartbeat_fresh))
+            maintenance_observed = False
+            # A complete systemd query can block.  Sample the heartbeat again
+            # after Loader validation so crossing the stale threshold during
+            # that query is handled in this iteration, as it was before the
+            # healthy fast path existed.
+            heartbeat_fresh = self._heartbeat_fresh(lease)
             same_loader = self._same_identity(current_loader, lease.loader)
 
             if current_loader is not None and not same_loader:
@@ -1258,7 +1405,7 @@ class LifecycleGuard:
                 return self._automatic_restart("replacement-not-ready")
 
             if owner_alive and same_loader:
-                if self._heartbeat_fresh(lease):
+                if heartbeat_fresh:
                     stale_checked_at = None
                     self.sleep(self.poll_seconds)
                     continue
