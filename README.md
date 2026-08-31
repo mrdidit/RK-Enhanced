@@ -150,11 +150,12 @@ presets.
 ### RGB control
 
 On compatible devices, the RGB tab provides graphical control of ROCKNIX's
-native stick-ring lighting. Support is discovered from runtime capabilities,
-not from a device, product, or SoC allowlist. The tab is omitted when no verified
-native interface is available.
+native stick-ring lighting. Support is normally discovered from an exact
+runtime interface. A device identity is additionally required where identical
+controllers have different physical zone wiring. The tab is omitted when no
+verified native interface and layout are available.
 
-Three interface families are supported. Devices with the known native LED-mode
+Four interface families are supported. Devices with the known native LED-mode
 and effect interface retain ROCKNIX's **LED Color** modes:
 
 - Off
@@ -180,6 +181,25 @@ colours, RK-Enhanced shows the right-ring colour and warns before saving. An
 explicit Save & Apply then makes both rings match. Native-state revisions stop
 an older open draft from overwriting a newer ROCKNIX-side edit.
 
+The AYN Odin 3 receives a dedicated Static provider when its complete pair of
+HTR3212 controllers exposes all 24 expected writable LED channels. Its ring
+order was [measured on hardware by the Armada project](https://github.com/armada-os/armada/pull/255):
+both rings run clockwise and the right ring is offset by one emitter.
+RK-Enhanced therefore offers both-ring, per-stick, and eight-quadrant editing
+with physical corner names in the UI.
+
+Odin 3 currently exposes only **Off**, **RGB**, and **Static**. Brightness is
+gamma-corrected while preserving the selected raw RGB ratios. Applying a
+layout snapshots all 24 cached values and rechecks the complete cached state
+before each changed channel. If an operation or preference save fails,
+RK-Enhanced attempts guarded cached-state rollback only while the observed
+values still match, stopping when it sees divergence. The Linux LED class
+reports the driver's cached brightness after accepting an asynchronous HTR3212
+write; this ABI cannot read the physical I²C output back. No daemon, poller,
+animation loop, unload restoration, or automatic startup write is added. Other
+HTR3212 handhelds remain hidden from this mapped provider until their physical
+ring order is verified on hardware.
+
 Pocket EVO kernels exposing the complete RGB ABI version 3 receive a dedicated
 provider ahead of both existing interfaces. Detection validates the ABI,
 attributes, physical zone order, writable controls, and required effects; it
@@ -196,16 +216,16 @@ The verified FIT stick-ring effect interface offers:
 
 The FIT and generic providers present the stick rings as one shared lighting
 zone. Static mode persists through ROCKNIX's native `analogsticks.led` setting.
-RK-Enhanced stores
-the chosen source colour, brightness, optional colour correction, and animated
-effect so the draft remains coherent across modes. It may reapply a saved
-animation at startup only for the verified effect provider while native LED
-Color remains RGB. The generic static provider adds no startup write, polling,
-restoration, or unadvertised animation command.
+RK-Enhanced stores the chosen source colour, brightness, optional colour
+correction, and animated effect so the draft remains coherent across modes. It
+may reapply a saved animation at startup only for the verified effect provider
+while native LED Color remains RGB. The generic static provider adds no startup
+write, polling, restoration, or unadvertised animation command.
 
-Colour correction is off by default and applies only to Static and Breath. When
-enabled for a colour containing red, the red channel is unchanged while green
-and blue are scaled to 80%. Rainbow is always passed through unchanged.
+For the FIT and generic providers, colour correction is off by default and
+applies only to Static and Breath. When enabled for a colour containing red,
+the red channel is unchanged while green and blue are scaled to 80%. Rainbow
+is always passed through unchanged.
 
 On the ABI 3 Pocket EVO provider, **Static** remains the default effect. Its
 layout editor can address both rings together, the left and right rings, or all
@@ -636,9 +656,10 @@ the request.
   refinement.
 - Experimental charging controls are compatible-device-only and are not ready
   for general exposure.
-- RGB controls are hidden unless either a verified native mode/effect interface
-  or the complete generic analogue-stick interface is present. Animated effects
-  still require the known stick-ring effect interface.
+- RGB controls are hidden unless a verified native mode/effect interface, the
+  complete generic analogue-stick interface, Pocket EVO ABI 3, or the exact
+  mapped Odin 3 HTR3212 interface is present. Animated effects still require a
+  provider that explicitly advertises them.
 - Preset import, export, and sharing are not yet available.
 - TDP control is not currently implemented.
 

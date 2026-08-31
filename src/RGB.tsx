@@ -12,8 +12,8 @@ import {
 } from "./rgbModel";
 import type {
   RgbColor, RgbEffect, RgbEvoCalibration, RgbEvoEffect, RgbEvoLayoutMode,
-  RgbEvoRequest, RgbLegacyEffect, RgbLegacyRequest, RgbMode, RgbRequest,
-  RgbState,
+  RgbEvoRequest, RgbLegacyEffect, RgbLegacyRequest, RgbMode, RgbRequest, RgbState,
+  RgbZonedRequest,
 } from "./types";
 
 const MODE_LABELS: Record<RgbMode, string> = {
@@ -39,7 +39,19 @@ const LAYOUT_LABELS: Record<RgbEvoLayoutMode, string> = {
   quadrants: "Quadrants",
 };
 const QUADRANT_LABELS = ["270° Left", "0° Top", "90° Right", "180° Bottom"];
+const HTR3212_QUADRANT_LABELS = ["Upper left", "Upper right", "Lower right", "Lower left"];
 const option = <T extends string>(data: T, label: string) => ({ data, label });
+
+const isZonedProvider = (provider: RgbState["provider"] | RgbRequest["provider"]):
+  provider is "pocket-evo-v3" | "htr3212-static" =>
+  provider === "pocket-evo-v3" || provider === "htr3212-static";
+type RgbEvoState = Extract<RgbState, { provider: "pocket-evo-v3" }>;
+type RgbHtrState = Extract<RgbState, { provider: "htr3212-static" }>;
+type RgbZonedState = RgbEvoState | RgbHtrState;
+const isZonedState = (state: RgbState): state is RgbZonedState =>
+  isZonedProvider(state.provider);
+const isZonedRequest = (request: RgbRequest): request is RgbZonedRequest =>
+  isZonedProvider(request.provider);
 
 const isLegacyEffect = (effect: RgbEffect): effect is RgbLegacyEffect =>
   effect === "static" || effect === "breath" || effect === "rainbow";
@@ -47,7 +59,9 @@ const isEvoEffect = (effect: RgbEffect): effect is RgbEvoEffect =>
   effect === "static" || effect === "breath" || effect === "rgb-breath" ||
   effect === "rainbow" || effect === "reactive";
 
-const defaultNonOffLighting = (state: Extract<RgbState, { provider: "pocket-evo-v3" }>) => {
+function defaultNonOffLighting(state: RgbEvoState): RgbEvoState["lighting"];
+function defaultNonOffLighting(state: RgbHtrState): RgbHtrState["lighting"];
+function defaultNonOffLighting(state: RgbZonedState): RgbEvoState["lighting"] {
   const lighting = cloneEvoLighting(state.lighting);
   lighting.effect = "static";
   lighting.layout_mode = "both";
@@ -57,11 +71,22 @@ const defaultNonOffLighting = (state: Extract<RgbState, { provider: "pocket-evo-
     brightness: lighting.brightness,
   }));
   return lighting;
-};
+}
 
 const requestFromState = (state: RgbState): RgbRequest | null => {
   if (!(state.supported && state.valid && state.provider !== "none" &&
       state.mode !== "unknown")) return null;
+  if (state.provider === "htr3212-static") {
+    const lighting = state.mode === "off"
+      ? state.resume_lighting || defaultNonOffLighting(state)
+      : state.lighting;
+    return {
+      provider: state.provider,
+      revision: state.revision,
+      mode: state.mode,
+      lighting: cloneEvoLighting(lighting),
+    };
+  }
   if (state.provider === "pocket-evo-v3") {
     const lighting = state.mode === "off"
       ? state.resume_lighting || defaultNonOffLighting(state)
@@ -90,7 +115,9 @@ const sameRequest = (left: RgbRequest | null, right: RgbRequest | null) => {
       left.revision === right.revision && left.mode === right.mode)) return false;
   if (left.provider === "pocket-evo-v3" && right.provider === "pocket-evo-v3")
     return sameEvoLighting(left.lighting, right.lighting);
-  if (left.provider === "pocket-evo-v3" || right.provider === "pocket-evo-v3") return false;
+  if (left.provider === "htr3212-static" && right.provider === "htr3212-static")
+    return sameEvoLighting(left.lighting, right.lighting);
+  if (isZonedRequest(left) || isZonedRequest(right)) return false;
   return left.effect === right.effect && left.brightness === right.brightness &&
     left.correction === right.correction &&
     left.color.every((value, index) => value === right.color[index]);
@@ -246,9 +273,14 @@ export function RGB({ active }: { active: boolean }) {
   };
   const updateLegacy = (change: (request: RgbLegacyRequest) => void) =>
     replaceDraft(request => {
-      if (request.provider === "pocket-evo-v3") return request;
+      if (isZonedRequest(request)) return request;
       change(request);
       return request;
+    });
+  const updateZoned = (change: (request: RgbZonedRequest) => RgbZonedRequest | void) =>
+    replaceDraft(request => {
+      if (!isZonedRequest(request)) return request;
+      return change(request) || request;
     });
   const updateEvo = (change: (request: RgbEvoRequest) => RgbEvoRequest | void) =>
     replaceDraft(request => {
@@ -395,16 +427,19 @@ export function RGB({ active }: { active: boolean }) {
   const effects = status?.effects || [];
   const analogStatic = status?.provider === "analog-static";
   const evoStatus = status?.provider === "pocket-evo-v3" ? status : null;
-  const legacyDraft = draft && draft.provider !== "pocket-evo-v3" ? draft : null;
+  const zonedStatus = status && isZonedState(status) ? status : null;
+  const legacyDraft = draft && !isZonedRequest(draft) ? draft : null;
+  const zonedDraft = draft && isZonedRequest(draft) ? draft : null;
   const evoDraft = draft?.provider === "pocket-evo-v3" ? draft : null;
+  const htrDraft = draft?.provider === "htr3212-static" ? draft : null;
   const maxBrightness = Math.max(1, status?.max_brightness || 255);
   const lightingLocked = Boolean(busy || !active || calibrationDirty);
   const calibrationLocked = Boolean(busy || !active || lightingDirty);
   const calibrationNeedsSave = Boolean(draftCalibration &&
     !sameEvoCalibration(evoStatus?.calibration_override || null, draftCalibration));
-  const selectedZone = evoDraft?.lighting.zones[Math.min(
+  const selectedZone = zonedDraft?.lighting.zones[Math.min(
     Math.max(evoTargetIndex, 0),
-    Math.max(0, evoDraft.lighting.zones.length - 1),
+    Math.max(0, zonedDraft.lighting.zones.length - 1),
   )];
   const backToTop = () => {
     topRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -468,23 +503,23 @@ export function RGB({ active }: { active: boolean }) {
         </>}
       </>}
 
-      {evoDraft && evoStatus && <>
+      {zonedDraft && zonedStatus && <>
         <PanelSectionRow><DropdownItem label="Stick lighting" bottomSeparator="none"
           disabled={lightingLocked}
-          selectedOption={evoDraft.mode}
+          selectedOption={zonedDraft.mode}
           rgOptions={[option("off", "Off"), option("rgb", "RGB")]}
-          onChange={(selected: any) => updateEvo(request => {
+          onChange={(selected: any) => updateZoned(request => {
             request.mode = selected.data;
           })} />
         </PanelSectionRow>
-        {evoStatus.temporarily_gated && <div className="rke-rgb-warning">
+        {evoStatus?.temporarily_gated && <div className="rke-rgb-warning">
           <PanelSectionRow><Field label="RGB output temporarily suspended"
             description="ROCKNIX has gated the LEDs. Saved changes will appear when output resumes."
             bottomSeparator="none" />
           </PanelSectionRow>
         </div>}
-        {evoDraft.mode === "rgb" && <>
-          <PanelSectionRow><DropdownItem label="Effect" bottomSeparator="none"
+        {zonedDraft.mode === "rgb" && <>
+          {evoDraft && <PanelSectionRow><DropdownItem label="Effect" bottomSeparator="none"
             disabled={lightingLocked}
             selectedOption={evoDraft.lighting.effect}
             rgOptions={effects.filter(isEvoEffect).map(effect =>
@@ -492,30 +527,30 @@ export function RGB({ active }: { active: boolean }) {
             onChange={(selected: any) => updateEvo(request => {
               request.lighting.effect = selected.data;
             })} />
-          </PanelSectionRow>
+          </PanelSectionRow>}
 
-          {evoDraft.lighting.effect === "static" && <>
+          {zonedDraft.lighting.effect === "static" && <>
             <PanelSectionRow><DropdownItem label="Layout" bottomSeparator="none"
               disabled={lightingLocked}
-              selectedOption={evoDraft.lighting.layout_mode}
+              selectedOption={zonedDraft.lighting.layout_mode}
               rgOptions={(Object.keys(LAYOUT_LABELS) as RgbEvoLayoutMode[]).map(layout =>
                 option(layout, LAYOUT_LABELS[layout]))}
-              onChange={(selected: any) => updateEvo(request => {
+              onChange={(selected: any) => updateZoned(request => {
                 const layout = selected.data as RgbEvoLayoutMode;
                 setEvoTargetIndex(layout === "per-stick" && evoTargetIndex >= 4 ? 4 : 0);
                 return setEvoLayoutMode(request, layout, evoTargetIndex);
               })} />
             </PanelSectionRow>
-            {evoDraft.lighting.layout_mode === "both" && <PanelSectionRow><Field
+            {zonedDraft.lighting.layout_mode === "both" && <PanelSectionRow><Field
               label="Target" description="Both stick rings" bottomSeparator="none" />
             </PanelSectionRow>}
-            {evoDraft.lighting.layout_mode === "per-stick" && <PanelSectionRow><DropdownItem
+            {zonedDraft.lighting.layout_mode === "per-stick" && <PanelSectionRow><DropdownItem
               label="Target" bottomSeparator="none" disabled={lightingLocked}
               selectedOption={evoTargetIndex < 4 ? "left" : "right"}
               rgOptions={[option("left", "Left stick"), option("right", "Right stick")]}
               onChange={(selected: any) => setEvoTargetIndex(selected.data === "right" ? 4 : 0)} />
             </PanelSectionRow>}
-            {evoDraft.lighting.layout_mode === "quadrants" && <>
+            {zonedDraft.lighting.layout_mode === "quadrants" && <>
               <PanelSectionRow><DropdownItem label="Stick" bottomSeparator="none"
                 disabled={lightingLocked}
                 selectedOption={evoTargetIndex < 4 ? "left" : "right"}
@@ -527,7 +562,8 @@ export function RGB({ active }: { active: boolean }) {
               <PanelSectionRow><DropdownItem label="Quadrant" bottomSeparator="none"
                 disabled={lightingLocked}
                 selectedOption={String(evoTargetIndex % 4)}
-                rgOptions={QUADRANT_LABELS.map((label, index) => option(String(index), label))}
+                rgOptions={(htrDraft ? HTR3212_QUADRANT_LABELS : QUADRANT_LABELS)
+                  .map((label, index) => option(String(index), label))}
                 onChange={(selected: any) => setEvoTargetIndex(
                   (evoTargetIndex < 4 ? 0 : 4) + Number(selected.data),
                 )} />
@@ -536,13 +572,13 @@ export function RGB({ active }: { active: boolean }) {
             {selectedZone && <ColourEditor color={selectedZone.color}
               brightness={selectedZone.brightness} maxBrightness={maxBrightness}
               disabled={lightingLocked}
-              onColorChange={color => updateEvo(request =>
+              onColorChange={color => updateZoned(request =>
                 setEvoStaticGroup(request, evoTargetIndex, { color }))}
-              onBrightnessChange={brightness => updateEvo(request =>
+              onBrightnessChange={brightness => updateZoned(request =>
                 setEvoStaticGroup(request, evoTargetIndex, { brightness }))} />}
           </>}
 
-          {evoDraft.lighting.effect === "breath" && <ColourEditor
+          {evoDraft && evoDraft.lighting.effect === "breath" && <ColourEditor
             color={evoDraft.lighting.color} brightness={evoDraft.lighting.brightness}
             maxBrightness={maxBrightness} disabled={lightingLocked}
             onColorChange={color => updateEvo(request => {
@@ -552,7 +588,7 @@ export function RGB({ active }: { active: boolean }) {
               request.lighting.brightness = brightness;
             })} />}
 
-          {evoDraft.lighting.effect === "rgb-breath" && <PanelSectionRow><SliderField
+          {evoDraft && evoDraft.lighting.effect === "rgb-breath" && <PanelSectionRow><SliderField
             label={<ValueLabel name="Brightness"
               value={`${Math.round(evoDraft.lighting.brightness * 100 / maxBrightness)}%`} />}
             bottomSeparator="none" disabled={lightingLocked}
@@ -563,12 +599,12 @@ export function RGB({ active }: { active: boolean }) {
             })} />
           </PanelSectionRow>}
 
-          {evoDraft.lighting.effect === "rainbow" && <PanelSectionRow><Field
+          {evoDraft && evoDraft.lighting.effect === "rainbow" && <PanelSectionRow><Field
             label="MCU-controlled effect" bottomSeparator="none"
             description="Rainbow is generated by the controller and has no adjustable settings." />
           </PanelSectionRow>}
 
-          {evoDraft.lighting.effect === "reactive" && <>
+          {evoDraft && evoDraft.lighting.effect === "reactive" && <>
             <PanelSectionRow><DropdownItem label="Reactive colour" bottomSeparator="none"
               disabled={lightingLocked} selectedOption={reactiveTarget}
               rgOptions={[option("idle", "Idle"), option("active", "Active")]}
@@ -597,7 +633,7 @@ export function RGB({ active }: { active: boolean }) {
       {draft && <>
         <PanelSectionRow><ButtonItem layout="below" bottomSeparator="none"
           disabled={Boolean(busy || loading || !active || calibrationDirty ||
-            !status?.supported || !status.valid || (evoDraft && !lightingDirty))}
+            !status?.supported || !status.valid || (zonedDraft && !lightingDirty))}
           onClick={() => { void applyLighting(); }}>Save &amp; Apply</ButtonItem></PanelSectionRow>
         {lightingDirty && <PanelSectionRow><Field label="Unsaved RGB changes"
           bottomSeparator="none" /></PanelSectionRow>}

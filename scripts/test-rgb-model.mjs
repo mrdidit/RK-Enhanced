@@ -67,6 +67,36 @@ assert.ok(collapsed.lighting.zones.every(zone =>
   zone.brightness === request.lighting.zones[5].brightness));
 assert.equal(collapsed.lighting.effect, "static");
 
+const htrRequest = {
+  ...request,
+  provider: "htr3212-static",
+  lighting: {
+    ...request.lighting,
+    zones: [
+      "left-upper-left", "left-upper-right", "left-lower-right", "left-lower-left",
+      "right-upper-left", "right-upper-right", "right-lower-right", "right-lower-left",
+    ].map((id, index) => ({
+      id,
+      color: [index, index + 20, index + 40],
+      brightness: 200 + index,
+    })),
+  },
+};
+const clonedHtr = model.cloneRgbRequest(htrRequest);
+clonedHtr.lighting.zones[0].color[0] = 255;
+assert.equal(htrRequest.lighting.zones[0].color[0], 0);
+
+const htrPerStick = model.setEvoLayoutMode(htrRequest, "per-stick", 0);
+const editedHtr = model.setEvoStaticGroup(htrPerStick, 6, {
+  color: [70, 80, 90],
+  brightness: 123,
+});
+assert.deepEqual(editedHtr.lighting.zones.slice(4).map(zone => zone.color),
+  Array.from({ length: 4 }, () => [70, 80, 90]));
+assert.ok(editedHtr.lighting.zones.slice(4).every(zone => zone.brightness === 123));
+assert.equal(editedHtr.provider, "htr3212-static");
+assert.equal(editedHtr.lighting.effect, "static");
+
 assert.deepEqual(model.calibrationRequest("revision", "save", {
   green_percent: 15,
   blue_percent: 20,
@@ -88,4 +118,4 @@ assert.equal(model.rgbFailureDisposition(
   "OSError: preferences unavailable",
 ), "uncertain-write");
 
-console.log("Pocket EVO RGB frontend model tests passed");
+console.log("Zoned RGB frontend model tests passed");

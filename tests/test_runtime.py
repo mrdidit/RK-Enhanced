@@ -1054,7 +1054,7 @@ class FrontendIntegrityPackagingTests(unittest.TestCase):
         notes = (ROOT / "RELEASE_NOTES.md").read_text()
 
         self.assertIn(
-            "name: RK-Enhanced ${{ github.ref_name }} — Installer safety and Pocket EVO RGB",
+            "name: RK-Enhanced ${{ github.ref_name }} — AYN Odin 3 Static RGB",
             workflow,
         )
         self.assertIn("body_path: RELEASE_NOTES.md", workflow)
@@ -1739,12 +1739,17 @@ class FrontendLifecycleContractTests(unittest.TestCase):
         self.assertIn("state changed; refresh before applying", rgb_model)
         self.assertNotIn("setInterval", rgb)
         self.assertNotIn("setTimeout", rgb)
-        self.assertIn(
-            '"none" | "sysfs-effects" | "analog-static" | "pocket-evo-v3"',
-            typescript)
+        for provider in (
+                '"none"', '"sysfs-effects"', '"analog-static"',
+                '"pocket-evo-v3"', '"htr3212-static"'):
+            self.assertIn(provider, typescript)
         self.assertIn('status?.provider === "analog-static"', rgb)
         self.assertIn(
             'status?.provider === "pocket-evo-v3"', rgb)
+        self.assertIn(
+            'draft?.provider === "htr3212-static"', rgb)
+        self.assertIn('HTR3212_QUADRANT_LABELS', rgb)
+        self.assertIn('htrDraft ? HTR3212_QUADRANT_LABELS', rgb)
         self.assertIn(
             'state.resume_lighting || defaultNonOffLighting(state)', rgb)
         self.assertIn('label="Layout"', rgb)

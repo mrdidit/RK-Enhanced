@@ -1,11 +1,11 @@
 import type {
   RgbCalibrationRequest, RgbColor, RgbEvoCalibration, RgbEvoLayoutMode,
-  RgbEvoLighting, RgbEvoRequest, RgbRequest,
+  RgbEvoLighting, RgbRequest, RgbZonedRequest,
 } from "./types";
 
 export const cloneRgbColor = (color: RgbColor): RgbColor => [...color];
 
-export const cloneEvoLighting = (lighting: RgbEvoLighting): RgbEvoLighting => ({
+export const cloneEvoLighting = <T extends RgbEvoLighting>(lighting: T): T => ({
   ...lighting,
   color: cloneRgbColor(lighting.color),
   idle_color: cloneRgbColor(lighting.idle_color),
@@ -14,12 +14,13 @@ export const cloneEvoLighting = (lighting: RgbEvoLighting): RgbEvoLighting => ({
     ...zone,
     color: cloneRgbColor(zone.color),
   })),
-});
+}) as T;
 
-export const cloneRgbRequest = (request: RgbRequest): RgbRequest =>
-  request.provider === "pocket-evo-v3"
+export const cloneRgbRequest = <T extends RgbRequest>(request: T): T => (
+  request.provider === "pocket-evo-v3" || request.provider === "htr3212-static"
     ? { ...request, lighting: cloneEvoLighting(request.lighting) }
-    : { ...request, color: cloneRgbColor(request.color) };
+    : { ...request, color: cloneRgbColor(request.color) }
+) as T;
 
 const sameColor = (left: RgbColor, right: RgbColor) =>
   left.every((value, index) => value === right[index]);
@@ -68,12 +69,12 @@ export const evoZoneIndexes = (
   return targetIndex >= 0 && targetIndex < zoneCount ? [targetIndex] : [];
 };
 
-export const setEvoStaticGroup = (
-  request: RgbEvoRequest,
+export const setEvoStaticGroup = <T extends RgbZonedRequest>(
+  request: T,
   targetIndex: number,
   change: { color?: RgbColor; brightness?: number },
-) => {
-  const next = cloneRgbRequest(request) as RgbEvoRequest;
+): T => {
+  const next = cloneRgbRequest(request);
   for (const index of evoZoneIndexes(
     next.lighting.layout_mode,
     targetIndex,
@@ -85,12 +86,12 @@ export const setEvoStaticGroup = (
   return next;
 };
 
-export const setEvoLayoutMode = (
-  request: RgbEvoRequest,
+export const setEvoLayoutMode = <T extends RgbZonedRequest>(
+  request: T,
   layoutMode: RgbEvoLayoutMode,
   sourceIndex: number,
-) => {
-  const next = cloneRgbRequest(request) as RgbEvoRequest;
+): T => {
+  const next = cloneRgbRequest(request);
   if (!next.lighting.zones.length) {
     next.lighting.layout_mode = layoutMode;
     return next;

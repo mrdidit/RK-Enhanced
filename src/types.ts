@@ -40,7 +40,8 @@ export type RgbLegacyEffect = "static" | "breath" | "rainbow";
 export type RgbEvoEffect = "static" | "breath" | "rgb-breath" | "rainbow" | "reactive";
 export type RgbEffect = RgbLegacyEffect | RgbEvoEffect;
 export type RgbColor = [number, number, number];
-export type RgbProvider = "none" | "sysfs-effects" | "analog-static" | "pocket-evo-v3";
+export type RgbProvider = "none" | "sysfs-effects" | "analog-static" |
+  "pocket-evo-v3" | "htr3212-static";
 export type RgbEvoLayoutMode = "both" | "per-stick" | "quadrants";
 
 export interface RgbEvoZone {
@@ -58,6 +59,10 @@ export interface RgbEvoLighting {
   idle_color: RgbColor;
   active_color: RgbColor;
 }
+
+export type RgbHtrLighting = Omit<RgbEvoLighting, "effect"> & {
+  effect: "static";
+};
 
 export interface RgbEvoCalibration {
   green_percent: number;
@@ -90,7 +95,15 @@ export interface RgbEvoRequest {
   lighting: RgbEvoLighting;
 }
 
-export type RgbRequest = RgbLegacyRequest | RgbEvoRequest;
+export interface RgbHtrRequest {
+  provider: "htr3212-static";
+  revision: string;
+  mode: "off" | "rgb";
+  lighting: RgbHtrLighting;
+}
+
+export type RgbZonedRequest = RgbEvoRequest | RgbHtrRequest;
+export type RgbRequest = RgbLegacyRequest | RgbZonedRequest;
 
 export interface RgbCalibrationRequest {
   provider: "pocket-evo-v3";
@@ -137,7 +150,16 @@ export interface RgbEvoState extends RgbStateBase {
   calibration_override: RgbEvoCalibration | null;
 }
 
-export type RgbState = RgbUnavailableState | RgbLegacyState | RgbEvoState;
+export interface RgbHtrState extends RgbStateBase {
+  provider: "htr3212-static";
+  mode: "off" | "rgb" | "unknown";
+  modes: Array<"off" | "rgb">;
+  effects: Array<"static">;
+  lighting: RgbHtrLighting;
+  resume_lighting: RgbHtrLighting | null;
+}
+
+export type RgbState = RgbUnavailableState | RgbLegacyState | RgbEvoState | RgbHtrState;
 
 export interface Capabilities {
   cpu: CpuPolicy[];

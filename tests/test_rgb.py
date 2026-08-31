@@ -688,6 +688,464 @@ class RGBControllerTests(unittest.TestCase):
                 self.assertEqual(state["error"], "")
 
 
+class HtrTestController(rgb.RGBController):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.htr_writes = []
+        self.fail_on_write = None
+        self.failure_mutation = None
+
+    def _write_htr3212_brightness(self, path, value):
+        path = Path(path)
+        self.htr_writes.append((path.parent.name, value))
+        if (self.fail_on_write is not None and
+                len(self.htr_writes) == self.fail_on_write):
+            if self.failure_mutation is not None:
+                self.failure_mutation()
+            raise RuntimeError("injected HTR3212 write failure")
+        path.write_text(f"{value}\n")
+
+
+class Htr3212RGBControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.settings_dir = self.root / "settings"
+        self.leds = self.root / "class-leds"
+        self.leds.mkdir()
+        self.devices = self.root / "devices"
+        self.drivers = self.root / "drivers"
+        self.driver = self.drivers / "htr3212"
+        self.driver.mkdir(parents=True)
+        self.controllers = {
+            "l": self.devices / "1-003c",
+            "r": self.devices / "0-003c",
+        }
+        for controller in self.controllers.values():
+            (controller / "leds").mkdir(parents=True)
+            (controller / "driver").symlink_to(self.driver, target_is_directory=True)
+        for side in ("l", "r"):
+            for color in ("r", "g", "b"):
+                for zone in range(1, 5):
+                    name = f"{side}:{color}{zone}"
+                    backing = self.controllers[side] / "leds" / name
+                    backing.mkdir()
+                    (backing / "brightness").write_text("0\n")
+                    (backing / "brightness").chmod(0o644)
+                    (backing / "max_brightness").write_text("255\n")
+                    (backing / "max_brightness").chmod(0o444)
+                    (backing / "device").symlink_to(
+                        self.controllers[side], target_is_directory=True)
+                    (self.leds / name).symlink_to(backing, target_is_directory=True)
+        self.evo_root = self.root / "evo-leds"
+        self.evo_root.mkdir()
+        self.boot_id = self.root / "boot_id"
+        self.boot_id.write_text("boot-a\n")
+        self.helper = self.root / "analog_sticks_ledcontrol"
+        self.helper.write_text("#!/bin/sh\nexit 0\n")
+        self.helper.chmod(0o755)
+        self.led_control = self.root / "ledcontrol"
+        self.led_control.write_text("#!/bin/sh\nexit 0\n")
+        self.led_control.chmod(0o755)
+        self.values = {
+            "led.color": "rgb",
+            "analogsticks.led": "255 1 2 3 1 2 3",
+        }
+        self.events = []
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def controller(self, *, quirk=rgb.HTR3212_ODIN3_QUIRK):
+        return HtrTestController(
+            self.settings_dir,
+            run=lambda command, check=True: self.events.append(
+                ("run", tuple(command), check)) or "off battery rgb",
+            get_setting=lambda name, default="": self.values.get(name, default),
+            set_setting=lambda name, value: self.events.append(
+                ("set", name, value)),
+            get_runtime_capability=lambda name: (
+                quirk if name == rgb.QUIRK_DEVICE_CAPABILITY else
+                "true" if name == rgb.ANALOG_STICKS_CAPABILITY else ""),
+            led_control=self.led_control,
+            analog_sticks_led_control=self.helper,
+            led_path=self.root / "missing-shared-provider",
+            boot_id_path=self.boot_id,
+            evo_leds_root=self.evo_root,
+            htr_leds_root=self.leds,
+        )
+
+    @staticmethod
+    def request(state, *, mode=None, lighting=None):
+        return {
+            "provider": "htr3212-static",
+            "revision": state["revision"],
+            "mode": mode or state["mode"],
+            "lighting": lighting or state["lighting"],
+        }
+
+    def brightness(self, name):
+        return int((self.leds / name / "brightness").read_text())
+
+    def test_exact_odin3_abi_is_read_only_and_wins_over_generic(self):
+        controller = self.controller()
+
+        capabilities = controller.capabilities()
+        state = controller.get_state()
+
+        self.assertEqual(capabilities, {
+            "available": True,
+            "provider": "htr3212-static",
+            "modes": ["off", "rgb"],
+            "effects": ["static"],
+            "shared_zone": False,
+            "max_brightness": 255,
+            "zone_ids": list(rgb.HTR3212_ZONE_INDEX),
+            "layout_modes": ["both", "per-stick", "quadrants"],
+            "error": "",
+        })
+        self.assertTrue(state["supported"])
+        self.assertTrue(state["valid"])
+        self.assertEqual(state["mode"], "off")
+        self.assertEqual(state["provider"], "htr3212-static")
+        self.assertEqual(state["effects"], ["static"])
+        self.assertEqual([zone["id"] for zone in state["lighting"]["zones"]],
+                         list(rgb.HTR3212_ZONE_INDEX))
+        self.assertEqual(controller.htr_writes, [])
+        self.assertEqual(self.events, [])
+        json.dumps(state)
+
+    def test_unverified_device_or_partial_odin_abi_is_not_used(self):
+        self.assertEqual(
+            self.controller(quirk="AYN Thor").capabilities()["provider"],
+            "analog-static")
+
+        (self.leds / "l:r1").unlink()
+        capabilities = self.controller().capabilities()
+        self.assertEqual(capabilities["provider"], "htr3212-static")
+        self.assertFalse(capabilities["available"])
+        self.assertIn("incomplete", capabilities["error"])
+
+    def test_duplicate_channel_alias_and_wrong_driver_fail_closed(self):
+        original = self.leds / "l:r1"
+        duplicate_target = (self.leds / "l:g1").resolve()
+        original.unlink()
+        original.symlink_to(duplicate_target, target_is_directory=True)
+        capabilities = self.controller().capabilities()
+        self.assertFalse(capabilities["available"])
+        self.assertIn("ambiguous", capabilities["error"])
+
+        original.unlink()
+        original.symlink_to(
+            self.controllers["l"] / "leds" / "l:r1",
+            target_is_directory=True)
+        wrong = self.drivers / "wrong-driver"
+        wrong.mkdir()
+        (self.controllers["l"] / "driver").unlink()
+        (self.controllers["l"] / "driver").symlink_to(
+            wrong, target_is_directory=True)
+        capabilities = self.controller().capabilities()
+        self.assertFalse(capabilities["available"])
+        self.assertIn("unexpected driver", capabilities["error"])
+
+    def test_gamma_corrects_level_only(self):
+        self.assertEqual(rgb._htr3212_pwm(128, 255), 128)
+        self.assertEqual(rgb._htr3212_pwm(255, 128), 56)
+        self.assertEqual(rgb._htr3212_pwm(100, 128), 22)
+
+    def test_revision_covers_every_native_channel(self):
+        controller = self.controller()
+        baseline = controller.get_state()["revision"]
+        for name in ("l:r4", "l:g1", "r:b4"):
+            with self.subTest(name=name):
+                path = self.leds / name / "brightness"
+                path.write_text("1\n")
+                changed = controller.get_state()["revision"]
+                self.assertNotEqual(changed, baseline)
+                self.assertEqual(len(changed), 64)
+                path.write_text("0\n")
+
+    def test_state_requires_two_identical_complete_snapshots(self):
+        controller = self.controller()
+        original = controller._read_htr3212_snapshot_once
+        calls = 0
+
+        def changing(channels):
+            nonlocal calls
+            snapshot = [list(zone) for zone in original(channels)]
+            calls += 1
+            if calls % 2 == 0:
+                snapshot[0][0] = 1
+            return tuple(tuple(zone) for zone in snapshot)
+
+        controller._read_htr3212_snapshot_once = changing
+        state = controller.get_state()
+        self.assertTrue(state["supported"])
+        self.assertFalse(state["valid"])
+        self.assertIn("unstable", state["error"])
+        self.assertEqual(controller.htr_writes, [])
+
+    def test_static_apply_uses_hardware_mapped_quadrants(self):
+        controller = self.controller()
+        state = controller.get_state()
+        lighting = state["lighting"]
+        lighting["layout_mode"] = "quadrants"
+        for index, zone in enumerate(lighting["zones"]):
+            zone["color"] = [10 + index, 30 + index, 50 + index]
+            zone["brightness"] = 255
+
+        applied = controller.set_state(self.request(state, mode="rgb", lighting=lighting))
+
+        expected_nodes = (
+            "l:r4", "l:r1", "l:r2", "l:r3",
+            "r:r1", "r:r2", "r:r3", "r:r4",
+        )
+        for index, red_node in enumerate(expected_nodes):
+            prefix, red = red_node.split(":")
+            zone_number = red[1:]
+            self.assertEqual(self.brightness(red_node), 10 + index)
+            self.assertEqual(self.brightness(f"{prefix}:g{zone_number}"), 30 + index)
+            self.assertEqual(self.brightness(f"{prefix}:b{zone_number}"), 50 + index)
+        self.assertEqual(applied["lighting"]["layout_mode"], "quadrants")
+        self.assertEqual(applied["lighting"]["zones"], lighting["zones"])
+        self.assertEqual(len(controller.htr_writes), 24)
+        self.assertEqual(self.events, [])
+
+    def test_gamma_preserves_selected_rgb_ratios(self):
+        controller = self.controller()
+        state = controller.get_state()
+        lighting = state["lighting"]
+        for zone in lighting["zones"]:
+            zone["color"] = [100, 50, 25]
+            zone["brightness"] = 128
+
+        applied = controller.set_state(self.request(
+            state, mode="rgb", lighting=lighting))
+
+        self.assertEqual((
+            self.brightness("l:r4"), self.brightness("l:g4"),
+            self.brightness("l:b4")), (22, 11, 5))
+        self.assertEqual(applied["lighting"]["zones"][0]["color"],
+                         [100, 50, 25])
+        again = controller.set_state(self.request(applied))
+        self.assertEqual(again["lighting"]["zones"][0]["color"],
+                         [100, 50, 25])
+        self.assertEqual(len(controller.htr_writes), 24)
+        self.assertNotIn("correction", applied)
+        self.assertNotIn(
+            "correction",
+            json.loads(controller.htr_preferences_path.read_text()))
+
+    def test_v1_preferences_migrate_only_when_correction_was_off(self):
+        controller = self.controller()
+        lighting = controller._default_htr3212_lighting()
+        lighting["layout_mode"] = "per-stick"
+        candidate = {
+            "version": 1,
+            "provider": "htr3212-static",
+            "lighting": lighting,
+            "resume_lighting": lighting,
+            "correction": False,
+            "native_signature": " ".join("0" for _index in range(24)),
+            "last_applied_boot_id": "boot-a",
+        }
+        controller.htr_preferences_path.parent.mkdir(parents=True)
+        controller.htr_preferences_path.write_text(json.dumps(candidate))
+
+        migrated = controller.get_state()
+        self.assertEqual(
+            migrated["resume_lighting"]["layout_mode"], "per-stick")
+        self.assertNotIn("correction", migrated)
+
+        candidate["correction"] = True
+        controller.htr_preferences_path.write_text(json.dumps(candidate))
+        rejected = controller.get_state()
+        self.assertIsNone(rejected["resume_lighting"])
+        self.assertNotIn("correction", rejected)
+
+    def test_off_then_backend_only_on_restores_complete_saved_layout(self):
+        controller = self.controller()
+        state = controller.get_state()
+        lighting = state["lighting"]
+        lighting["layout_mode"] = "per-stick"
+        for index, zone in enumerate(lighting["zones"]):
+            zone["color"] = [200 if index < 4 else 20, 10, 5]
+            zone["brightness"] = 180 if index < 4 else 90
+        active = controller.set_state(self.request(
+            state, mode="rgb", lighting=lighting))
+        off = controller.set_state(self.request(active, mode="off"))
+        self.assertEqual(off["mode"], "off")
+        self.assertEqual(off["resume_lighting"]["layout_mode"], "per-stick")
+        self.assertTrue(all(self.brightness(name) == 0
+            for name in (f"{side}:{color}{zone}"
+                for side in ("l", "r") for color in ("r", "g", "b")
+                for zone in range(1, 5))))
+
+        raw_zero_lighting = off["lighting"]
+        restored = controller.set_state(self.request(
+            off, mode="rgb", lighting=raw_zero_lighting))
+        self.assertEqual(restored["mode"], "rgb")
+        self.assertEqual(restored["lighting"]["layout_mode"], "per-stick")
+
+    def test_stale_revision_rejects_without_writes(self):
+        controller = self.controller()
+        state = controller.get_state()
+        request = self.request(state, mode="rgb")
+        request["revision"] = "stale"
+        with self.assertRaisesRegex(ValueError, "state changed"):
+            controller.set_state(request)
+        self.assertEqual(controller.htr_writes, [])
+
+    def test_invalid_htr_requests_never_write(self):
+        controller = self.controller()
+        state = controller.get_state()
+        base = self.request(state, mode="rgb")
+        invalid = []
+        for key, value in (
+                ("provider", "pocket-evo-v3"),
+                ("mode", "battery")):
+            request = dict(base)
+            request[key] = value
+            invalid.append(request)
+        bad_effect = json.loads(json.dumps(base))
+        bad_effect["lighting"]["effect"] = "breath"
+        invalid.append(bad_effect)
+        bad_zones = json.loads(json.dumps(base))
+        bad_zones["lighting"]["zones"][0]["id"] = "left-0"
+        invalid.append(bad_zones)
+
+        for request in invalid:
+            with self.subTest(request=request):
+                with self.assertRaises(ValueError):
+                    controller.set_state(request)
+                self.assertEqual(controller.htr_writes, [])
+
+    def test_immediate_write_failure_rolls_back_unchanged_cached_prefix(self):
+        controller = self.controller()
+        state = controller.get_state()
+        lighting = state["lighting"]
+        for zone in lighting["zones"]:
+            zone["color"] = [100, 80, 60]
+            zone["brightness"] = 255
+        controller.fail_on_write = 3
+
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            controller.set_state(self.request(
+                state, mode="rgb", lighting=lighting))
+
+        self.assertEqual(self.brightness("l:r4"), 0)
+        self.assertEqual(self.brightness("l:g4"), 0)
+        self.assertFalse(controller.htr_preferences_path.exists())
+
+    def test_observed_external_divergence_skips_cached_rollback(self):
+        controller = self.controller()
+        state = controller.get_state()
+        lighting = state["lighting"]
+        for zone in lighting["zones"]:
+            zone["color"] = [100, 80, 60]
+            zone["brightness"] = 255
+        controller.fail_on_write = 2
+        controller.failure_mutation = lambda: (
+            self.leds / "r:b4" / "brightness").write_text("77\n")
+
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            controller.set_state(self.request(
+                state, mode="rgb", lighting=lighting))
+
+        self.assertEqual(self.brightness("l:r4"), 100)
+        self.assertEqual(self.brightness("r:b4"), 77)
+
+    def test_future_channel_change_observed_before_next_write_aborts_apply(self):
+        controller = self.controller()
+        state = controller.get_state()
+        lighting = state["lighting"]
+        for zone in lighting["zones"]:
+            zone["color"] = [100, 80, 60]
+            zone["brightness"] = 255
+        original_write = controller._write_htr3212_brightness
+        writes = 0
+
+        def concurrent_write(path, value):
+            nonlocal writes
+            original_write(path, value)
+            writes += 1
+            if writes == 1:
+                (self.leds / "r:b4" / "brightness").write_text("77\n")
+
+        controller._write_htr3212_brightness = concurrent_write
+        with self.assertRaisesRegex(RuntimeError, "changed during apply"):
+            controller.set_state(self.request(
+                state, mode="rgb", lighting=lighting))
+
+        self.assertEqual(self.brightness("l:r4"), 100)
+        self.assertEqual(self.brightness("l:g4"), 0)
+        self.assertEqual(self.brightness("r:b4"), 77)
+        self.assertEqual(len(controller.htr_writes), 1)
+        self.assertFalse(controller.htr_preferences_path.exists())
+
+    def test_preference_failure_rolls_back_cached_state(self):
+        controller = self.controller()
+        state = controller.get_state()
+        lighting = state["lighting"]
+        for zone in lighting["zones"]:
+            zone["color"] = [100, 80, 60]
+            zone["brightness"] = 255
+        controller._save_htr3212_preferences = mock.Mock(
+            side_effect=OSError("preferences unavailable"))
+
+        with self.assertRaisesRegex(OSError, "preferences unavailable"):
+            controller.set_state(self.request(
+                state, mode="rgb", lighting=lighting))
+
+        self.assertTrue(all(self.brightness(name) == 0
+            for name in (f"{side}:{color}{zone}"
+                for side in ("l", "r") for color in ("r", "g", "b")
+                for zone in range(1, 5))))
+
+    def test_startup_never_reapplies_htr3212_preferences(self):
+        controller = self.controller()
+        state = controller.get_state()
+        controller.set_state(self.request(state, mode="off"))
+        saved = controller.htr_preferences_path.read_text()
+        controller.htr_writes.clear()
+        self.boot_id.write_text("boot-b\n")
+
+        self.assertFalse(controller.reapply_startup())
+        self.assertEqual(controller.htr_writes, [])
+        self.assertEqual(controller.htr_preferences_path.read_text(), saved)
+
+    def test_production_writer_uses_one_ascii_sysfs_write(self):
+        target = self.root / "brightness"
+        target.write_text("0\n")
+        real_open, real_write, real_close = os.open, os.write, os.close
+        with (mock.patch.object(rgb.os, "open", side_effect=real_open) as opened,
+              mock.patch.object(rgb.os, "write", side_effect=real_write) as written,
+              mock.patch.object(rgb.os, "close", side_effect=real_close) as closed):
+            rgb.RGBController._write_htr3212_brightness(target, 123)
+
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(opened.call_args.args, (
+            target, os.O_WRONLY | os.O_CLOEXEC | os.O_TRUNC))
+        self.assertEqual(written.call_count, 1)
+        self.assertEqual(written.call_args.args[1], b"123\n")
+        self.assertEqual(closed.call_count, 1)
+        self.assertEqual(target.read_text(), "123\n")
+
+    def test_production_writer_explains_suspend_and_reprobe_failures(self):
+        cases = (
+            (errno.EBUSY, "suspended; retry after resume"),
+            (errno.ENOENT, "interface disappeared; refresh and retry"),
+            (errno.ENODEV, "interface disappeared; refresh and retry"),
+        )
+        for error_number, message in cases:
+            with self.subTest(error_number=error_number), mock.patch.object(
+                    rgb.os, "open",
+                    side_effect=OSError(error_number, os.strerror(error_number))):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    rgb.RGBController._write_htr3212_brightness(
+                        self.root / "missing", 1)
+
+
 class EvoTestController(rgb.RGBController):
     """Regular-file emulator for the ABI's cross-attribute semantics."""
 

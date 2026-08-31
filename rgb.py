@@ -5,6 +5,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -22,6 +23,7 @@ RGB_MODES = ("off", "battery", "rgb")
 RGB_EFFECTS = ("static", "breath", "rainbow")
 ANIMATED_EFFECTS = ("breath", "rainbow")
 PREFERENCES_FILE = "rgb-settings.json"
+HTR_PREFERENCES_FILE = "rgb-htr3212-settings.json"
 PREFERENCES_VERSION = 3
 LEGACY_PREFERENCES_VERSION = 2
 DEFAULT_COLOR = (255, 255, 255)
@@ -29,8 +31,11 @@ DEFAULT_BRIGHTNESS = 255
 PROVIDER_SYSFS_EFFECTS = "sysfs-effects"
 PROVIDER_ANALOG_STATIC = "analog-static"
 PROVIDER_POCKET_EVO_V3 = "pocket-evo-v3"
+PROVIDER_HTR3212_STATIC = "htr3212-static"
 PROVIDER_NONE = "none"
 ANALOG_STICKS_CAPABILITY = "DEVICE_ANALOG_STICKS_LED_CONTROL"
+QUIRK_DEVICE_CAPABILITY = "QUIRK_DEVICE"
+HTR3212_ODIN3_QUIRK = "AYN Odin 3"
 EVO_ZONE_INDEX = (
     "left-270", "left-0", "left-90", "left-180",
     "right-270", "right-0", "right-90", "right-180",
@@ -44,6 +49,20 @@ EVO_WRITABLE_ATTRIBUTES = ("zone_layout", "effect", "calibration", "enabled")
 EVO_LAYOUT_MODES = ("both", "per-stick", "quadrants")
 EVO_DEFAULT_CALIBRATION = (15, 20)
 EVO_RAW_CALIBRATION = (100, 100)
+HTR3212_DRIVER = "htr3212"
+HTR3212_ZONE_INDEX = (
+    "left-upper-left", "left-upper-right",
+    "left-lower-right", "left-lower-left",
+    "right-upper-left", "right-upper-right",
+    "right-lower-right", "right-lower-left",
+)
+# Hardware-verified Odin 3 ring order. The exported channel colours are
+# authoritative; the device-tree symbol names behind them are misleading.
+HTR3212_ZONE_CHANNELS = (
+    ("l", 4), ("l", 1), ("l", 2), ("l", 3),
+    ("r", 1), ("r", 2), ("r", 3), ("r", 4),
+)
+HTR3212_PREFERENCE_VERSION = 2
 
 
 @contextmanager
@@ -103,6 +122,20 @@ def corrected_color(color, enabled):
     # Integer round-to-nearest for x * 0.80. The source channels remain saved
     # separately, so an already corrected output is never corrected again.
     return red, (green * 4 + 2) // 5, (blue * 4 + 2) // 5
+
+
+def _htr3212_pwm(channel, brightness):
+    """Apply perceptual correction to the level, preserving RGB ratios."""
+    channel = _bounded_integer(channel, "RGB channel")
+    brightness = _bounded_integer(brightness, "zone brightness")
+    level = math.pow(brightness / 255, 2.2)
+    return int(round(channel * level))
+
+
+def _htr3212_zone_output(zone):
+    color = _source_color(zone["color"])
+    brightness = _bounded_integer(zone["brightness"], "zone brightness")
+    return tuple(_htr3212_pwm(channel, brightness) for channel in color)
 
 
 def _parse_native_config(raw):
@@ -240,9 +273,12 @@ class RGBController:
                  get_runtime_capability=None,
                  led_control=LED_CONTROL, led_path=LED_PATH,
                  analog_sticks_led_control=ANALOG_STICKS_LED_CONTROL,
-                 boot_id_path=BOOT_ID, evo_leds_root=EVO_LEDS_ROOT):
+                 boot_id_path=BOOT_ID, evo_leds_root=EVO_LEDS_ROOT,
+                 htr_leds_root=EVO_LEDS_ROOT):
         self.settings_dir = Path(settings_dir)
         self.preferences_path = self.settings_dir / PREFERENCES_FILE
+        self.htr_preferences_path = (
+            self.settings_dir / HTR_PREFERENCES_FILE)
         self.lock_path = self.settings_dir / "rgb-control.lock"
         self.run = run
         self.get_setting = get_setting
@@ -254,6 +290,7 @@ class RGBController:
         self.led_path = Path(led_path)
         self.boot_id_path = Path(boot_id_path)
         self.evo_leds_root = Path(evo_leds_root)
+        self.htr_leds_root = Path(htr_leds_root)
         self.thread_lock = threading.RLock()
 
     @staticmethod
@@ -330,6 +367,76 @@ class RGBController:
         effects = tuple(effect for effect in EVO_EFFECTS if effect in available)
         return "valid", path, effects, ""
 
+    def _discover_htr3212(self):
+        """Discover the hardware-mapped Odin 3 discrete 24-channel ABI.
+
+        Other handhelds expose the same controller with unverified physical
+        layouts. They deliberately remain unsupported until their mapping is
+        measured on hardware rather than guessed from device-tree labels.
+        """
+        try:
+            quirk = self.get_runtime_capability(QUIRK_DEVICE_CAPABILITY)
+        except Exception:
+            return "absent", (), ""
+        if quirk != HTR3212_ODIN3_QUIRK:
+            return "absent", (), ""
+
+        channels = []
+        for side, zone in HTR3212_ZONE_CHANNELS:
+            channels.append(tuple(
+                self.htr_leds_root / f"{side}:{color}{zone}"
+                for color in ("r", "g", "b")
+            ))
+        flat = tuple(path for zone in channels for path in zone)
+        present = tuple(path.exists() for path in flat)
+        if not any(present):
+            return "absent", (), ""
+        if not all(present):
+            return "invalid", (), "Odin 3 RGB channel set is incomplete"
+
+        controller_by_side = {}
+        resolved_leds = set()
+        try:
+            for (side, _zone), zone_paths in zip(
+                    HTR3212_ZONE_CHANNELS, channels):
+                for path in zone_paths:
+                    resolved_led = path.resolve(strict=True)
+                    if resolved_led in resolved_leds:
+                        return (
+                            "invalid", (),
+                            "Odin 3 RGB channel mapping is ambiguous",
+                        )
+                    resolved_leds.add(resolved_led)
+                    brightness = path / "brightness"
+                    maximum = path / "max_brightness"
+                    if (not self._readable_attribute(brightness) or
+                            not self._writable_attribute(brightness) or
+                            not self._readable_attribute(maximum) or
+                            _read(maximum) != "255"):
+                        return (
+                            "invalid", (),
+                            "Odin 3 RGB channels are not safely writable",
+                        )
+                    device = (path / "device").resolve(strict=True)
+                    driver = (device / "driver").resolve(strict=True)
+                    if driver.name != HTR3212_DRIVER:
+                        return (
+                            "invalid", (),
+                            "Odin 3 RGB channels use an unexpected driver",
+                        )
+                    previous = controller_by_side.setdefault(side, device)
+                    if previous != device:
+                        return (
+                            "invalid", (),
+                            "Odin 3 RGB channel ownership is ambiguous",
+                        )
+        except (OSError, RuntimeError):
+            return "invalid", (), "Odin 3 RGB interface is incomplete"
+        if (set(controller_by_side) != {"l", "r"} or
+                controller_by_side["l"] == controller_by_side["r"]):
+            return "invalid", (), "Odin 3 RGB controllers are ambiguous"
+        return "valid", tuple(channels), ""
+
     def _native_modes(self):
         if not self.led_control.is_file() or not os.access(self.led_control, os.X_OK):
             return ()
@@ -390,6 +497,19 @@ class RGBController:
                 "max_brightness": 0,
                 "error": evo_error,
             }
+        htr_status, _htr_channels, htr_error = self._discover_htr3212()
+        if htr_status == "valid":
+            return self._provider_capabilities(PROVIDER_HTR3212_STATIC)
+        if htr_status == "invalid":
+            return {
+                "available": False,
+                "provider": PROVIDER_HTR3212_STATIC,
+                "modes": [],
+                "effects": [],
+                "shared_zone": False,
+                "max_brightness": 0,
+                "error": htr_error,
+            }
         if self._sysfs_effects_available():
             provider = PROVIDER_SYSFS_EFFECTS
         elif self._analog_static_available():
@@ -416,6 +536,18 @@ class RGBController:
                 "shared_zone": False,
                 "max_brightness": 255,
                 "zone_ids": list(EVO_ZONE_INDEX),
+                "layout_modes": list(EVO_LAYOUT_MODES),
+                "error": "",
+            }
+        if provider == PROVIDER_HTR3212_STATIC:
+            return {
+                "available": True,
+                "provider": provider,
+                "modes": ["off", "rgb"],
+                "effects": ["static"],
+                "shared_zone": False,
+                "max_brightness": 255,
+                "zone_ids": list(HTR3212_ZONE_INDEX),
                 "layout_modes": list(EVO_LAYOUT_MODES),
                 "error": "",
             }
@@ -628,6 +760,175 @@ class RGBController:
             return defaults
 
     @staticmethod
+    def _default_htr3212_lighting():
+        return {
+            "effect": "static",
+            "layout_mode": "both",
+            "zones": [
+                {
+                    "id": zone_id,
+                    "color": list(DEFAULT_COLOR),
+                    "brightness": DEFAULT_BRIGHTNESS,
+                }
+                for zone_id in HTR3212_ZONE_INDEX
+            ],
+            # Keep the common zoned-lighting envelope so the frontend can use
+            # one editor. These fields are dormant while Static is the only
+            # effect offered by this provider.
+            "color": list(DEFAULT_COLOR),
+            "brightness": DEFAULT_BRIGHTNESS,
+            "idle_color": list(DEFAULT_COLOR),
+            "active_color": [0, 0, 255],
+        }
+
+    def _validated_htr3212_lighting(self, value):
+        if not isinstance(value, dict):
+            raise ValueError("Odin 3 RGB lighting must be an object")
+        if value.get("effect") != "static":
+            raise ValueError("Odin 3 RGB currently supports Static only")
+        layout_mode = value.get("layout_mode")
+        if layout_mode not in EVO_LAYOUT_MODES:
+            raise ValueError("invalid Odin 3 RGB editing layout")
+        source_zones = value.get("zones")
+        if not isinstance(source_zones, list) or len(source_zones) != 8:
+            raise ValueError("Odin 3 RGB layout must contain eight zones")
+        zones = []
+        for expected_id, source in zip(HTR3212_ZONE_INDEX, source_zones):
+            if not isinstance(source, dict) or source.get("id") != expected_id:
+                raise ValueError("Odin 3 RGB zones are out of order")
+            zones.append({
+                "id": expected_id,
+                "color": list(_source_color(source.get("color"))),
+                "brightness": _bounded_integer(
+                    source.get("brightness"), "zone brightness"),
+            })
+        return {
+            "effect": "static",
+            "layout_mode": layout_mode,
+            "zones": zones,
+            "color": list(_source_color(value.get("color"))),
+            "brightness": _bounded_integer(
+                value.get("brightness"), "RGB brightness"),
+            "idle_color": list(_source_color(value.get("idle_color"))),
+            "active_color": list(_source_color(value.get("active_color"))),
+        }
+
+    def _default_htr3212_preferences(self):
+        return {
+            "version": HTR3212_PREFERENCE_VERSION,
+            "provider": PROVIDER_HTR3212_STATIC,
+            "lighting": None,
+            "resume_lighting": None,
+            "native_signature": "",
+            "last_applied_boot_id": "",
+        }
+
+    def _load_htr3212_preferences(self):
+        defaults = self._default_htr3212_preferences()
+        try:
+            candidate = json.loads(self.htr_preferences_path.read_text())
+            version = candidate.get("version") if isinstance(candidate, dict) else None
+            if (not isinstance(candidate, dict) or
+                    version not in (1, HTR3212_PREFERENCE_VERSION) or
+                    candidate.get("provider") != PROVIDER_HTR3212_STATIC):
+                return defaults
+            # The short-lived v1 test build offered EVO-style software colour
+            # correction. Preserve only v1 metadata known to describe raw RGB;
+            # corrected source metadata cannot truthfully represent the cached
+            # PWM values after that control is removed.
+            if version == 1 and candidate.get("correction") is not False:
+                return defaults
+            lighting = candidate.get("lighting")
+            if lighting is not None:
+                lighting = self._validated_htr3212_lighting(lighting)
+            resume = candidate.get("resume_lighting")
+            if resume is not None:
+                resume = self._validated_htr3212_lighting(resume)
+            native_signature = candidate.get("native_signature")
+            last_boot = candidate.get("last_applied_boot_id")
+            if (not isinstance(native_signature, str) or
+                    not isinstance(last_boot, str)):
+                raise ValueError
+            return {
+                "version": HTR3212_PREFERENCE_VERSION,
+                "provider": PROVIDER_HTR3212_STATIC,
+                "lighting": lighting,
+                "resume_lighting": resume,
+                "native_signature": native_signature,
+                "last_applied_boot_id": last_boot,
+            }
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+            return defaults
+
+    def _save_htr3212_preferences(self, preferences):
+        _atomic_json(self.htr_preferences_path, preferences)
+
+    @staticmethod
+    def _htr3212_signature(snapshot):
+        return " ".join(
+            str(value) for zone in snapshot for value in zone)
+
+    @staticmethod
+    def _htr3212_revision(snapshot):
+        return _state_revision(
+            PROVIDER_HTR3212_STATIC,
+            RGBController._htr3212_signature(snapshot),
+        )
+
+    @staticmethod
+    def _read_htr3212_snapshot_once(channels):
+        zones = []
+        try:
+            for zone_paths in channels:
+                values = []
+                for path in zone_paths:
+                    raw = (path / "brightness").read_text().strip()
+                    if re.fullmatch(r"[0-9]+", raw) is None:
+                        return None
+                    value = int(raw)
+                    if value > 255:
+                        return None
+                    values.append(value)
+                zones.append(tuple(values))
+        except (OSError, UnicodeError):
+            return None
+        return tuple(zones)
+
+    def _stable_htr3212_snapshot(self, channels):
+        first = self._read_htr3212_snapshot_once(channels)
+        second = self._read_htr3212_snapshot_once(channels)
+        if first is None or second is None or first != second:
+            return None
+        return second
+
+    def _htr3212_lighting_from_snapshot(self, snapshot):
+        lighting = self._default_htr3212_lighting()
+        zones = []
+        for zone_id, output in zip(HTR3212_ZONE_INDEX, snapshot):
+            # Native PWM cannot uniquely recover separate source colour and
+            # perceptual level. The canonical lossless representation keeps
+            # the exact PWM triplet as colour at full brightness.
+            brightness = 255 if any(output) else 0
+            color = list(output) if brightness else list(DEFAULT_COLOR)
+            zones.append({
+                "id": zone_id,
+                "color": color,
+                "brightness": brightness,
+            })
+        lighting.update({
+            "layout_mode": _layout_mode(zones),
+            "zones": zones,
+        })
+        return lighting
+
+    @staticmethod
+    def _htr3212_snapshot_from_lighting(lighting):
+        return tuple(
+            _htr3212_zone_output(zone)
+            for zone in lighting["zones"]
+        )
+
+    @staticmethod
     def _evo_snapshot_revision(snapshot):
         return _state_revision(
             PROVIDER_POCKET_EVO_V3,
@@ -717,6 +1018,55 @@ class RGBController:
 
     def _get_state_locked(self, capabilities=None):
         capabilities = capabilities or self.capabilities()
+        if capabilities["provider"] == PROVIDER_HTR3212_STATIC:
+            preferences = self._load_htr3212_preferences()
+            base = {
+                "supported": capabilities["available"],
+                "valid": False,
+                "provider": PROVIDER_HTR3212_STATIC,
+                "revision": "",
+                "modes": capabilities["modes"],
+                "effects": capabilities["effects"],
+                "shared_zone": False,
+                "max_brightness": capabilities["max_brightness"],
+                "mode": "unknown",
+                "lighting": self._default_htr3212_lighting(),
+                "resume_lighting": None,
+                "error": capabilities.get("error", ""),
+            }
+            if not capabilities["available"]:
+                return base
+            status, channels, error = self._discover_htr3212()
+            if status != "valid":
+                base["supported"] = False
+                base["error"] = error or "Odin 3 RGB interface disappeared"
+                return base
+            snapshot = self._stable_htr3212_snapshot(channels)
+            if snapshot is None:
+                base["error"] = "Odin 3 RGB state is unstable or malformed"
+                return base
+            signature = self._htr3212_signature(snapshot)
+            mode = (
+                "off" if all(value == 0 for zone in snapshot for value in zone)
+                else "rgb")
+            lighting = self._htr3212_lighting_from_snapshot(snapshot)
+            resume = None
+            if preferences["native_signature"] == signature:
+                if mode == "rgb" and preferences["lighting"] is not None:
+                    lighting = preferences["lighting"]
+                if mode == "off":
+                    resume = (
+                        preferences["resume_lighting"] or
+                        preferences["lighting"])
+            base.update({
+                "valid": True,
+                "revision": self._htr3212_revision(snapshot),
+                "mode": mode,
+                "lighting": lighting,
+                "resume_lighting": resume,
+                "error": "",
+            })
+            return base
         if capabilities["provider"] == PROVIDER_POCKET_EVO_V3:
             preferences = self._load_evo_preferences()
             base = {
@@ -1138,6 +1488,159 @@ class RGBController:
             raise
         return self._get_state_locked(capabilities)
 
+    def _validated_htr3212_request(self, request, current):
+        if not isinstance(request, dict):
+            raise ValueError("RGB request must be an object")
+        if request.get("provider") != PROVIDER_HTR3212_STATIC:
+            raise ValueError("RGB provider changed; refresh before applying")
+        if request.get("revision") != current["revision"]:
+            raise ValueError("RGB state changed; refresh before applying")
+        mode = request.get("mode")
+        if mode not in ("off", "rgb"):
+            raise ValueError("Odin 3 RGB mode must be Off or RGB")
+        lighting = self._validated_htr3212_lighting(request.get("lighting"))
+        return mode, lighting
+
+    @staticmethod
+    def _write_htr3212_brightness(path, value):
+        payload = f"{_bounded_integer(value, 'HTR3212 PWM')}\n".encode("ascii")
+        descriptor = None
+        try:
+            descriptor = os.open(
+                path, os.O_WRONLY | os.O_CLOEXEC | os.O_TRUNC)
+            written = os.write(descriptor, payload)
+            if written != len(payload):
+                raise OSError("short Odin 3 RGB sysfs write")
+        except OSError as reason:
+            if reason.errno == errno.EBUSY:
+                raise RuntimeError(
+                    "Odin 3 RGB transport is suspended; retry after resume") from reason
+            if reason.errno in (errno.ENOENT, errno.ENODEV):
+                raise RuntimeError(
+                    "Odin 3 RGB interface disappeared; refresh and retry") from reason
+            raise RuntimeError(
+                f"unable to apply Odin 3 RGB state: {reason}") from reason
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _guarded_htr3212_rollback(
+            self, channels, owned_snapshot, previous_snapshot):
+        expected = owned_snapshot
+        if self._stable_htr3212_snapshot(channels) != expected:
+            return False
+        expected_mutable = [list(zone) for zone in expected]
+        try:
+            for zone_index, zone_paths in enumerate(channels):
+                for color_index, path in enumerate(zone_paths):
+                    previous = previous_snapshot[zone_index][color_index]
+                    if expected_mutable[zone_index][color_index] == previous:
+                        continue
+                    if (self._stable_htr3212_snapshot(channels) !=
+                            tuple(tuple(zone) for zone in expected_mutable)):
+                        return False
+                    self._write_htr3212_brightness(
+                        path / "brightness", previous)
+                    expected_mutable[zone_index][color_index] = previous
+                    if _read(path / "brightness") != str(previous):
+                        return False
+        except (RuntimeError, OSError, UnicodeError):
+            return False
+        return self._stable_htr3212_snapshot(channels) == previous_snapshot
+
+    def _apply_htr3212_snapshot(
+            self, channels, previous_snapshot, target_snapshot):
+        expected = [list(zone) for zone in previous_snapshot]
+        last_before = previous_snapshot
+        writes_started = False
+        try:
+            for zone_index, zone_paths in enumerate(channels):
+                for color_index, path in enumerate(zone_paths):
+                    target = target_snapshot[zone_index][color_index]
+                    if expected[zone_index][color_index] == target:
+                        continue
+                    last_before = tuple(tuple(zone) for zone in expected)
+                    # Sysfs exposes 24 independent attributes, not one atomic
+                    # layout command.  Recheck the complete cached state before
+                    # every changed channel. Divergence observed between writes
+                    # aborts the operation before RK-Enhanced advances farther.
+                    # The LED class offers no compare-and-swap operation, so the
+                    # final check/write pair itself cannot be atomic.
+                    if self._stable_htr3212_snapshot(channels) != last_before:
+                        if not writes_started:
+                            raise ValueError(
+                                "RGB state changed; refresh before applying")
+                        raise RuntimeError(
+                            "Odin 3 RGB state changed during apply; "
+                            "refresh and retry")
+                    expected[zone_index][color_index] = target
+                    # The sysfs call may have changed the driver's cached value
+                    # even when userspace receives a later error, so consider
+                    # the transaction uncertain from this point onward.
+                    writes_started = True
+                    self._write_htr3212_brightness(
+                        path / "brightness", target)
+                    if _read(path / "brightness") != str(target):
+                        raise RuntimeError(
+                            "Odin 3 RGB cached channel state did not match")
+        except Exception:
+            owned = self._stable_htr3212_snapshot(channels)
+            expected_snapshot = tuple(tuple(zone) for zone in expected)
+            if owned in (last_before, expected_snapshot):
+                self._guarded_htr3212_rollback(
+                    channels, owned, previous_snapshot)
+            raise
+        applied = self._stable_htr3212_snapshot(channels)
+        if applied != target_snapshot:
+            raise RuntimeError("Odin 3 RGB cached native state did not match")
+        return applied
+
+    def _set_htr3212_state_locked(self, request, capabilities, current):
+        mode, lighting = self._validated_htr3212_request(
+            request, current)
+        status, channels, error = self._discover_htr3212()
+        if status != "valid":
+            raise RuntimeError(error or "Odin 3 RGB interface disappeared")
+        # ``brightness`` is the Linux LED class driver's cached sysfs state;
+        # this HTR3212 driver does not expose physical register readback.
+        previous_snapshot = self._stable_htr3212_snapshot(channels)
+        if (previous_snapshot is None or
+                self._htr3212_revision(previous_snapshot) !=
+                current["revision"]):
+            raise ValueError("RGB state changed; refresh before applying")
+        preferences = self._load_htr3212_preferences()
+        if (mode == "rgb" and current["mode"] == "off" and
+                all(zone["brightness"] == 0 for zone in lighting["zones"]) and
+                preferences["resume_lighting"] is not None):
+            lighting = preferences["resume_lighting"]
+        target_snapshot = (
+            tuple((0, 0, 0) for _zone in HTR3212_ZONE_INDEX)
+            if mode == "off" else
+            self._htr3212_snapshot_from_lighting(lighting)
+        )
+        if target_snapshot == previous_snapshot:
+            applied_snapshot = previous_snapshot
+        else:
+            applied_snapshot = self._apply_htr3212_snapshot(
+                channels, previous_snapshot, target_snapshot)
+
+        preferences.update({
+            "version": HTR3212_PREFERENCE_VERSION,
+            "provider": PROVIDER_HTR3212_STATIC,
+            "lighting": lighting,
+            "resume_lighting": lighting,
+            "native_signature": self._htr3212_signature(applied_snapshot),
+            "last_applied_boot_id": _read(self.boot_id_path),
+        })
+        try:
+            self._save_htr3212_preferences(preferences)
+        except Exception:
+            if applied_snapshot != previous_snapshot:
+                self._guarded_htr3212_rollback(
+                    channels, applied_snapshot, previous_snapshot)
+            raise
+        return self._get_state_locked(capabilities)
+
     def _validated_request(self, request, capabilities, current_revision):
         if not isinstance(request, dict):
             raise ValueError("RGB request must be an object")
@@ -1234,6 +1737,9 @@ class RGBController:
             current = self._get_state_locked(capabilities)
             if not current["valid"]:
                 raise RuntimeError(current["error"] or "RGB state is unavailable")
+            if capabilities["provider"] == PROVIDER_HTR3212_STATIC:
+                return self._set_htr3212_state_locked(
+                    request, capabilities, current)
             if capabilities["provider"] == PROVIDER_POCKET_EVO_V3:
                 return self._set_evo_state_locked(
                     request, capabilities, current)
