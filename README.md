@@ -25,6 +25,22 @@ directly copying NDC-Enhanced.
 > and support can vary between devices and ROCKNIX builds. Keep a recovery
 > path available and expect unfinished areas.
 
+## Installation
+
+SSH into the ROCKNIX device and run the installer as `root`:
+
+```sh
+curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh
+```
+
+The installer retrieves the latest published RK-Enhanced release and a
+compatible Decky Loader, including prereleases. Decky prereleases are included
+because current Steam builds can require fixes not yet present in Decky's
+latest stable build. Review `install.sh` before piping it into a shell.
+
+If the standard installer reports an existing ROCKNIX Control conflict, see
+[Conflicting ROCKNIX Control installations](#conflicting-rocknix-control-installations).
+
 ## What RK-Enhanced does
 
 ### Live monitoring
@@ -354,8 +370,9 @@ races.
 
 The full SSH installer scans only immediate plugin directories and matches that
 exact normalized manifest identity. It blocks by default when a conflict is
-found. To explicitly remove the conflicting plugin directory without creating
-a plugin backup, then continue installation, use:
+found and does not remove anything. Only if the standard installer reports this
+conflict—and you intend to permanently remove that plugin—rerun the installer
+with the explicit removal option:
 
 ```sh
 curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | \
@@ -711,23 +728,12 @@ the request.
 - A polished 1.0 release after sufficient hardware coverage and recovery
   testing
 
-## Installation
+## Installer details
 
-Run the installer as `root` on the ROCKNIX device:
-
-```sh
-curl -fL https://raw.githubusercontent.com/mrdidit/RK-Enhanced/main/install.sh | sh
-```
-
-The installer retrieves the latest published RK-Enhanced release and Decky
-Loader, including prereleases. Decky prereleases are included because current
-Steam builds can require compatibility fixes not yet present in Decky's latest
-stable build. Review `install.sh` before piping it into a shell.
-
-When moving from beta.9 or earlier to beta.10, run the full installer above
-once. An in-plugin update is started by the updater from the currently
-installed release, so the older updater does not yet use beta.10's
-prerelease-aware Decky selection before replacement begins. If the selected
+Devices still running beta.9 or earlier must use the full installer from
+[Installation](#installation) once. An in-plugin update starts with the updater
+from the currently installed release, so those older versions cannot use the
+new prerelease-aware Decky selection before replacement begins. If a selected
 Loader is incompatible, readiness verification rejects it and restores the
 previous installation instead of recording a false success.
 
