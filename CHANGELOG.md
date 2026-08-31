@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.2.0-beta.13 — 2026-08-31
+
+### AYN Odin 3 restart persistence
+
+- Persists the complete last successfully applied Odin 3 RGB or Off state and
+  restores its exact verified cached 24-channel state once on the first
+  eligible RK-Enhanced startup of a new boot.
+- Revalidates the exact Odin 3 HTR3212 provider before restoration and rejects
+  missing, malformed, inconsistent, or incomplete saved/native state without
+  falling through to another RGB provider.
+- Tombstones the current boot before the first channel write. A failed restore
+  therefore cannot repeat on a Decky reload, while explicit Save & Apply stays
+  available as the safe retry path.
+- Performs no channel writes when the saved and current cached channel states
+  already match and adds no polling loop, daemon, suspend watcher, or
+  unload-time RGB mutation.
+
 ## v0.2.0-beta.12 — 2026-08-31
 
 ### AYN Odin 3 RGB

@@ -1054,7 +1054,8 @@ class FrontendIntegrityPackagingTests(unittest.TestCase):
         notes = (ROOT / "RELEASE_NOTES.md").read_text()
 
         self.assertIn(
-            "name: RK-Enhanced ${{ github.ref_name }} — AYN Odin 3 Static RGB",
+            "name: RK-Enhanced ${{ github.ref_name }} — "
+            "Odin 3 RGB restart persistence",
             workflow,
         )
         self.assertIn("body_path: RELEASE_NOTES.md", workflow)
