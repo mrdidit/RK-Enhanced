@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.2.0-beta.12 — 2026-08-31
+
+### AYN Odin 3 RGB
+
+- Adds a dedicated, exact-device provider for the Odin 3's pair of HTR3212
+  stick-ring controllers and complete 24-channel sysfs layout.
+- Adds **Off** and **Static RGB** control with both-ring, per-stick, and eight
+  physical-quadrant editing using the verified Odin 3 ring order.
+- Applies gamma to brightness only, preserving the selected raw RGB ratios.
+  The optional FIT/generic mixed-colour correction is not applied to Odin 3.
+- Binds every save to a stable complete cached sysfs snapshot, writes only
+  changed channels, and checks the full cached state before each write.
+  Failures attempt guarded rollback only while the observed state still
+  matches, stopping when external divergence is detected.
+- Documents the kernel boundary honestly: the LED class exposes cached driver
+  brightness, not physical HTR3212 register readback.
+- Adds no daemon, polling loop, startup reapply, unload restoration, or unsafe
+  fallback for other HTR3212 devices whose physical layouts remain unverified.
+- This first Odin 3 release is intentionally Static-only. Armada's
+  [PR #270](https://github.com/armada-os/armada/pull/270) demonstrates that
+  Breathing, Rainbow, Battery-level, and CPU-temperature effects can be
+  generated in software; those background effects are not included yet.
+
+Special thanks to the [Armada project](https://github.com/armada-os/armada) and
+its contributors. The hardware-tested physical mapping from
+[PR #255](https://github.com/armada-os/armada/pull/255) made the safe Odin 3
+provider possible, while PR #270 provided valuable research for potential
+future effects.
+
 ## v0.2.0-beta.11 — 2026-08-30
 
 ### Installation safety and visibility
