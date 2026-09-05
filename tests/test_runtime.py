@@ -1380,7 +1380,7 @@ class FrontendIntegrityPackagingTests(unittest.TestCase):
 
         self.assertIn(
             "name: RK-Enhanced ${{ github.ref_name }} — "
-            "Odin 3 RGB restart persistence",
+            "Lightweight runtime and reliable GPU monitoring",
             workflow,
         )
         self.assertIn("body_path: RELEASE_NOTES.md", workflow)

@@ -525,9 +525,16 @@ This provides system-wide GPU activity and closely follows the value used by
 MangoApp.
 
 When KGSL activity is unavailable, RK-Enhanced can fall back to DRM client
-engine accounting associated with the active Steam application or gamescope.
-Process and file-descriptor discovery is cached to avoid expensive repeated
-scans.
+engine accounting. It selects clients belonging to the exact active Steam
+AppID first, then the measurable DRM compositor inside Steam's authoritative
+scope. `gamescopereaper`, unrelated Gamescope sessions, and duplicate views of
+the same physical DRM client are excluded.
+
+The fallback binds every source to its process generation, DRM device, client,
+and descriptor lifetime. A source change resets the utilization baseline so a
+game exit, compositor restart, reused PID, or reused file descriptor cannot
+create a false spike. Discovery is cached and refreshed at a bounded interval
+instead of repeatedly scanning processes on every Monitor sample.
 
 ## Temperature monitoring
 

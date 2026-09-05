@@ -45,6 +45,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: release/RK-Enhanced.zip
-          name: RK-Enhanced ${{ github.ref_name }} — Odin 3 RGB restart persistence
+          name: RK-Enhanced ${{ github.ref_name }} — Lightweight runtime and reliable GPU monitoring
           body_path: RELEASE_NOTES.md
           prerelease: ${{ contains(github.ref_name, '-') }}

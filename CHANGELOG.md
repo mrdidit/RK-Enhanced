@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.2.0-beta.14 — 2026-09-05
+
+### Lightweight runtime
+
+- Reduces Monitor, game-watcher, frontend, and healthy PluginLoader recovery
+  overhead while retaining exact-identity crash recovery and stale-response
+  protection.
+- Reports RK-Enhanced CPU usage on the same whole-device scale as total CPU
+  load, including the backend and its active lifecycle guards without counting
+  unrelated Decky processes.
+- Preserves in-progress preset edits during safe state refreshes and avoids
+  unnecessary frontend updates while Quick Access is hidden.
+
+### Reliable GPU monitoring
+
+- Selects DRM clients belonging to the exact active Steam AppID first, then
+  the real measurable Gamescope compositor inside Steam's authoritative scope.
+- Rejects `gamescopereaper`, unrelated compositor sessions, duplicate physical
+  DRM clients, and stale PID or file-descriptor generations.
+- Resets the sampling baseline whenever the selected source changes so game
+  exits, compositor restarts, PID reuse, or descriptor reuse cannot produce a
+  false utilization spike. KGSL remains the preferred source when available.
+
+### Native state restoration
+
+- Restores native CPU, GPU, scheduler, and protected fan state after a
+  confirmed complete Steam exit.
+- Debounces transient Steam scope changes while preserving immediate recovery
+  after clean unload, plugin-worker death, or verified PluginLoader replacement.
+
+No Experimental charging behaviour or hardware-write boundary changed in this
+release.
+
 ## v0.2.0-beta.13 — 2026-08-31
 
 ### AYN Odin 3 restart persistence
