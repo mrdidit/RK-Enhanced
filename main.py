@@ -67,6 +67,8 @@ CPU_ROOT = Path("/sys/devices/system/cpu/cpufreq")
 GPU_ROOT = Path("/sys/class/devfreq")
 KGSL_GPU_ROOT = Path("/sys/class/kgsl/kgsl-3d0")
 THERMAL_ROOT = Path("/sys/class/thermal")
+PROC_ROOT = Path("/proc")
+SYS_DEV_CHAR_ROOT = Path("/sys/dev/char")
 STEAM_SCOPE_CGROUPS = (
     Path("/sys/fs/cgroup/systemd/system.slice/steam-bigpicture.scope/cgroup.procs"),
     Path("/sys/fs/cgroup/unified/system.slice/steam-bigpicture.scope/cgroup.procs"),
@@ -866,8 +868,21 @@ class Plugin:
         self.last_cpu_sample = None
         self.last_gpu_sample = None
         self.gamescope_pid = None
+        self.gamescope_identity = None
         self.gpu_fdinfo_paths = []
         self.gpu_fdinfo_refresh = 0.0
+        self.gpu_drm_lock = threading.RLock()
+        self.gpu_drm_revision = 0
+        self.gpu_drm_cache = {
+            "kind": "none",
+            "context": "",
+            "revision": 0,
+            "identities": (),
+            "clients": (),
+            "signature": ("invalid",),
+            "refreshed_at": 0.0,
+            "generation": 0,
+        }
         self.telemetry_sample_lock = threading.Lock()
         self.telemetry_topology_epoch = 0
         self.telemetry_topology_cache = None
@@ -2199,9 +2214,7 @@ class Plugin:
             # previous preset.
             self.active_preset = preset
             self.active_appid = target
-            self.gpu_fdinfo_paths = []
-            self.gpu_fdinfo_refresh = 0.0
-            self.last_gpu_sample = None
+            self._invalidate_gpu_drm_cache()
             return {"applied": True, "preset": preset}
         return await asyncio.to_thread(self._run_hardware_mutation, work)
 
@@ -2440,76 +2453,470 @@ class Plugin:
                 decky.logger.error(f"Backend game watcher failed: {reason}")
                 await asyncio.sleep(5)
 
-    def _find_gamescope_pid(self):
-        if self.gamescope_pid:
-            comm = _read(Path("/proc") / str(self.gamescope_pid) / "comm")
-            if comm.startswith("gamescope"):
-                return self.gamescope_pid
-        for process in Path("/proc").glob("[0-9]*"):
-            if _read(process / "comm").startswith("gamescope"):
-                self.gamescope_pid = int(process.name)
-                return self.gamescope_pid
-        self.gamescope_pid = None
-        return None
+    @staticmethod
+    def _process_cmdline(process):
+        try:
+            return tuple(
+                os.fsdecode(value) for value in
+                (process / "cmdline").read_bytes().split(b"\0") if value)
+        except OSError:
+            return ()
 
-    def _refresh_gpu_fdinfo_paths(self):
-        processes = []
-        if self.active_appid:
-            appid = self.active_appid.encode()
-            for process in Path("/proc").glob("[0-9]*"):
-                try:
-                    environment = (process / "environ").read_bytes()
-                except OSError:
-                    continue
-                variables = environment.split(b"\0")
-                if (b"SteamAppId=" + appid in variables or
-                        b"SteamGameId=" + appid in variables):
-                    processes.append(process)
-        if not processes:
-            pid = self._find_gamescope_pid()
-            if pid is not None:
-                processes.append(Path("/proc") / str(pid))
-        paths = []
-        client_ids = set()
+    @classmethod
+    def _is_gamescope_compositor(cls, process):
+        """Accept the compositor executable, never its reaper or helpers."""
+        comm = _read(process / "comm").lower()
+        if "reaper" in comm:
+            return False
+        if comm in ("gamescope", "gamescope-wl"):
+            return True
+        # A normal non-Gamescope comm is conclusive and avoids opening two
+        # extra proc files for every unrelated process in the Steam scope.
+        if comm and not comm.startswith("gamescope"):
+            return False
+        command = cls._process_cmdline(process)
+        argv0 = Path(command[0]).name.lower() if command else ""
+        executable = ""
+        try:
+            executable = Path(os.readlink(process / "exe")).name.lower()
+        except OSError:
+            pass
+        names = tuple(name for name in (comm, argv0, executable) if name)
+        if any("reaper" in name for name in names):
+            return False
+        return any(name in ("gamescope", "gamescope-wl") for name in names)
+
+    @classmethod
+    def _gamescope_uses_drm_backend(cls, process):
+        command = cls._process_cmdline(process)
+        for index, argument in enumerate(command[1:], 1):
+            if argument == "--backend" and index + 1 < len(command):
+                return command[index + 1].lower() == "drm"
+            if argument.lower() == "--backend=drm":
+                return True
+        return False
+
+    @staticmethod
+    def _process_identity_key(process):
+        identity = _process_identity(process.name, PROC_ROOT)
+        if not identity:
+            return None
+        return (identity["pid"], identity["start_time_ticks"])
+
+    @staticmethod
+    def _read_gpu_fdinfo(info):
+        client_id = ""
+        engine_time = None
+        try:
+            for line in info.read_text().splitlines():
+                if line.startswith("drm-client-id:"):
+                    client_id = line.split(":", 1)[1].strip()
+                elif line.startswith("drm-engine-gpu:"):
+                    fields = line.split()
+                    if len(fields) >= 2:
+                        engine_time = int(fields[1])
+        except (OSError, ValueError):
+            return None
+        if not client_id or engine_time is None or engine_time < 0:
+            return None
+        return client_id, engine_time
+
+    @staticmethod
+    def _drm_device_identity(descriptor, target):
+        """Return a physical key and cheap runtime descriptor identity."""
+        device_number = None
+        try:
+            metadata = descriptor.stat()
+            if stat.S_ISCHR(metadata.st_mode):
+                device_number = metadata.st_rdev
+                major = os.major(metadata.st_rdev)
+                minor = os.minor(metadata.st_rdev)
+                physical = SYS_DEV_CHAR_ROOT / f"{major}:{minor}" / "device"
+                return (
+                    f"physical:{physical.resolve(strict=True)}",
+                    device_number)
+        except (OSError, ValueError):
+            pass
+        return f"node:{target}", device_number
+
+    @staticmethod
+    def _descriptor_sort_key(descriptor):
+        try:
+            return 0, int(descriptor.name)
+        except ValueError:
+            return 1, descriptor.name
+
+    @classmethod
+    def _process_gpu_fdinfo(cls, process, expected_identity=None):
+        """Return engine-capable DRM clients for one exact process lifetime."""
+        identity = cls._process_identity_key(process)
+        if (identity is None or
+                (expected_identity is not None and
+                 identity != expected_identity)):
+            return ()
+        clients = []
+        client_keys = set()
+        try:
+            descriptors = tuple((process / "fd").iterdir())
+        except OSError:
+            return ()
+        for descriptor in sorted(descriptors, key=cls._descriptor_sort_key):
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if not target.startswith("/dev/dri/"):
+                continue
+            info = process / "fdinfo" / descriptor.name
+            parsed = cls._read_gpu_fdinfo(info)
+            if parsed is None:
+                continue
+            client_id, _ = parsed
+            device, device_number = cls._drm_device_identity(
+                descriptor, target)
+            client_key = (device, client_id)
+            if client_key in client_keys:
+                continue
+            client_keys.add(client_key)
+            clients.append({
+                "identity": identity,
+                "device": device,
+                "client_id": client_id,
+                "descriptor": descriptor,
+                "device_number": device_number,
+                "target": target,
+                "fdinfo": info,
+            })
+        # A PID can be reused while its fd directory is being scanned. Never
+        # publish records unless both identity reads name the same lifetime.
+        if cls._process_identity_key(process) != identity:
+            return ()
+        return tuple(clients)
+
+    @staticmethod
+    def _dedupe_gpu_clients(clients):
+        unique = {}
+        for client in clients:
+            key = (client["device"], client["client_id"])
+            unique.setdefault(key, client)
+        return tuple(sorted(
+            unique.values(),
+            key=lambda item: (
+                item["device"], item["client_id"], item["identity"],
+                str(item["fdinfo"]))))
+
+    @staticmethod
+    def _process_matches_appid(process, appid):
+        if not appid:
+            return False
+        expected = appid.encode()
+        try:
+            variables = (process / "environ").read_bytes().split(b"\0")
+        except OSError:
+            return False
+        return (b"SteamAppId=" + expected in variables or
+                b"SteamGameId=" + expected in variables)
+
+    @classmethod
+    def _collect_app_gpu_clients(cls, processes, appid):
+        clients = []
         for process in processes:
-            for descriptor in (process / "fd").glob("*"):
+            # Cheap untrusted filter first; bind only matching evidence to an
+            # exact process generation before opening its DRM descriptors.
+            if not cls._process_matches_appid(process, appid):
+                continue
+            identity = cls._process_identity_key(process)
+            if (identity is None or
+                    not cls._process_matches_appid(process, appid)):
+                continue
+            # The compositor is selected separately using its main-session
+            # signals. Do not let inherited AppID variables bypass that logic.
+            if cls._is_gamescope_compositor(process):
+                continue
+            clients.extend(cls._process_gpu_fdinfo(process, identity))
+        return cls._dedupe_gpu_clients(clients)
+
+    @classmethod
+    def _select_gamescope_candidate(cls, processes):
+        candidates = []
+        for process in processes:
+            if not cls._is_gamescope_compositor(process):
+                continue
+            identity = cls._process_identity_key(process)
+            if (identity is None or
+                    not cls._is_gamescope_compositor(process)):
+                continue
+            drm_backend = cls._gamescope_uses_drm_backend(process)
+            clients = cls._process_gpu_fdinfo(process, identity)
+            if (not clients or
+                    any(item["identity"] != identity for item in clients)):
+                continue
+            candidates.append({
+                "process": process,
+                "identity": identity,
+                "clients": clients,
+                "drm_backend": drm_backend,
+            })
+        if not candidates:
+            return None
+        # Main DRM backend first, then process generation. PID is only a final
+        # deterministic tie-break and is never treated as process age.
+        return max(candidates, key=lambda item: (
+            int(item["drm_backend"]), item["identity"][1],
+            len(item["clients"]), item["identity"][0]))
+
+    @staticmethod
+    def _process_paths(pids):
+        return tuple(
+            PROC_ROOT / str(pid) for pid in sorted(set(pids))
+            if (PROC_ROOT / str(pid)).is_dir())
+
+    def _find_gamescope_candidate(self):
+        scope_pids = self._steam_scope_pids()
+        scope_processes = self._process_paths(scope_pids)
+        if scope_pids:
+            return self._select_gamescope_candidate(scope_processes)
+        return self._select_gamescope_candidate(
+            tuple(PROC_ROOT.glob("[0-9]*")))
+
+    def _find_gamescope_pid(self):
+        """Compatibility wrapper around the generation-safe selector."""
+        candidate = self._find_gamescope_candidate()
+        if candidate is None:
+            self.gamescope_pid = None
+            self.gamescope_identity = None
+            return None
+        self.gamescope_identity = candidate["identity"]
+        self.gamescope_pid = candidate["identity"][0]
+        return self.gamescope_pid
+
+    def _gpu_drm_cache_lock(self):
+        lock = getattr(self, "gpu_drm_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self.gpu_drm_lock = lock
+        return lock
+
+    def _install_gpu_drm_cache(
+            self, kind, clients, refreshed_at, gamescope_identity=None,
+            context=None, revision=None):
+        clients = self._dedupe_gpu_clients(clients)
+        with self._gpu_drm_cache_lock():
+            current_context = str(
+                getattr(self, "active_appid", "") or "")
+            current_revision = int(getattr(self, "gpu_drm_revision", 0))
+            context = current_context if context is None else context
+            revision = current_revision if revision is None else revision
+            # Discovery runs outside this lock. Publish only if the AppID and
+            # lifecycle revision it started under are still current.
+            if (context != current_context or
+                    revision != current_revision):
+                return None
+            client_signature = tuple(
+                (item["identity"], item["device"], item["client_id"])
+                for item in clients)
+            signature = (
+                kind, context, revision, gamescope_identity,
+                client_signature)
+            previous = getattr(self, "gpu_drm_cache", {})
+            changed = previous.get("signature") != signature
+            generation = int(previous.get("generation", 0)) + int(changed)
+            identities = tuple(sorted({
+                item["identity"] for item in clients
+            } | ({gamescope_identity} if gamescope_identity else set())))
+            cache = {
+                "kind": kind,
+                "context": context,
+                "revision": revision,
+                "identities": identities,
+                "clients": clients,
+                "signature": signature,
+                "refreshed_at": refreshed_at,
+                "generation": generation,
+            }
+            # Replace the complete source atomically. The legacy mirrors are
+            # diagnostic only; sampling reads gpu_drm_cache exclusively.
+            self.gpu_drm_cache = cache
+            self.gamescope_identity = gamescope_identity
+            self.gamescope_pid = (
+                gamescope_identity[0] if gamescope_identity else None)
+            self.gpu_fdinfo_paths = [item["fdinfo"] for item in clients]
+            self.gpu_fdinfo_refresh = refreshed_at
+            if changed:
+                self.last_gpu_sample = None
+            return cache
+
+    def _invalidate_gpu_drm_cache(self):
+        with self._gpu_drm_cache_lock():
+            previous = getattr(self, "gpu_drm_cache", {})
+            generation = int(previous.get("generation", 0)) + 1
+            self.gpu_drm_revision = int(
+                getattr(self, "gpu_drm_revision", 0)) + 1
+            self.gpu_drm_cache = {
+                "kind": "none",
+                "context": str(getattr(self, "active_appid", "") or ""),
+                "revision": self.gpu_drm_revision,
+                "identities": (),
+                "clients": (),
+                "signature": ("invalid", generation),
+                "refreshed_at": 0.0,
+                "generation": generation,
+            }
+            self.gamescope_pid = None
+            self.gamescope_identity = None
+            self.gpu_fdinfo_paths = []
+            self.gpu_fdinfo_refresh = 0.0
+            self.last_gpu_sample = None
+
+    def _refresh_gpu_fdinfo_paths(self, refreshed_at=None):
+        refreshed_at = (
+            time.monotonic() if refreshed_at is None else refreshed_at)
+        context = str(getattr(self, "active_appid", "") or "")
+        revision = int(getattr(self, "gpu_drm_revision", 0))
+        scope_pids = self._steam_scope_pids()
+        scope_processes = self._process_paths(scope_pids)
+        appid = context
+
+        # Games can live in descendant/container cgroups whose PIDs are not
+        # listed by steam-bigpicture.scope/cgroup.procs. Exact AppID matching
+        # is therefore global and wins over the compositor fallback.
+        global_processes = (
+            tuple(PROC_ROOT.glob("[0-9]*")) if appid else None)
+        if appid:
+            clients = self._collect_app_gpu_clients(global_processes, appid)
+            if clients:
+                return self._install_gpu_drm_cache(
+                    "appid", clients, refreshed_at,
+                    context=context, revision=revision)
+
+        if scope_pids:
+            candidate = self._select_gamescope_candidate(scope_processes)
+            if candidate is not None:
+                return self._install_gpu_drm_cache(
+                    "gamescope", candidate["clients"], refreshed_at,
+                    candidate["identity"], context, revision)
+            # A populated Steam scope is authoritative for its compositor.
+            # Never bind telemetry to another global Gamescope session.
+            return self._install_gpu_drm_cache(
+                "none", (), refreshed_at,
+                context=context, revision=revision)
+
+        if global_processes is None:
+            global_processes = tuple(PROC_ROOT.glob("[0-9]*"))
+        candidate = self._select_gamescope_candidate(global_processes)
+        if candidate is not None:
+            return self._install_gpu_drm_cache(
+                "gamescope", candidate["clients"], refreshed_at,
+                candidate["identity"], context, revision)
+        return self._install_gpu_drm_cache(
+            "none", (), refreshed_at,
+            context=context, revision=revision)
+
+    @staticmethod
+    def _gpu_drm_identities_current(cache):
+        for pid, started in cache.get("identities", ()):
+            identity = _process_identity(pid, PROC_ROOT)
+            if (not identity or
+                    identity["start_time_ticks"] != started):
+                return False
+        return True
+
+    @classmethod
+    def _cached_gpu_engine_time(cls, cache):
+        if not cls._gpu_drm_identities_current(cache):
+            return None
+        total = 0
+        for client in cache.get("clients", ()):
+            info = client["fdinfo"]
+            descriptor = client["descriptor"]
+            parsed = cls._read_gpu_fdinfo(info)
+            if parsed is None:
+                return None
+            client_id, engine_time = parsed
+            expected_device = client["device_number"]
+            if expected_device is not None:
+                try:
+                    metadata = descriptor.stat()
+                except OSError:
+                    return None
+                if (not stat.S_ISCHR(metadata.st_mode) or
+                        metadata.st_rdev != expected_device):
+                    return None
+            else:
                 try:
                     target = os.readlink(descriptor)
                 except OSError:
+                    return None
+                if target != client["target"]:
+                    return None
+            if client_id != client["client_id"]:
+                return None
+            total += engine_time
+        if not cls._gpu_drm_identities_current(cache):
+            return None
+        return total
+
+    def _gpu_engine_sample(self):
+        now = time.monotonic()
+        for _ in range(3):
+            with self._gpu_drm_cache_lock():
+                cache = getattr(self, "gpu_drm_cache", None)
+                context = str(getattr(self, "active_appid", "") or "")
+                revision = int(getattr(self, "gpu_drm_revision", 0))
+            if (not isinstance(cache, dict) or
+                    cache.get("context") != context or
+                    cache.get("revision") != revision or
+                    cache.get("refreshed_at", 0.0) <= 0 or
+                    now - cache.get("refreshed_at", 0.0) >=
+                    GPU_FDINFO_REFRESH_SECONDS):
+                cache = self._refresh_gpu_fdinfo_paths(now)
+                if cache is None:
+                    # A newer lifecycle won compare-and-publish. Read that
+                    # winner on the next pass; never clear it from this loser.
                     continue
-                if not target.startswith("/dev/dri/"):
+            total = self._cached_gpu_engine_time(cache)
+            if total is None:
+                # A process can exit or recycle an fd between validation and
+                # read. Retry complete discovery, never a partial client sum.
+                cache = self._refresh_gpu_fdinfo_paths(now)
+                if cache is None:
                     continue
-                info = process / "fdinfo" / descriptor.name
-                client_id = ""
-                try:
-                    for line in info.read_text().splitlines():
-                        if line.startswith("drm-client-id:"):
-                            client_id = line.split(":", 1)[1].strip()
-                            break
-                except OSError:
+                total = self._cached_gpu_engine_time(cache)
+                if total is None:
                     continue
-                if not client_id or client_id in client_ids:
+            with self._gpu_drm_cache_lock():
+                if (getattr(self, "gpu_drm_cache", None) is not cache or
+                        cache.get("context") != str(
+                            getattr(self, "active_appid", "") or "") or
+                        cache.get("revision") != int(
+                            getattr(self, "gpu_drm_revision", 0))):
                     continue
-                client_ids.add(client_id)
-                paths.append(info)
-        self.gpu_fdinfo_paths = paths
-        self.gpu_fdinfo_refresh = time.monotonic()
+            return cache["generation"], total
+        # A continuously changing lifecycle gets no reusable delta baseline.
+        # The next settled sample will necessarily have another generation.
+        return -1, 0
 
     def _gpu_engine_time(self):
-        now = time.monotonic()
-        if (self.gpu_fdinfo_refresh <= 0 or
-                now - self.gpu_fdinfo_refresh >= GPU_FDINFO_REFRESH_SECONDS):
-            self._refresh_gpu_fdinfo_paths()
-        total = 0
-        for info in self.gpu_fdinfo_paths:
-            try:
-                for line in info.read_text().splitlines():
-                    if line.startswith("drm-engine-gpu:"):
-                        total += int(line.split()[1])
-                        break
-            except (OSError, ValueError, IndexError):
-                continue
-        return total
+        """Return cumulative engine time for compatibility with narrow tests."""
+        return self._gpu_engine_sample()[1]
+
+    def _gpu_utilization(self, kgsl_load):
+        if kgsl_load >= 0:
+            self.last_gpu_sample = None
+            return min(100.0, float(kgsl_load))
+        generation, engine_ns = self._gpu_engine_sample()
+        now_ns = time.monotonic_ns()
+        percent = 0.0
+        if (self.last_gpu_sample and
+                len(self.last_gpu_sample) == 3 and
+                self.last_gpu_sample[0] == generation):
+            _, previous_engine, previous_time = self.last_gpu_sample
+            elapsed = now_ns - previous_time
+            busy = engine_ns - previous_engine
+            if elapsed > 0 and busy >= 0:
+                percent = min(100.0, busy * 100 / elapsed)
+        self.last_gpu_sample = (generation, engine_ns, now_ns)
+        return percent
 
     def _invalidate_telemetry_topology_locked(self):
         """Invalidate cached sysfs discovery for a new Monitor activation."""
@@ -2517,8 +2924,7 @@ class Plugin:
             getattr(self, "telemetry_topology_epoch", 0) + 1)
         self.telemetry_topology_cache = None
         # DRM clients are session-sensitive rather than boot-stable.
-        self.gpu_fdinfo_paths = []
-        self.gpu_fdinfo_refresh = 0.0
+        self._invalidate_gpu_drm_cache()
 
     @staticmethod
     def _telemetry_topology_paths_valid(topology):
@@ -2977,21 +3383,8 @@ class Plugin:
         ) if monitor_request and rke_cpu_available else None
         # Match MangoHud's msm_drm/KGSL backend on Qualcomm devices: this is
         # total GPU load, rather than the load of gamescope's DRM client.
-        kgsl_load = _read_int(KGSL_GPU_ROOT / "gpu_busy_percentage", -1)
-        if kgsl_load >= 0:
-            gpu_percent = min(100.0, float(kgsl_load))
-            self.last_gpu_sample = None
-        else:
-            gpu_engine_ns = self._gpu_engine_time()
-            now_ns = time.monotonic_ns()
-            gpu_percent = 0.0
-            if self.last_gpu_sample:
-                previous_engine, previous_time = self.last_gpu_sample
-                elapsed = now_ns - previous_time
-                busy = gpu_engine_ns - previous_engine
-                if elapsed > 0 and busy >= 0:
-                    gpu_percent = min(100.0, busy * 100 / elapsed)
-            self.last_gpu_sample = (gpu_engine_ns, now_ns)
+        gpu_percent = self._gpu_utilization(
+            _read_int(KGSL_GPU_ROOT / "gpu_busy_percentage", -1))
         (cpu_package_temps, cpu_core_temps, gpu_temps,
          primary_gpu_temps) = self._temperature_telemetry(topology)
         mem_total = mem_available = 0

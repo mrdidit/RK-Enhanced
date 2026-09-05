@@ -1,5 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -84,6 +86,18 @@ class TelemetryCacheTests(unittest.TestCase):
         self.plugin.telemetry_topology_cache = None
         self.plugin.gpu_fdinfo_paths = []
         self.plugin.gpu_fdinfo_refresh = 0.0
+        self.plugin.gamescope_pid = None
+        self.plugin.gamescope_identity = None
+        self.plugin.gpu_drm_lock = threading.RLock()
+        self.plugin.gpu_drm_revision = 0
+        self.plugin.gpu_drm_cache = {
+            "kind": "none", "context": "", "revision": 0,
+            "identities": (),
+            "clients": (), "signature": ("invalid",),
+            "refreshed_at": 0.0, "generation": 0,
+        }
+        self.plugin.active_appid = ""
+        self.plugin.last_gpu_sample = None
         self.plugin.monitor_session = ""
         self.plugin.monitor_generation = 0
         self.plugin.monitor_revision = 0
@@ -183,6 +197,7 @@ class TelemetryCacheTests(unittest.TestCase):
             first = self.plugin._telemetry_topology()
             self.plugin.gpu_fdinfo_paths = [Path("/proc/fake/fdinfo/1")]
             self.plugin.gpu_fdinfo_refresh = 123.0
+            self.plugin.gpu_drm_cache["refreshed_at"] = 123.0
 
             asyncio.run(self.plugin.begin_monitor_session("monitor-a", 1))
             second = self.plugin._telemetry_topology()
@@ -192,6 +207,8 @@ class TelemetryCacheTests(unittest.TestCase):
         self.assertEqual(self.plugin.telemetry_topology_epoch, 1)
         self.assertEqual(self.plugin.gpu_fdinfo_paths, [])
         self.assertEqual(self.plugin.gpu_fdinfo_refresh, 0.0)
+        self.assertEqual(self.plugin.gpu_drm_cache["kind"], "none")
+        self.assertEqual(self.plugin.gpu_drm_cache["refreshed_at"], 0.0)
 
     def test_incomplete_discovery_retries_only_after_bounded_delay(self):
         missing = {
@@ -312,22 +329,507 @@ class TelemetryCacheTests(unittest.TestCase):
         self.assertEqual(maximum, 1)
 
     def test_empty_fdinfo_result_is_cached_for_ten_seconds(self):
-        self.plugin.gpu_fdinfo_paths = []
-        self.plugin.gpu_fdinfo_refresh = 0.0
+        proc_root = self.root / "proc-empty"
+        proc_root.mkdir()
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=()), \
+                mock.patch.object(
+                    self.plugin, "_refresh_gpu_fdinfo_paths",
+                    wraps=self.plugin._refresh_gpu_fdinfo_paths) as refresh, \
+                mock.patch.object(
+                    main.time, "monotonic",
+                    side_effect=[100.0, 105.0, 111.0]):
+            self.assertEqual(self.plugin._gpu_engine_time(), 0)
+            self.assertEqual(self.plugin._gpu_engine_time(), 0)
+            self.assertEqual(self.plugin._gpu_engine_time(), 0)
 
-        def refresh():
-            self.plugin.gpu_fdinfo_paths = []
-            self.plugin.gpu_fdinfo_refresh = main.time.monotonic()
+        self.assertEqual(refresh.call_count, 2)
 
-        self.plugin._refresh_gpu_fdinfo_paths = mock.Mock(side_effect=refresh)
+    @staticmethod
+    def _add_proc_process(
+            proc_root, pid, comm, command=None, clients=(),
+            start_time=None, environment=(), parent_pid=1):
+        process = proc_root / str(pid)
+        (process / "fd").mkdir(parents=True)
+        (process / "fdinfo").mkdir()
+        (process / "comm").write_text(f"{comm}\n")
+        command = command if command is not None else (comm, "--test")
+        if isinstance(command, str):
+            command = (command, "--test")
+        (process / "cmdline").write_bytes(
+            b"\0".join(value.encode() for value in command) + b"\0")
+        (process / "environ").write_bytes(
+            b"\0".join(value.encode() for value in environment) + b"\0")
+        fields = ["0"] * 30
+        fields[0] = "S"
+        fields[1] = str(parent_pid)
+        fields[19] = str(pid if start_time is None else start_time)
+        (process / "stat").write_text(
+            f"{pid} ({comm}) " + " ".join(fields) + "\n")
+        paths = []
+        for client in clients:
+            if len(client) == 3:
+                descriptor, client_id, has_gpu_engine = client
+                target = "/dev/dri/renderD128"
+                engine_time = 100 if has_gpu_engine else None
+            else:
+                descriptor, target, client_id, engine_time = client
+            os.symlink(target, process / "fd" / str(descriptor))
+            info = process / "fdinfo" / str(descriptor)
+            lines = [f"drm-client-id:\t{client_id}"]
+            if engine_time is not None:
+                lines.append(f"drm-engine-gpu:\t{engine_time} ns")
+            info.write_text("\n".join(lines) + "\n")
+            paths.append(info)
+        return process, paths
+
+    def test_gamescope_selection_rejects_reaper_even_when_it_is_first(self):
+        proc_root = self.root / "proc-reaper-first"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 100, "gamescopereaper", "gamescopereaper")
+        _, compositor_paths = self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "4", True),))
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(100, 200)):
+            self.assertEqual(self.plugin._find_gamescope_pid(), 200)
+            self.plugin.active_appid = ""
+            self.plugin._refresh_gpu_fdinfo_paths()
+
+        self.assertEqual(self.plugin.gamescope_pid, 200)
+        self.assertEqual(self.plugin.gpu_fdinfo_paths, compositor_paths)
+
+    def test_cached_reaper_is_rejected_after_backend_reload(self):
+        proc_root = self.root / "proc-cached-reaper"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 100, "gamescopereaper", "gamescopereaper")
+        self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "4", True),))
+        self.plugin.gamescope_pid = 100
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(100, 200)):
+            self.assertEqual(self.plugin._find_gamescope_pid(), 200)
+
+        self.assertEqual(self.plugin.gamescope_pid, 200)
+
+    def test_gamescope_respawn_replaces_cached_compositor_without_drm(self):
+        proc_root = self.root / "proc-respawn"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 100, "gamescope-wl", "gamescope")
+        self._add_proc_process(
+            proc_root, 300, "gamescope-wl", "gamescope",
+            clients=((14, "9", True),))
+        self.plugin.gamescope_pid = 100
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(100, 300)):
+            self.assertEqual(self.plugin._find_gamescope_pid(), 300)
+
+        self.assertEqual(self.plugin.gamescope_pid, 300)
+
+    def test_gamescope_without_ready_drm_is_not_a_measurable_source(self):
+        proc_root = self.root / "proc-no-drm-yet"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 100, "gamescopereaper", "gamescopereaper")
+        self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope")
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(100, 200)):
+            self.assertIsNone(self.plugin._find_gamescope_pid())
+            cache = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+
+        self.assertIsNone(self.plugin.gamescope_pid)
+        self.assertEqual(cache["kind"], "none")
+        self.assertEqual(cache["clients"], ())
+
+    def test_gamescope_selection_prefers_most_measurable_gpu_clients(self):
+        proc_root = self.root / "proc-multiple-compositors"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "4", True),))
+        self._add_proc_process(
+            proc_root, 300, "gamescope", "/usr/bin/gamescope",
+            clients=((13, "5", True), (14, "6", True)))
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(200, 300)):
+            self.assertEqual(self.plugin._find_gamescope_pid(), 300)
+
+        self.assertEqual(self.plugin.gamescope_pid, 300)
+
+    def test_steam_scope_compositor_beats_newer_outside_session(self):
+        proc_root = self.root / "proc-scope-owner"
+        proc_root.mkdir()
+        _, scope_paths = self._add_proc_process(
+            proc_root, 110, "gamescope-wl",
+            ("/usr/bin/gamescope", "--backend", "drm"),
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=100)
+        self._add_proc_process(
+            proc_root, 900, "gamescope-wl",
+            ("/usr/bin/gamescope", "--backend", "drm"),
+            clients=(
+                (20, "/dev/dri/renderD128", "7", 200),
+                (21, "/dev/dri/renderD128", "8", 300),
+                (22, "/dev/dri/renderD128", "9", 400),
+            ), start_time=900)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(110,)):
+            cache = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+
+        self.assertEqual(cache["kind"], "gamescope")
+        self.assertEqual(self.plugin.gamescope_identity, (110, 100))
+        self.assertEqual(self.plugin.gpu_fdinfo_paths, scope_paths)
+
+    def test_authoritative_scope_never_falls_back_to_other_compositor(self):
+        proc_root = self.root / "proc-scope-no-global-fallback"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 110, "gamescope-wl",
+            ("/usr/bin/gamescope", "--backend", "drm"),
+            clients=((12, "/dev/dri/renderD128", "4", None),),
+            start_time=100)
+        self._add_proc_process(
+            proc_root, 900, "gamescope-wl",
+            ("/usr/bin/gamescope", "--backend", "drm"),
+            clients=((20, "/dev/dri/renderD128", "7", 500),),
+            start_time=900)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(110,)):
+            cache = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+
+        self.assertEqual(cache["kind"], "none")
+        self.assertIsNone(self.plugin.gamescope_pid)
+        self.assertEqual(self.plugin.gpu_fdinfo_paths, [])
+
+    def test_exact_global_appid_beats_scope_compositor_fallback(self):
+        proc_root = self.root / "proc-global-appid"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 110, "gamescope-wl",
+            ("/usr/bin/gamescope", "--backend", "drm"),
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=100)
+        _, game_paths = self._add_proc_process(
+            proc_root, 500, "container-game", clients=(
+                (30, "/dev/dri/renderD128", "12", 600),),
+            start_time=200, environment=("SteamGameId=42",))
+        self.plugin.active_appid = "42"
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(110,)):
+            cache = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+
+        self.assertEqual(cache["kind"], "appid")
+        self.assertIsNone(self.plugin.gamescope_pid)
+        self.assertEqual(self.plugin.gpu_fdinfo_paths, game_paths)
+
+    def test_active_appid_without_engine_falls_back_to_scope_compositor(self):
+        proc_root = self.root / "proc-app-no-engine"
+        proc_root.mkdir()
+        _, compositor_paths = self._add_proc_process(
+            proc_root, 110, "gamescope-wl",
+            ("/usr/bin/gamescope", "--backend", "drm"),
+            clients=((12, "/dev/dri/renderD128", "4", 250),),
+            start_time=100)
+        self._add_proc_process(
+            proc_root, 500, "game-launcher", clients=(
+                (30, "/dev/dri/renderD128", "12", None),),
+            start_time=200, environment=("SteamAppId=42",))
+        self.plugin.active_appid = "42"
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids",
+                    return_value=(110, 500)):
+            cache = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            total = self.plugin._cached_gpu_engine_time(cache)
+
+        self.assertEqual(cache["kind"], "gamescope")
+        self.assertEqual(self.plugin.gamescope_pid, 110)
+        self.assertEqual(self.plugin.gpu_fdinfo_paths, compositor_paths)
+        self.assertEqual(total, 250)
+
+    def test_newer_lower_pid_replaces_lingering_compositor_at_refresh(self):
+        proc_root = self.root / "proc-lower-pid-newer"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 900, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=100)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids",
+                    return_value=(100, 900)):
+            first = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            self._add_proc_process(
+                proc_root, 100, "gamescope-wl", "gamescope",
+                clients=((14, "/dev/dri/renderD128", "8", 200),),
+                start_time=200)
+            with mock.patch.object(main.time, "monotonic", return_value=111.0):
+                _, total = self.plugin._gpu_engine_sample()
+
+        self.assertEqual(first["identities"], ((900, 100),))
+        self.assertEqual(self.plugin.gamescope_identity, (100, 200))
+        self.assertEqual(total, 200)
+
+    def test_same_pid_new_starttime_invalidates_cached_source(self):
+        proc_root = self.root / "proc-pid-reuse"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=10)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(200,)):
+            first = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            self.plugin.last_gpu_sample = (
+                first["generation"], 100, 100_000_000_000)
+            shutil.rmtree(proc_root / "200")
+            self._add_proc_process(
+                proc_root, 200, "gamescope-wl", "gamescope",
+                clients=((12, "/dev/dri/renderD128", "9", 300),),
+                start_time=20)
+            with mock.patch.object(main.time, "monotonic", return_value=101.0):
+                generation, total = self.plugin._gpu_engine_sample()
+
+        self.assertGreater(generation, first["generation"])
+        self.assertEqual(self.plugin.gamescope_identity, (200, 20))
+        self.assertEqual(total, 300)
+        self.assertIsNone(self.plugin.last_gpu_sample)
+
+    def test_same_process_recycled_fd_is_rediscovered_before_deadline(self):
+        proc_root = self.root / "proc-fd-reuse"
+        proc_root.mkdir()
+        process, _ = self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=10)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(200,)):
+            first = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            self.plugin.last_gpu_sample = (
+                first["generation"], 100, 100_000_000_000)
+            (process / "fd" / "12").unlink()
+            os.symlink("/dev/dri/renderD129", process / "fd" / "12")
+            (process / "fdinfo" / "12").write_text(
+                "drm-client-id:\t9\ndrm-engine-gpu:\t300 ns\n")
+            with mock.patch.object(main.time, "monotonic", return_value=101.0):
+                generation, total = self.plugin._gpu_engine_sample()
+
+        self.assertGreater(generation, first["generation"])
+        self.assertEqual(total, 300)
+        self.assertIsNone(self.plugin.last_gpu_sample)
+
+    def test_client_ids_are_deduplicated_per_physical_drm_device(self):
+        proc_root = self.root / "proc-device-client-keys"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope", clients=(
+                (10, "/dev/dri/renderD128", "7", 100),
+                (11, "/dev/dri/renderD128", "7", 100),
+                (12, "/dev/dri/renderD129", "7", 200),
+            ), start_time=10)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(200,)):
+            cache = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            total = self.plugin._cached_gpu_engine_time(cache)
+
+        self.assertEqual(len(cache["clients"]), 2)
+        self.assertEqual(total, 300)
+
+    def test_app_source_change_resets_gamescope_delta_baseline(self):
+        proc_root = self.root / "proc-source-change"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 110, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=100)
+        self.plugin.active_appid = "42"
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids",
+                    return_value=(110, 500)):
+            first = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            self.plugin.last_gpu_sample = (
+                first["generation"], 100, 100_000_000_000)
+            self._add_proc_process(
+                proc_root, 500, "active-game", clients=(
+                    (30, "/dev/dri/renderD128", "12", 5000),),
+                start_time=200, environment=("SteamGameId=42",))
+            second = self.plugin._refresh_gpu_fdinfo_paths(111.0)
+
+        self.assertEqual(first["kind"], "gamescope")
+        self.assertEqual(second["kind"], "appid")
+        self.assertGreater(second["generation"], first["generation"])
+        self.assertIsNone(self.plugin.last_gpu_sample)
+
+    def test_dead_source_is_rediscovered_before_refresh_deadline(self):
+        proc_root = self.root / "proc-dead-source"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 100, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=10)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids",
+                    return_value=(100, 300)):
+            self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            shutil.rmtree(proc_root / "100")
+            _, replacement_paths = self._add_proc_process(
+                proc_root, 300, "gamescope-wl", "gamescope",
+                clients=((14, "/dev/dri/renderD128", "9", 350),),
+                start_time=20)
+            with mock.patch.object(main.time, "monotonic", return_value=101.0):
+                _, total = self.plugin._gpu_engine_sample()
+
+        self.assertEqual(self.plugin.gamescope_identity, (300, 20))
+        self.assertEqual(self.plugin.gpu_fdinfo_paths, replacement_paths)
+        self.assertEqual(total, 350)
+
+    def test_no_engine_source_recovers_after_bounded_refresh(self):
+        proc_root = self.root / "proc-drm-not-ready"
+        proc_root.mkdir()
+        _, paths = self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", None),),
+            start_time=10)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(200,)):
+            first = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            paths[0].write_text(
+                "drm-client-id:\t4\ndrm-engine-gpu:\t225 ns\n")
+            with mock.patch.object(
+                    main.time, "monotonic", side_effect=[105.0, 111.0]):
+                _, before_deadline = self.plugin._gpu_engine_sample()
+                _, after_deadline = self.plugin._gpu_engine_sample()
+
+        self.assertEqual(first["kind"], "none")
+        self.assertEqual(before_deadline, 0)
+        self.assertEqual(after_deadline, 225)
+        self.assertEqual(self.plugin.gamescope_identity, (200, 10))
+
+    def test_unchanged_source_refresh_preserves_generation_and_baseline(self):
+        proc_root = self.root / "proc-unchanged-source"
+        proc_root.mkdir()
+        _, paths = self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=10)
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids", return_value=(200,)):
+            first = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            baseline = (first["generation"], 100, 100_000_000_000)
+            self.plugin.last_gpu_sample = baseline
+            paths[0].write_text(
+                "drm-client-id:\t4\ndrm-engine-gpu:\t200 ns\n")
+            second = self.plugin._refresh_gpu_fdinfo_paths(111.0)
+
+        self.assertEqual(second["generation"], first["generation"])
+        self.assertEqual(self.plugin.last_gpu_sample, baseline)
+
+    def test_kgsl_idle_zero_bypasses_fdinfo_and_clears_fallback(self):
+        self.plugin.last_gpu_sample = (4, 100, 1000)
         with mock.patch.object(
-                main.time, "monotonic",
-                side_effect=[100.0, 100.0, 105.0, 111.0, 111.0]):
-            self.assertEqual(self.plugin._gpu_engine_time(), 0)
-            self.assertEqual(self.plugin._gpu_engine_time(), 0)
-            self.assertEqual(self.plugin._gpu_engine_time(), 0)
+                self.plugin, "_gpu_engine_sample",
+                side_effect=AssertionError("fdinfo fallback must not run")):
+            percent = self.plugin._gpu_utilization(0)
 
-        self.assertEqual(self.plugin._refresh_gpu_fdinfo_paths.call_count, 2)
+        self.assertEqual(percent, 0.0)
+        self.assertIsNone(self.plugin.last_gpu_sample)
+
+    def test_gpu_delta_is_never_crossed_between_source_generations(self):
+        with mock.patch.object(
+                self.plugin, "_gpu_engine_sample", side_effect=[
+                    (1, 100), (2, 10_000), (2, 10_100)]), \
+                mock.patch.object(
+                    main.time, "monotonic_ns",
+                    side_effect=[100, 1100, 2100]):
+            first = self.plugin._gpu_utilization(-1)
+            changed = self.plugin._gpu_utilization(-1)
+            settled = self.plugin._gpu_utilization(-1)
+
+        self.assertEqual(first, 0.0)
+        self.assertEqual(changed, 0.0)
+        self.assertEqual(settled, 10.0)
+
+    def test_overtaken_gpu_discovery_cannot_seed_winning_lifecycle(self):
+        proc_root = self.root / "proc-overtaken-gpu-discovery"
+        proc_root.mkdir()
+        self._add_proc_process(
+            proc_root, 200, "gamescope-wl", "gamescope",
+            clients=((12, "/dev/dri/renderD128", "4", 100),),
+            start_time=10)
+        self._add_proc_process(
+            proc_root, 500, "active-game", clients=(
+                (30, "/dev/dri/renderD128", "12", 500),),
+            start_time=20, environment=("SteamAppId=42",))
+        original = self.plugin._select_gamescope_candidate
+        overtaken = False
+        winning_cache = None
+
+        def publish_new_appid_during_old_discovery(processes):
+            nonlocal overtaken, winning_cache
+            candidate = original(processes)
+            if not overtaken:
+                overtaken = True
+                self.plugin.active_appid = "42"
+                self.plugin._invalidate_gpu_drm_cache()
+                winning_cache = self.plugin._refresh_gpu_fdinfo_paths(100.0)
+            return candidate
+
+        with mock.patch.object(main, "PROC_ROOT", proc_root), \
+                mock.patch.object(
+                    self.plugin, "_steam_scope_pids",
+                    return_value=(200, 500)), \
+                mock.patch.object(
+                    self.plugin, "_select_gamescope_candidate",
+                    side_effect=publish_new_appid_during_old_discovery), \
+                mock.patch.object(main.time, "monotonic", return_value=100.0):
+            generation, total = self.plugin._gpu_engine_sample()
+
+        self.assertTrue(overtaken)
+        self.assertIsNotNone(winning_cache)
+        self.assertIs(self.plugin.gpu_drm_cache, winning_cache)
+        self.assertEqual(self.plugin.gpu_drm_revision, 1)
+        self.assertEqual(winning_cache["context"], "42")
+        self.assertEqual(winning_cache["kind"], "appid")
+        self.assertEqual(total, 500)
+        self.assertEqual(generation, winning_cache["generation"])
 
     def test_narrow_fan_status_never_runs_full_telemetry(self):
         self.plugin._telemetry_sample = mock.Mock(
